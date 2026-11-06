@@ -1483,10 +1483,22 @@ fn default_region() -> String {
     "us-east-1".to_owned()
 }
 
+/// The log filter when `[logging] filter` is absent (#726): `info`, except
+/// for the vendored ruma-state-res.
+///
+/// That crate logs two `INFO` lines for every event it authorizes, and more
+/// for every resolution, with no room in them. At plain `info` they were all
+/// a lightly used server logged, and they buried the warnings an operator
+/// acts on. At `warn` its real faults, such as a missing auth event, still
+/// show. An operator who wants the lines back names the target, e.g.
+/// `info,ruma_state_res=info`.
+pub const DEFAULT_LOG_FILTER: &str = "info,ruma_state_res=warn";
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// `tracing-subscriber` filter directive, e.g. `spindle=debug,warn`.
+    /// Absent means [`DEFAULT_LOG_FILTER`].
     #[serde(default)]
     pub filter: Option<String>,
     /// Where spans go, beside the log. Absent means nowhere, which is the
@@ -1494,6 +1506,14 @@ pub struct LoggingConfig {
     /// without an operator's say-so: no exporter is wired unless named.
     #[serde(default)]
     pub traces: Option<TraceExporter>,
+}
+
+impl LoggingConfig {
+    /// The filter directive the log is built with.
+    #[must_use]
+    pub fn filter_directive(&self) -> &str {
+        self.filter.as_deref().unwrap_or(DEFAULT_LOG_FILTER)
+    }
 }
 
 /// A span exporter an operator may switch on.

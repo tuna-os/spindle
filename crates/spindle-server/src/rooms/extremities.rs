@@ -26,17 +26,26 @@
 //! `dummy_event_interval_secs`, and a pass merges at most
 //! [`ROOMS_PER_PASS`] rooms.
 //!
+//! A dummy event needs a local member who may send. A room where none may,
+//! or where `dummy_events` is off, would still resolve against its stuck tips
+//! on every remote state event. So each append also prunes, as Synapse's
+//! `_prune_extremities` does: when the room's resolution equals the state of
+//! some tips, the others lost and contribute nothing to the current state.
+//! Those are forgotten if each is someone else's event and old, by Synapse's
+//! measures. The current state does not move, and the next event on the
+//! winning branch is linear again ([`Rooms::prune_stuck_extremities`]).
+//!
 //! A dummy event is a timeline event like any other, which is what Synapse
 //! sends too, and clients hide it. It never counts toward a reader's unread
 //! or notification counts here (`unread`, `push`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ruma::signatures::Ed25519KeyPair;
 use serde_json::{Value, json};
-use spindle_core::EventId;
+use spindle_core::{EventId, RoomLog};
 
 use super::{RoomError, Rooms, now_ms};
 
@@ -49,6 +58,68 @@ pub const ROOMS_PER_PASS: usize = 5;
 /// The most local members tried as a dummy event's sender before a room is
 /// left for the next interval.
 const SENDERS_TRIED: usize = 3;
+
+/// A tip older than this, and [`PRUNE_DEPTH`] behind the event being
+/// appended, may be dropped as stuck whoever sent it. Synapse's day.
+const PRUNE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// How far behind the appended event an old stuck tip must be, in depth.
+const PRUNE_DEPTH: u64 = 100;
+
+/// How far behind, in depth, a stuck tip from the appended event's own
+/// server must be. That server has moved past it by this many events, so
+/// it is not merely concurrent.
+const PRUNE_SAME_SERVER_DEPTH: u64 = 20;
+
+/// The server part of an event's sender, as Synapse's `get_domain_from_id`.
+fn sender_server(event: &Value) -> Option<&str> {
+    event["sender"]
+        .as_str()?
+        .split_once(':')
+        .map(|(_, server)| server)
+}
+
+/// Whether a tip the resolution overrode is old enough to drop, by
+/// Synapse's two rules: a day old and [`PRUNE_DEPTH`] behind, or from the
+/// appended event's own server and [`PRUNE_SAME_SERVER_DEPTH`] behind.
+/// Anything younger may be a branch that is still live and will merge.
+fn stuck_long_enough(tip: &Value, appended: &Value, now: u64) -> bool {
+    let depth = tip["depth"].as_u64().unwrap_or(0);
+    let current_depth = appended["depth"].as_u64().unwrap_or(0);
+    let old = tip["origin_server_ts"]
+        .as_u64()
+        .is_some_and(|ts| ts < now.saturating_sub(PRUNE_AFTER_MS))
+        && depth.saturating_add(PRUNE_DEPTH) < current_depth;
+    let same_server = sender_server(tip).is_some_and(|tip| sender_server(appended) == Some(tip))
+        && depth.saturating_add(PRUNE_SAME_SERVER_DEPTH) < current_depth;
+    old || same_server
+}
+
+/// Whether `tip` is an event of `own_server`'s, or a dummy event of ours
+/// whose ancestry through other dummy events of ours reaches one. Such a tip
+/// stays: the next local event must cite our events so that peers fetch
+/// them, and a dummy event that only cites remote events is no such event.
+/// A parent `read` cannot find is passed over, as Synapse does.
+fn leads_to_own_event(tip: Value, own_server: &str, read: &dyn Fn(&str) -> Option<Value>) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending = vec![tip];
+    while let Some(event) = pending.pop() {
+        if sender_server(&event) != Some(own_server) {
+            continue;
+        }
+        if !is_dummy_event(&event) {
+            return true;
+        }
+        for parent in super::edge_ids(&event["prev_events"]) {
+            if seen.insert(parent.clone())
+                && let Some(body) = read(&parent)
+            {
+                pending.push(body);
+            }
+        }
+    }
+    false
+}
 
 /// Whether `event` is an `org.matrix.dummy_event`.
 #[must_use]
@@ -324,6 +395,76 @@ impl Rooms {
         }
         Ok(None)
     }
+
+    /// Forget the forward extremities whose states lost the room's
+    /// resolution, when each is someone else's and has been stuck long
+    /// enough (#626), as Synapse's `_prune_extremities`.
+    ///
+    /// Called after `settle`, whose resolution of the same tips this asks
+    /// for again, as a cache hit; asking rather than reading the recorded
+    /// current state means a failed resolution cannot pass for this one.
+    /// It must run after the append's batch is written: before it, the
+    /// appended event's body is not in the store for the resolver to read.
+    /// The smaller set reaches the store with the room's next commit, which
+    /// writes the extremities; a restart before then brings the stuck tips
+    /// back, and the next append drops them again.
+    ///
+    /// The current state does not move: the kept tips all hold the resolved
+    /// state. All the losing tips go or none does, because resolving a
+    /// subset could reach another answer.
+    ///
+    /// A tip that is our own event stays, and so does a dummy event of ours
+    /// leading back to one: the next local event must cite it so that peers
+    /// fetch it. Such a room has a local member to send one, which is what
+    /// the merge pass is for.
+    pub(super) fn prune_stuck_extremities(
+        &self,
+        log: &mut RoomLog,
+        room_id: &str,
+        appended: &EventId,
+        json: &Value,
+    ) {
+        if log.forward_extremities().len() < 2 {
+            return;
+        }
+        // A failure is `settle`'s to report: it asks the same question.
+        let Ok(resolved) = self.resolve_in(log, room_id, |log, resolver, load| {
+            log.resolve_current(resolver, load)
+        }) else {
+            return;
+        };
+        let root = resolved.root();
+        let (keep, dropped): (BTreeSet<EventId>, BTreeSet<EventId>) =
+            log.forward_extremities().iter().cloned().partition(|tip| {
+                log.state_after_event(tip)
+                    .is_some_and(|state| state.root() == root)
+            });
+        if keep.is_empty() || dropped.is_empty() || dropped.contains(appended) {
+            return;
+        }
+        let now = now_ms();
+        let read = |id: &str| self.read_event(room_id, &EventId::new(id)).ok();
+        for tip in &dropped {
+            let Some(body) = read(tip.as_str()) else {
+                return;
+            };
+            if !stuck_long_enough(&body, json, now)
+                || leads_to_own_event(body, &self.server_name, &read)
+            {
+                return;
+            }
+        }
+        if log.retain_forward_extremities(&keep) {
+            self.metrics
+                .record_extremities_pruned(u64::try_from(dropped.len()).unwrap_or(u64::MAX));
+            tracing::info!(
+                room = room_id,
+                dropped = dropped.len(),
+                kept = keep.len(),
+                "dropped stuck forward extremities whose states lost the resolution"
+            );
+        }
+    }
 }
 
 /// Run [`Rooms::merge_extremities`] every `tick` for the life of the
@@ -370,9 +511,76 @@ pub async fn merge_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::Tracker;
+    use serde_json::{Value, json};
+
+    use super::{DUMMY_EVENT_TYPE, Tracker, leads_to_own_event, stuck_long_enough};
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    fn event(sender: &str, ts: u64, depth: u64) -> Value {
+        json!({
+            "type": "m.room.message",
+            "sender": sender,
+            "origin_server_ts": ts,
+            "depth": depth,
+            "prev_events": [],
+        })
+    }
+
+    fn dummy(sender: &str, prev: &[&str]) -> Value {
+        json!({ "type": DUMMY_EVENT_TYPE, "sender": sender, "prev_events": prev })
+    }
+
+    #[test]
+    fn a_losing_tip_is_stuck_when_old_and_deep_or_left_behind_by_its_server() {
+        let now = 10 * DAY;
+        let appended = event("@p:peer.example", now, 200);
+        let stuck = |tip: Value| stuck_long_enough(&tip, &appended, now);
+        // Any server's: a day old and more than 100 behind.
+        assert!(stuck(event("@o:other.example", now - DAY - 1, 99)));
+        assert!(!stuck(event("@o:other.example", now - DAY + 1, 99)));
+        assert!(!stuck(event("@o:other.example", now - 2 * DAY, 100)));
+        // The appended event's own server: more than 20 behind, at any age.
+        assert!(stuck(event("@q:peer.example", now, 179)));
+        assert!(!stuck(event("@q:peer.example", now, 180)));
+        assert!(!stuck(event("@o:other.example", now, 179)));
+    }
+
+    #[test]
+    fn our_events_and_our_dummies_leading_to_them_are_ours() {
+        let ours = "example.org";
+        let bodies: HashMap<&str, Value> = [
+            ("$ours", event("@a:example.org", 0, 1)),
+            ("$theirs", event("@p:peer.example", 0, 1)),
+            ("$dummy-theirs", dummy("@a:example.org", &["$theirs"])),
+            (
+                "$dummy-dummy",
+                dummy("@a:example.org", &["$dummy-theirs", "$unheld"]),
+            ),
+            (
+                "$dummy-ours",
+                dummy("@a:example.org", &["$dummy-dummy", "$ours"]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let read = |id: &str| bodies.get(id).cloned();
+        let own = |id: &str| leads_to_own_event(bodies[id].clone(), ours, &read);
+        assert!(own("$ours"));
+        assert!(!own("$theirs"));
+        assert!(!own("$dummy-theirs"));
+        assert!(!own("$dummy-dummy"), "an unheld parent is passed over");
+        assert!(own("$dummy-ours"));
+        // A peer's dummy event is the peer's, whatever it cites.
+        assert!(!leads_to_own_event(
+            dummy("@p:peer.example", &["$ours"]),
+            ours,
+            &read
+        ));
+    }
 
     #[test]
     fn a_room_is_claimed_once_per_interval() {

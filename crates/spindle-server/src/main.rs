@@ -796,11 +796,7 @@ async fn serve() -> ExitCode {
         }
     };
 
-    let filter = config
-        .logging
-        .filter
-        .clone()
-        .unwrap_or_else(|| "info".to_owned());
+    let filter = config.logging.filter_directive().to_owned();
     let tracer_provider = match init_logging(&config, filter) {
         Ok(provider) => provider,
         Err(code) => return code,

@@ -304,6 +304,64 @@ fn the_current_state_is_the_resolution_of_the_forward_extremities() {
     );
 }
 
+/// A stuck extremity can be forgotten only in favour of tips that agree on
+/// one state, which then is the current state with nothing to resolve; the
+/// next event on the kept branch is linear.
+#[test]
+fn retained_extremities_must_share_the_state_they_leave_current() {
+    let topic = StateKey::new("m.room.topic", "");
+    let mut room = RoomLog::new(spindle_core::MemStateKeyTable::shared());
+    room.append_local("$create", Some(StateKey::new("m.room.create", "")))
+        .unwrap();
+    let base = room.forward_extremities().iter().next().unwrap().clone();
+    room.append_remote(EventInput::new("$stuck", vec![base.clone()]))
+        .unwrap();
+    let mut resolver = Recording::default();
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$topic-a", vec![base.clone()]).with_state_key(topic.clone()),
+    )
+    .unwrap();
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$topic-b", vec![base]).with_state_key(topic.clone()),
+    )
+    .unwrap();
+    assert_eq!(room.forward_extremities().len(), 3);
+    let before = room.forward_extremities().clone();
+
+    let set = |ids: &[&str]| -> std::collections::BTreeSet<EventId> {
+        ids.iter().map(|id| EventId::new(*id)).collect()
+    };
+    for refused in [
+        set(&[]),
+        set(&["$unknown"]),
+        set(&["$topic-a", "$topic-b"]),
+        set(&["$stuck", "$topic-a"]),
+    ] {
+        assert!(!room.retain_forward_extremities(&refused), "{refused:?}");
+        assert_eq!(room.forward_extremities(), &before);
+    }
+
+    assert!(room.retain_forward_extremities(&set(&["$topic-a"])));
+    assert_eq!(
+        room.forward_extremities().iter().collect::<Vec<_>>(),
+        vec![&EventId::new("$topic-a")]
+    );
+    assert_eq!(room.current_state().unwrap().get(&topic), Some("$topic-a"));
+    let calls = resolver.calls;
+    append_resolved(
+        &mut room,
+        &mut resolver,
+        EventInput::new("$next", vec![EventId::new("$topic-a")]),
+    )
+    .unwrap();
+    assert_eq!(resolver.calls, calls, "the kept branch is linear again");
+    assert_eq!(room.forward_extremities().len(), 1);
+}
+
 /// A rejected event is held for the DAG and changes nothing: no state, no
 /// extremity, no place in the timeline. A child that names it sits on the
 /// state before it.

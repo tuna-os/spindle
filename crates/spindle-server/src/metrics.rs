@@ -383,6 +383,9 @@ struct StateResMetrics {
     /// `org.matrix.dummy_event`s authored to merge extremities, `[sent,
     /// failed]`.
     dummy_events: [AtomicU64; 2],
+    /// Forward extremities dropped as stuck after a resolution showed their
+    /// states had lost to the other tips'.
+    extremities_pruned: AtomicU64,
     /// Resident rooms by forward-extremity count, by
     /// [`EXTREMITY_BUCKETS`], as the last census found them.
     extremity_buckets: [AtomicU64; 4],
@@ -915,6 +918,19 @@ impl Metrics {
         )
     }
 
+    /// Record `count` stuck forward extremities dropped from one room.
+    pub fn record_extremities_pruned(&self, count: u64) {
+        self.state_res
+            .extremities_pruned
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Stuck forward extremities dropped so far, for tests.
+    #[must_use]
+    pub fn extremities_pruned(&self) -> u64 {
+        self.state_res.extremities_pruned.load(Ordering::Relaxed)
+    }
+
     /// Replace the forward-extremity census, indexed as
     /// [`EXTREMITY_BUCKETS`].
     pub fn set_extremity_buckets(&self, buckets: [u64; 4]) {
@@ -1074,6 +1090,17 @@ impl Metrics {
                 counters.dummy_events[index].load(Ordering::Relaxed)
             );
         }
+        out.push_str(
+            "# HELP spindle_forward_extremities_pruned_total Forward extremities \
+             dropped as stuck: their states lost the room's resolution and no \
+             event cites them.\n\
+             # TYPE spindle_forward_extremities_pruned_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_forward_extremities_pruned_total {}",
+            counters.extremities_pruned.load(Ordering::Relaxed)
+        );
         out.push_str(
             "# HELP spindle_rooms_by_forward_extremities Resident rooms by how many \
              forward extremities they have, at the last census.\n\
@@ -3041,6 +3068,7 @@ mod tests {
         metrics.record_dummy_event(true);
         metrics.record_dummy_event(false);
         metrics.record_dummy_event(true);
+        metrics.record_extremities_pruned(3);
         let text = metrics.render();
         for line in [
             "spindle_rooms_by_forward_extremities{extremities=\"1\"} 4",
@@ -3052,6 +3080,7 @@ mod tests {
             "spindle_state_res_rejections_total 7",
             "spindle_dummy_events_total{result=\"sent\"} 2",
             "spindle_dummy_events_total{result=\"failed\"} 1",
+            "spindle_forward_extremities_pruned_total 3",
         ] {
             assert!(text.contains(line), "{line} missing from {text}");
         }
@@ -3068,6 +3097,7 @@ mod tests {
             "spindle_state_res_resolutions_total",
             "spindle_state_res_rejections_total",
             "spindle_dummy_events_total",
+            "spindle_forward_extremities_pruned_total",
             "spindle_rooms_by_forward_extremities",
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{text}");

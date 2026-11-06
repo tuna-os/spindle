@@ -567,6 +567,7 @@ impl Rooms {
             // the room's current state, and every membership it moved is
             // re-indexed from it.
             rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+            rooms.prune_stuck_extremities(log, room_id, &entry.event_id, json);
             if let Some(target) = redaction_target {
                 if log.get(&EventId::new(target.as_str())).is_some()
                     || rooms.gap_position(room_id, &target)?.is_some()
