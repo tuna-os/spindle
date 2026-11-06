@@ -24,9 +24,14 @@ impl Instance {
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        // The storage path too, not only the store: uploads and fetched
+        // remote media land under `<storage.path>/media`, and the default
+        // `./data` is the crate's source tree.
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
+            "[server]\nname = \"{name}\"\n[storage]\npath = \"{}\"\n\
+             [ratelimit]\nenabled = false\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
+            dir.path().display(),
         ))
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");

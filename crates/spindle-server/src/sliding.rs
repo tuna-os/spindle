@@ -455,6 +455,10 @@ pub struct Connection {
     /// it holds them as of. Apart from [`Self::rooms`] because the receipts
     /// extension has its own scope.
     pub receipts: HashMap<String, u64>,
+    /// The `count` the lists were answered with. Held so a long-poll can
+    /// tell that a room joined or left outside every window is news: the
+    /// count is the only part of the answer that changes for it.
+    pub listed: usize,
 }
 
 /// How one room in a response is to be answered.

@@ -162,6 +162,34 @@ impl AccountData {
         }
         Ok(out)
     }
+
+    /// Whether any entry of one kind changed in `(since, until]`.
+    ///
+    /// Reads the stream marks alone: a sliding-sync long-poll asks this on
+    /// every wake, about every room in its extension's scope, and parsing
+    /// the contents [`Self::between`] returns would answer nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountDataError`] if the scan fails.
+    pub fn changed_between(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        since: u64,
+        until: u64,
+    ) -> Result<bool, AccountDataError> {
+        let prefix = keys::account_data_stream_prefix(user_id, room_id);
+        for (_, bytes) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let changed = <[u8; 8]>::try_from(&bytes[..])
+                .map(u64::from_be_bytes)
+                .is_ok_and(|position| position > since && position <= until);
+            if changed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// What can go wrong reading or writing account data.
