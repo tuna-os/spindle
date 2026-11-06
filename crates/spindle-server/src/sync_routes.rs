@@ -1453,9 +1453,10 @@ async fn sync(
     // is a load from the store -- so both run on the blocking pool rather
     // than on an async worker (#614). The long-poll between them is the
     // one stretch that genuinely waits, and it stays async.
+    let reader = identity.user_id.clone();
     let read = |since: Option<u64>| {
         let state = state.clone();
-        let user_id = identity.user_id.clone();
+        let user_id = reader.clone();
         crate::blocking::offload(
             std::sync::Arc::clone(&state.metrics),
             crate::metrics::BlockingTask::Sync,
@@ -1478,49 +1479,73 @@ async fn sync(
     // something to say, and blocking one would leave a first-time client
     // staring at nothing for the whole timeout.
     let long_poll = since.is_some() && query.timeout.unwrap_or(0) > 0;
-    if let Some(since) = since {
-        let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
-        // A side stream (account data, to-device messages, receipts) can
-        // advance the shared token without putting a room in this result.
-        // That is already news: waiting merely because the room sections are
-        // empty misses a wake that landed just before this request subscribed.
-        if result.is_empty() && result.next_batch == since && !timeout.is_zero() {
-            // Either an appended event or a change in who is typing ends the
-            // wait. Typing is not an event and has no stream position, so it
-            // cannot be discovered by re-reading the log -- without this arm a
-            // client would learn that someone started typing only when they
-            // stopped and sent the message.
-            tokio::select! {
-                () = state.rooms.wait_for_event(timeout) => {}
-                () = state.typing.wait(timeout) => {}
-            }
-            result = read(Some(since)).await?;
-        }
-    }
-
+    let timeout = std::time::Duration::from_millis(query.timeout.unwrap_or(0).min(60_000));
+    let deadline = tokio::time::Instant::now() + timeout;
     let state_label = query.state_label();
-    let worker_state = state.clone();
-    crate::blocking::offload(
-        std::sync::Arc::clone(&state.metrics),
-        crate::metrics::BlockingTask::Sync,
-        move || {
-            let started = std::time::Instant::now();
-            let response = sync_answer(
-                &worker_state,
-                &identity,
-                result,
-                filter.as_ref(),
-                state_label,
-                resume,
-            );
-            worker_state
-                .metrics
-                .observe_sync_phase(crate::metrics::SyncPhase::SyncAssemble, started.elapsed());
-            response
-        },
-    )
-    .await
-    .map(|response| mark_long_poll(response, long_poll))
+    let identity = std::sync::Arc::new(identity);
+    let filter = std::sync::Arc::new(filter);
+    let assemble = |result: crate::rooms::SyncResult| {
+        let worker_state = state.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let filter = std::sync::Arc::clone(&filter);
+        crate::blocking::offload(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::Sync,
+            move || {
+                let started = std::time::Instant::now();
+                let answer = sync_answer(
+                    &worker_state,
+                    &identity,
+                    result,
+                    filter.as_ref().as_ref(),
+                    state_label,
+                    resume,
+                );
+                worker_state
+                    .metrics
+                    .observe_sync_phase(crate::metrics::SyncPhase::SyncAssemble, started.elapsed());
+                answer
+            },
+        )
+    };
+
+    // The stream is server-global, so it moves for everyone's news: another
+    // user's to-device message, their presence, a room this user is not in.
+    // A long-poll answers when there is something for *this* user, not when
+    // the stream merely moved, or the client is handed an empty response and
+    // has to ask again. That is not just a wasted round trip: matrix-rust-sdk
+    // sleeps a second before a sync that follows the last within a second,
+    // taking the answer as a server ignoring its timeout. A room key sent in
+    // that second waited it out, and a client that asked for the encrypted
+    // event meanwhile could not decrypt it (#705). Synapse answers the same
+    // way: it re-checks a woken sync for the user's news and keeps waiting
+    // when there is none.
+    let mut typing_moved = false;
+    loop {
+        let seen = result.next_batch;
+        // Nothing at all since the client's token, rooms or side streams,
+        // so there is no answer to assemble to find that out -- unless a
+        // typing change woke the wait, which moves no position.
+        let quiet = since == Some(seen) && result.is_empty() && !typing_moved;
+        let expired = tokio::time::Instant::now() >= deadline;
+        if !long_poll || expired || !quiet {
+            let (response, news) = assemble(result).await?;
+            if !long_poll || expired || news {
+                return Ok(mark_long_poll(response, long_poll));
+            }
+        }
+        // Either a stream move or a change in who is typing ends the wait.
+        // Typing is not an event and has no stream position, so it cannot
+        // be discovered by re-reading the log -- without this arm a client
+        // would learn that someone started typing only when they stopped
+        // and sent the message.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        typing_moved = tokio::select! {
+            () = state.rooms.wait_past(seen, left) => false,
+            () = state.typing.wait(left) => true,
+        };
+        result = read(since).await?;
+    }
 }
 
 /// What `/sync` does to its user's presence: online unless `set_presence`
@@ -1561,7 +1586,11 @@ async fn sync_presence_start(
 }
 
 /// The body of a `/sync` response, assembled synchronously from what the
-/// read found.
+/// read found, and whether it tells its user anything: a room in any
+/// section, a to-device message, a device-list change, account data,
+/// presence or a finished delayed event. The one-time-key counts and the
+/// fallback key types are in every answer, so they are not news on their
+/// own.
 fn sync_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -1569,7 +1598,7 @@ fn sync_answer(
     filter: Option<&crate::filters::Filter>,
     state_label: &'static str,
     resume: crate::tokens::Resume,
-) -> Result<axum::response::Response, MatrixError> {
+) -> Result<(axum::response::Response, bool), MatrixError> {
     let since = resume.position();
     let join = sync_join(
         state,
@@ -1588,6 +1617,13 @@ fn sync_answer(
         sync_device_sections(state, identity, resume, result.next_batch)?;
 
     let global = sync_account_data(state, identity, filter, since, result.next_batch)?;
+    let mut news = !join.is_empty()
+        || !invite.is_empty()
+        || !knock.is_empty()
+        || !leave.is_empty()
+        || !to_device.is_empty()
+        || !device_changes.is_empty()
+        || !global.is_empty();
 
     // Assembled from pre-serialized parts rather than as one `Value`, so the
     // joined rooms' state blocks -- which `sync_join` may have taken straight
@@ -1616,21 +1652,26 @@ fn sync_answer(
     body.insert("device_unused_fallback_key_types", raw(&unused_fallback)?);
     body.insert("account_data", raw(&json!({ "events": global }))?);
     if let Some(presence) = sync_presence(state, identity, filter, since, result.next_batch)? {
+        news |= !presence.is_empty();
         body.insert("presence", raw(&json!({ "events": presence }))?);
     }
 
     let window = (since, result.next_batch);
     if let Some(done) = finalised_delays(state, &identity.user_id, filter, window)? {
+        news = true;
         body.insert("org.matrix.msc4140.finalised_delayed_events", raw(&done)?);
     }
 
     let text =
         serde_json::to_string(&body).map_err(|error| MatrixError::internal(&error.to_string()))?;
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        text,
-    )
-        .into_response())
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            text,
+        )
+            .into_response(),
+        news,
+    ))
 }
 
 /// One room's entry in `rooms.join`, for every joined room the sync found.

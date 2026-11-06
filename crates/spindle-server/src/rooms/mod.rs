@@ -3893,6 +3893,22 @@ impl Rooms {
         self.metrics.sync_waiter_finished();
     }
 
+    /// [`Self::wait_for_event`] for a caller that has already read up to
+    /// `seen`: returns at once if the stream has moved past it since,
+    /// rather than waiting for the next wake. `/sync` reads, finds nothing
+    /// for its user and waits again, so a move landing between that read
+    /// and this wait would otherwise be missed until the one after it.
+    pub async fn wait_past(&self, seen: u64, timeout: std::time::Duration) {
+        // Created before the check, so a wake in between is not lost.
+        let notified = self.appended.notified();
+        if self.stream_position() > seen {
+            return;
+        }
+        self.metrics.sync_waiter_started();
+        let _ = tokio::time::timeout(timeout, notified).await;
+        self.metrics.sync_waiter_finished();
+    }
+
     /// Everything that happened after `since`, grouped by room.
     ///
     /// `since` of `None` is an initial sync: every joined room, with its
