@@ -5,3 +5,16 @@
 # The same rules as allowlist.txt: one `<spec file> :: <test title>` per
 # line, promoted by review, and nothing claimed that has not been seen to
 # pass -- every entry names the run that recorded it.
+#
+# Recorded on the first builtin run (workflow run 42295629126, element-call
+# pin 9f7c35c, chromium): six of the seven specs it ran. The call across the
+# two Spindles passes in both membership modes with each Spindle minting
+# for the other's user (subscribe-only) and creating its own rooms on an
+# SFU with `auto_create: false`. five-party-churn failed there: Element Call
+# handed its hour-long leave to the transport and the minter refused it.
+create-call.spec.ts :: BugFix: When unmuting in lobby, you had to click twice to unmute in call
+create-call.spec.ts :: Start a new call then leave and show the feedback screen
+spa-call-sticky.spec.ts :: One to One call using matrix rtc 2.0 aka sticky events
+spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash EC
+spindle/federated-call.spec.ts :: Federated call between two Spindles (2_0)
+spindle/federated-call.spec.ts :: Federated call between two Spindles (compat)

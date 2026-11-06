@@ -391,8 +391,8 @@ struct SfuRequest {
     openid_token: OpenIdToken,
     #[serde(default)]
     device_id: String,
-    /// Delegation of the delayed leave to the transport. Refused: see
-    /// [`refuse_transport_delegation`].
+    /// Delegation of the delayed leave to the transport: held for this
+    /// server's users, see [`check_transport_delegation`].
     #[serde(default)]
     delay_id: String,
 }
@@ -474,8 +474,8 @@ async fn sfu_get(
     if request.device_id.is_empty() {
         return Err(MatrixError::missing_param("device_id"));
     }
-    refuse_transport_delegation(&request.delay_id)?;
     let user_id = openid_user(&state, &request.openid_token).await?;
+    check_transport_delegation(&state, &user_id, &request.delay_id)?;
     let grant = Grant {
         user_id: &user_id,
         room_id: &request.room,
@@ -484,6 +484,9 @@ async fn sfu_get(
         full_access: full_access(&state, livekit, &user_id),
     };
     let jwt = mint_for(&state, livekit, &grant).await?;
+    if !request.delay_id.is_empty() {
+        hold(&state, &grant, &request.device_id, &request.delay_id)?;
+    }
     Ok(Json(json!({ "url": livekit.url, "jwt": jwt })))
 }
 
@@ -515,11 +518,11 @@ async fn service_get_token(
             "the request body's `member` is missing `id`, `claimed_user_id` or `claimed_device_id`",
         ));
     }
-    refuse_transport_delegation(&request.delay_id)?;
     let user_id = openid_user(&state, &request.openid_token).await?;
     if user_id != request.member.claimed_user_id {
         return Err(unconfirmed());
     }
+    check_transport_delegation(&state, &user_id, &request.delay_id)?;
     let grant = Grant {
         user_id: &user_id,
         room_id: &request.room_id,
@@ -532,23 +535,49 @@ async fn service_get_token(
         full_access: full_access(&state, livekit, &user_id),
     };
     let jwt = mint_for(&state, livekit, &grant).await?;
+    if !request.delay_id.is_empty() {
+        hold(
+            &state,
+            &grant,
+            &request.member.claimed_device_id,
+            &request.delay_id,
+        )?;
+    }
     Ok(Json(json!({ "url": livekit.url, "jwt": jwt })))
 }
 
-/// A token request that also asks the transport to hold the caller's
-/// delayed leave. This server holds delayed leaves on the homeserver path
-/// (`delegate_delayed_leave`) and nowhere else, so it refuses rather than
-/// mint while dropping the request on the floor. `M_BAD_JSON` because that
-/// is what a service without delegation answers, and clients built against
-/// one retry without the delay fields.
-fn refuse_transport_delegation(delay_id: &str) -> Result<(), MatrixError> {
+/// A token request that also hands the transport the caller's delayed
+/// leave (`delay_id`), as Element Call does once a delegation probe has
+/// answered anything but 404: it then schedules an hour-long leave and
+/// stops restarting it, and only the SFU webhook releasing the hold takes
+/// a crashed participant out of the call. `lk-jwt-service` takes this from
+/// full-access users; this server can only send its own users' delayed
+/// events, so it takes it from them and refuses everyone else with the
+/// external service's `M_BAD_JSON`, which clients answer by asking again
+/// without the delay. A delay ID that is not the caller's is refused
+/// rather than held, so nobody can arrange for someone else's leave.
+fn check_transport_delegation(
+    state: &AppState,
+    user_id: &str,
+    delay_id: &str,
+) -> Result<(), MatrixError> {
     if delay_id.is_empty() {
-        Ok(())
-    } else {
-        Err(MatrixError::bad_json(
-            "this service does not hold delayed leaves; the homeserver does",
-        ))
+        return Ok(());
     }
+    if user_id.split_once(':').map(|(_, server)| server) != Some(state.config.server.name.as_str())
+    {
+        return Err(MatrixError::bad_json(
+            "delegation of delayed events is only supported for this server's users",
+        ));
+    }
+    if state.delayed.get(delay_id, user_id).is_err() {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "unknown `delay_id`",
+        ));
+    }
+    Ok(())
 }
 
 /// The refusal for an `OpenID` token that could not be confirmed, in
@@ -919,23 +948,61 @@ async fn delegate_delayed_leave_builtin(
     } else {
         request.member.claimed_device_id.as_str()
     };
+    put_hold(
+        state,
+        &identity.user_id,
+        device_id,
+        &identity_for(&identity.user_id, device_id, &request.member.id),
+        &room,
+        &request.delay_id,
+    )?;
+    Ok(Json(json!({ "held": true })))
+}
+
+/// Record that the participant `grant` admits handed this server their
+/// delayed leave on the token request.
+fn hold(
+    state: &AppState,
+    grant: &Grant<'_>,
+    device_id: &str,
+    delay_id: &str,
+) -> Result<(), MatrixError> {
+    put_hold(
+        state,
+        grant.user_id,
+        device_id,
+        &grant.identity,
+        grant.room_id,
+        delay_id,
+    )
+}
+
+/// One held delegated leave, keyed by its delay, for the SFU webhook to
+/// find by the participant's `LiveKit` identity.
+fn put_hold(
+    state: &AppState,
+    user_id: &str,
+    device_id: &str,
+    identity: &str,
+    room_id: &str,
+    delay_id: &str,
+) -> Result<(), MatrixError> {
     let record = json!({
-        "user_id": identity.user_id,
+        "user_id": user_id,
         "device_id": device_id,
-        "identity": identity_for(&identity.user_id, device_id, &request.member.id),
-        "room_id": room,
-        "delay_id": request.delay_id,
+        "identity": identity,
+        "room_id": room_id,
+        "delay_id": delay_id,
     });
     state
         .store
         .put(
-            delegation_key(&request.delay_id).as_slice(),
+            delegation_key(delay_id).as_slice(),
             serde_json::to_vec(&record)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
                 .as_slice(),
         )
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok(Json(json!({ "held": true })))
+        .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
 /// The SFU webhook: `LiveKit`'s event sink, pointed at this path by the
@@ -964,6 +1031,9 @@ async fn sfu_webhook(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !webhook_signed(&livekit, presented, &body, now_secs()) {
+        // Worth an operator's eye: an SFU whose webhook key or secret
+        // does not match leaves every crashed participant in its call.
+        tracing::warn!("refused an SFU webhook that the SFU's key did not sign");
         return Err(MatrixError::unknown_token());
     }
     let events: Value =
@@ -987,6 +1057,9 @@ async fn sfu_webhook(
             .and_then(Value::as_str)
             .unwrap_or_default();
         released += release_holds_for(&state, identity);
+    }
+    if released > 0 {
+        tracing::info!(released, "the SFU webhook released held delayed leaves");
     }
     Ok(Json(json!({ "released": released })))
 }

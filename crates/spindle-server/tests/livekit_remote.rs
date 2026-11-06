@@ -652,3 +652,31 @@ async fn the_federation_twin_grants_a_remote_users_token() {
         );
     }
 }
+
+/// Delegating a delayed leave to the transport is for this server's own
+/// users: it cannot send another server's delayed events, so a remote
+/// user's `delay_id` gets `lk-jwt-service`'s answer for a user without full
+/// access, and clients ask again without it.
+#[tokio::test]
+async fn a_remote_user_cannot_hand_over_a_delayed_leave() {
+    let call = call(true).await;
+
+    let (status, body) = call
+        .here
+        .post(
+            "/_spindle/rtc/livekit/sfu/get",
+            None,
+            &json!({
+                "room": call.room,
+                "openid_token": call.bob_openid,
+                "device_id": call.bob.device_id,
+                "delay_id": "syd_bobs",
+                "delay_timeout": 3_600_000,
+            }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
+    assert!(call.sfu.created().is_empty(), "nothing was made");
+}

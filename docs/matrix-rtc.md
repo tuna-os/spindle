@@ -116,10 +116,14 @@ itself, with the SFU's `CreateRoom` API at the `http(s)` address of
 on it. This server must reach the SFU at that address. If it cannot, the
 token request fails with `500 M_UNKNOWN`.
 
-A token request that asks the transport to hold the delayed leave
-(`delay_id`) gets `400 M_BAD_JSON`, and clients then ask again without it.
-This server holds delayed leaves on the homeserver path instead (option C
-and the SFU program below).
+Element Call can give the transport its delayed leave on a token request
+(`delay_id`). It does this when a delegation probe does not get a 404.
+Then it schedules a leave an hour away and stops restarting it. This
+server holds that leave for its own users, and the SFU webhook sends it
+when the participant leaves the SFU. A delay that is not the caller's
+gets `400 M_INVALID_PARAM`. A user of another server gets
+`400 M_BAD_JSON`, because this server cannot send their delayed events.
+Clients then ask again without the delay.
 
 **Revocation.** A minted token cannot be revoked: it is stateless, and
 the SFU never asks this server again. A user who leaves the room after
@@ -454,12 +458,10 @@ page, docs/p2p-calls.md, with the rig that proves it against this server.
   is on. While it is off, a federated caller needs `lk-jwt-service`,
   external (option B) or as the sidecar (option C), which mints on its
   own.
-- **Delegation on the transport.** `lk-jwt-service` also holds a delayed
-  leave when a client asks the transport
-  (`{livekit_service_url}/delegate_delayed_leave`, or `delay_id` on a
-  token request). The built-in minter does not: the first is a 404, and
-  the second is `400 M_BAD_JSON`. Clients then restart their own short
-  leave, or use the homeserver path, which this server holds.
+- **The transport's own delegation endpoint.** `lk-jwt-service` also
+  serves `{livekit_service_url}/delegate_delayed_leave`. The built-in
+  minter does not, so that probe gets a 404. Delegation still works
+  through `delay_id` on a token request and through the homeserver path.
 - **Delegated leave without SFU events.** The probe records the hold.
   The release learns the drop from the SFU webhook. The supervised
   sidecar points its webhooks here on generation. A remote deployment

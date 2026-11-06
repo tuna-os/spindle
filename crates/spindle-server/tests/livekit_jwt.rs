@@ -450,34 +450,66 @@ async fn the_matrix_2_endpoint_mints_the_hashed_identity() {
     assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
 }
 
-/// A request that also asks the transport to hold the delayed leave is
-/// refused the way a service without delegation refuses it, so the client
-/// retries without -- rather than minted while the hold is silently
-/// dropped. This server holds leaves on the homeserver path.
+/// Element Call hands the transport its delayed leave on a token request
+/// (`delay_id`) once a delegation probe answered anything but 404, and
+/// then stops restarting an hour-long leave: the hold must be recorded, or
+/// a crashed participant stays in the call for that hour. A delay that is
+/// not the caller's is refused, not held, and nothing is minted for it.
 #[tokio::test]
-async fn delegation_to_the_transport_is_refused_not_dropped() {
+async fn a_delayed_leave_handed_to_the_transport_is_held() {
     let harness = Harness::with(LIVEKIT);
     let alice = harness.register("alice").await;
     let room = harness.create_room(&alice).await;
-    let openid = harness.openid_token(&alice).await;
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/t1?org.matrix.msc4140.delay=60000"
+                ))
+                .header("authorization", format!("Bearer {}", alice.access_token))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "msgtype": "m.text", "body": "x" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let delay_id = body["delay_id"].as_str().unwrap().to_owned();
+    let ask = |delay_id: &str, openid: Value| {
+        json!({
+            "room": room,
+            "openid_token": openid,
+            "device_id": alice.device_id,
+            "delay_id": delay_id,
+            "delay_timeout": 3_600_000,
+        })
+    };
 
     let (status, body) = harness
         .post(
             SFU_GET,
             None,
-            json!({
-                "room": room,
-                "openid_token": openid,
-                "device_id": alice.device_id,
-                "delay_id": "syd_abc",
-                "delay_timeout": 18000,
-            }),
+            ask("syd_not_hers", harness.openid_token(&alice).await),
         )
         .await;
-
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
     assert!(harness.sfu.created().is_empty(), "nothing was made");
+    assert_eq!(spindle_server::livekit::held_count(&harness.store), 0);
+
+    let (status, body) = harness
+        .post(
+            SFU_GET,
+            None,
+            ask(&delay_id, harness.openid_token(&alice).await),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        spindle_server::livekit::held_count(&harness.store),
+        1,
+        "the leave is held for the webhook to release"
+    );
 }
 
 /// The signature is bound to the secret: a token the SFU would honour is
