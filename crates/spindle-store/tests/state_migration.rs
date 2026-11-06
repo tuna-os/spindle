@@ -18,13 +18,20 @@
 //! - the version-2 node rows are gone and the intern rows are present;
 //! - a second run reports nothing to do.
 
-use spindle_core::keys::{Keyspace, content_addressed, room_li, room_prefix, store_marker};
+use std::time::Duration;
+
+use spindle_core::keys::{
+    Keyspace, content_addressed, keyspace_prefix, room_from_prefixed, room_li, room_prefix,
+    store_marker,
+};
 use spindle_core::{
     EventId, LinearIndex, RehydrateError, RoomLog, StateKey, rehydrate_v2,
     rehydrate_v2_with_addresses,
 };
 use spindle_store::codec::{EntryRecord, RoomRecord, SidelinedRecord};
-use spindle_store::migrate::{MIGRATIONS, run};
+use spindle_store::migrate::{
+    Event, MIGRATIONS, Progress, Stage, checkpoint, ledger, run, run_reporting,
+};
 use spindle_store::{FjallStore, ReadView, RoomStore, SchemaMarker, Store};
 use tempfile::TempDir;
 
@@ -474,6 +481,27 @@ fn migration_preserves_old_nodes_until_every_room_has_converted() {
     seed_v3_entry(&store);
     write_v2_fixture(&store);
     let other = "!second:example.org";
+    copy_room(&store, other);
+    run(&store, MIGRATIONS, false).unwrap();
+    drop(store);
+    let store = FjallStore::open(dir.path()).unwrap();
+    for room in [ROOM, other] {
+        let restored = RoomStore::new(&store, room).load().unwrap().unwrap();
+        assert!(restored.unverified.is_empty());
+        assert_eq!(
+            restored
+                .log
+                .state_after(LinearIndex::from_raw(2))
+                .unwrap()
+                .get(&StateKey::new("m.room.topic", "")),
+            Some("$t")
+        );
+    }
+}
+
+/// Copy every room-scoped row of `ROOM` to `other`, so both name the same
+/// version-2 nodes.
+fn copy_room(store: &FjallStore, other: &str) {
     for space in [
         Keyspace::RoomMeta,
         Keyspace::Log,
@@ -481,16 +509,156 @@ fn migration_preserves_old_nodes_until_every_room_has_converted() {
         Keyspace::FederationGapEvent,
     ] {
         let prefix = room_prefix(space, ROOM);
-        for (key, value) in ReadView::scan_prefix(&store, &prefix).unwrap() {
+        for (key, value) in ReadView::scan_prefix(store, &prefix).unwrap() {
             let mut copied = room_prefix(space, other);
             copied.extend_from_slice(&key[prefix.len()..]);
-            Store::put(&store, &copied, &value).unwrap();
+            Store::put(store, &copied, &value).unwrap();
         }
     }
-    run(&store, MIGRATIONS, false).unwrap();
+}
+
+/// The rows of `room` that hold a state root: what the step counts.
+fn root_holders(store: &FjallStore, room: &str) -> u64 {
+    [
+        Keyspace::Log,
+        Keyspace::Sidelined,
+        Keyspace::FederationGapEvent,
+    ]
+    .into_iter()
+    .map(|space| {
+        ReadView::scan_prefix(store, &room_prefix(space, room))
+            .unwrap()
+            .len() as u64
+    })
+    .sum()
+}
+
+/// Two version-2 rooms in conversion order, the second holding an entry
+/// that names a root no node row has. Returns both rooms and that entry's
+/// key.
+fn two_rooms_with_the_second_broken(store: &FjallStore) -> (String, String, Vec<u8>) {
+    seed_v3_entry(store);
+    write_v2_fixture(store);
+    copy_room(store, "!second:example.org");
+    let rooms: Vec<String> = ReadView::scan_prefix(store, &keyspace_prefix(Keyspace::RoomMeta))
+        .unwrap()
+        .iter()
+        .filter_map(|(key, _)| room_from_prefixed(key).map(str::to_owned))
+        .collect();
+    let [first, second] = <[String; 2]>::try_from(rooms).unwrap();
+    let template_key = room_li(Keyspace::Log, &second, LinearIndex::from_raw(2));
+    let mut broken =
+        EntryRecord::decode(&ReadView::get(store, &template_key).unwrap().unwrap()).unwrap();
+    broken.li = 3;
+    broken.state_root = [0x5a; 32];
+    let broken_key = room_li(Keyspace::Log, &second, LinearIndex::from_raw(3));
+    Store::put(store, &broken_key, &broken.encode()).unwrap();
+    (first, second, broken_key)
+}
+
+/// The real step says where it is (#656) and resumes from there.
+///
+/// The second room to convert holds an entry naming a root no node row
+/// has, so the first run stops in it as it would on corruption -- after the
+/// first room is converted and checkpointed. The rerun, with the entry
+/// gone, must not convert the first room again, must report the first
+/// room's records as already done, and must leave both rooms readable.
+#[test]
+fn the_state_key_step_reports_progress_and_resumes_after_its_last_finished_room() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open_unchecked(dir.path()).unwrap();
+    let (first, second, broken_key) = two_rooms_with_the_second_broken(&store);
+    let (first, second) = (first.as_str(), second.as_str());
+    let (in_first, in_second) = (root_holders(&store, first), root_holders(&store, second));
+
+    assert!(run(&store, MIGRATIONS, false).is_err());
+    let saved = checkpoint(&store)
+        .unwrap()
+        .expect("the finished room was checkpointed");
+    assert_eq!(
+        (
+            saved.step.as_str(),
+            saved.phase.as_str(),
+            saved.unit.as_str()
+        ),
+        ("intern-state-keys", "convert", "records")
+    );
+    assert_eq!(saved.cursor, first.as_bytes());
+    assert_eq!(
+        (saved.done, saved.total),
+        (in_first, Some(in_first + in_second))
+    );
+    let converted_first = ReadView::get(
+        &store,
+        &room_li(Keyspace::Log, first, LinearIndex::from_raw(2)),
+    )
+    .unwrap()
+    .unwrap();
+
+    Store::delete(&store, &broken_key).unwrap();
+    drop(store);
+    let store = FjallStore::open_unchecked(dir.path()).unwrap();
+    let mut resumed_from = Vec::new();
+    let mut progress: Vec<Progress> = Vec::new();
+    run_reporting(
+        &store,
+        MIGRATIONS,
+        false,
+        Duration::ZERO,
+        &mut |event| match event {
+            Event::Started { resumed, .. } => resumed_from.push(resumed.cloned()),
+            Event::Progress(update) => progress.push((*update).clone()),
+            Event::Applied { .. } => {}
+        },
+    )
+    .unwrap();
+    assert_eq!(resumed_from, [Some(saved)]);
+    let phase = |name: &str| -> Vec<&Progress> {
+        progress
+            .iter()
+            .filter(|update| update.phase == name)
+            .collect()
+    };
+
+    // Counting cannot know its total, so it reports none; it counts only
+    // the rooms left to convert.
+    let count = phase("count");
+    assert!(count.iter().all(|update| update.total.is_none()));
+    assert_eq!(count.last().unwrap().done, in_second - 1);
+    // Converting knows it, and starts at the first room's records.
+    let convert = phase("convert");
+    let total = in_first + in_second - 1;
+    let start = convert[0];
+    assert_eq!(
+        (start.stage, start.done, start.resumed, start.total),
+        (Stage::Started, in_first, in_first, Some(total))
+    );
+    let end = convert.last().unwrap();
+    assert_eq!((end.stage, end.done), (Stage::Finished, total));
+    assert_eq!(
+        convert.len() as u64,
+        2 + in_second - 1,
+        "one update per record of the second room only"
+    );
+    let delete = phase("delete-v2-nodes");
+    assert_eq!(delete[0].unit, "nodes");
+
+    // The first room was not converted again: its rewritten record is the
+    // bytes the first run left.
+    assert_eq!(
+        ReadView::get(
+            &store,
+            &room_li(Keyspace::Log, first, LinearIndex::from_raw(2))
+        )
+        .unwrap()
+        .unwrap(),
+        converted_first
+    );
+    assert!(checkpoint(&store).unwrap().is_none());
+    assert_eq!(ledger(&store).unwrap()[0].id, "intern-state-keys");
     drop(store);
     let store = FjallStore::open(dir.path()).unwrap();
-    for room in [ROOM, other] {
+    for room in [first, second] {
         let restored = RoomStore::new(&store, room).load().unwrap().unwrap();
         assert!(restored.unverified.is_empty());
         assert_eq!(

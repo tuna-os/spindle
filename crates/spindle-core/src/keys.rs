@@ -41,6 +41,35 @@ pub fn store_marker() -> Vec<u8> {
     vec![0x00, 0x00]
 }
 
+/// The prefix of the migration ledger: one row per applied step, keyed by
+/// the step's id (#661).
+///
+/// Beside the marker and outside every [`Keyspace`] for the marker's reason:
+/// a step can change the key schema, so the record that it ran cannot be laid
+/// out by the schema it moves. The zero first byte keeps it clear of every
+/// keyspace (see the assertion below), and the second byte keeps it clear of
+/// the marker.
+#[must_use]
+pub fn migration_ledger_prefix() -> Vec<u8> {
+    vec![0x00, 0x01]
+}
+
+/// The ledger row recording that migration step `id` was applied.
+#[must_use]
+pub fn migration_applied(id: &str) -> Vec<u8> {
+    let mut key = migration_ledger_prefix();
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+/// The progress of the one step a `spindle migrate` run has not finished
+/// (#656). One key, not one per step: steps run in order, so at most one is
+/// ever part way through.
+#[must_use]
+pub fn migration_progress() -> Vec<u8> {
+    vec![0x00, 0x02]
+}
+
 /// The marker's non-collision is a compile-time property, so it is checked at
 /// compile time: a zero `KEY_SCHEMA_VERSION` would put room keys in the
 /// marker's range, and that must fail the build rather than a test run.
