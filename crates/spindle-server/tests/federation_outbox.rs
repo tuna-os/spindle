@@ -466,3 +466,68 @@ async fn pending_rows_survive_a_rebuild_and_deliver_after() {
         stub.delivered()
     );
 }
+/// A server that accepts connections and never answers: what a dead or
+/// wedged homeserver looks like to the outbox, a request that runs into
+/// its timeout. Returns its server name.
+async fn hanging_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    name
+}
+
+/// reilly.asia, 2026-11-06: a call ring for matrix.org never rang because
+/// the outbox sent one destination at a time, and every pass first waited
+/// out the 30 s timeout of each dead server it owed a transaction. Here
+/// three hanging servers are owed rows and the drain loop is already
+/// waiting on them when a message for a live peer is sent: the live peer
+/// must get it within seconds, not after the dead servers' timeouts.
+#[tokio::test]
+async fn a_live_peer_is_not_kept_waiting_behind_dead_servers() {
+    let stub = Stub::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    assert!(
+        stub.wait_for(|stub| !stub.delivered().is_empty()).await,
+        "the invite reached the peer first"
+    );
+
+    for seq in 0..3_u64 {
+        let dead = hanging_server().await;
+        spindle_store::Store::put(
+            harness.store.as_ref(),
+            &spindle_core::keys::federation_outbox(&dead, u64::MAX - seq),
+            json!({ "type": "m.room.message", "content": {} })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    }
+    // Let the drain loop pick the dead destinations up and start waiting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    harness.say(&room, &alice, "ring ring", "ring").await;
+    let started = std::time::Instant::now();
+    let mut arrived = false;
+    while started.elapsed() < Duration::from_secs(10) {
+        if stub
+            .pdus()
+            .iter()
+            .any(|pdu| pdu["content"]["body"] == json!("ring ring"))
+        {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        arrived,
+        "the live peer got nothing within 10 s while dead servers were owed rows"
+    );
+}

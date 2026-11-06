@@ -99,8 +99,7 @@ fn no_room_version_is_advertised_before_rooms_can_be_created_or_joined() {
 async fn every_route_the_table_claims_actually_answers() {
     for path in routes::MOUNTED {
         let (status, body) = get(path).await;
-        let unrecognized =
-            status == StatusCode::NOT_FOUND && body["errcode"] == "M_UNRECOGNIZED";
+        let unrecognized = status == StatusCode::NOT_FOUND && body["errcode"] == "M_UNRECOGNIZED";
         assert!(
             !unrecognized,
             "{path} is in MOUNTED but the router does not serve it"

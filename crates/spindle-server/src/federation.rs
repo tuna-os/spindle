@@ -2681,34 +2681,79 @@ struct OutboundTransaction {
     request: Result<PreparedTransaction, FederationError>,
 }
 
+/// Transactions in flight at once, across destinations. One per
+/// destination at most, so each peer still sees its transactions in order.
+const MAX_IN_FLIGHT: usize = 64;
+
+/// Of [`MAX_IN_FLIGHT`], how many may go to destinations that are backing
+/// off, so dead servers cannot take every slot from a live one.
+const RETRY_SLOTS: usize = 48;
+
+/// What became of one transaction, sent back to the loop that owns the
+/// backoff table and the store.
+struct Delivered {
+    destination: String,
+    keys: Vec<Vec<u8>>,
+    sent: Result<(), FederationError>,
+}
+
 /// Drain the outbound queue, forever.
 ///
-/// A polling loop rather than a wakeup protocol: the scan of an empty
-/// keyspace is a bounded prefix read, and the poll interval doubles as the
-/// floor of the retry backoff. Rows are deleted only after the destination
-/// acknowledged the transaction carrying them — a crash between send and
-/// delete re-sends, and the transaction ID being derived from the first
-/// row's sequence lets the peer's replay table absorb the duplicate.
-///
-/// Holds the store and the federation weakly and ends when they are gone,
-/// for the reason `spawn_delivery_loops` gives. A pass upgrades them to
-/// plan -- scan, group, sign -- and lets go before the first request is
-/// sent, upgrading the store again for each acknowledgement. So neither
-/// await this task can be cancelled at, the idle sleep or a send in
-/// flight, finds it holding anything the store's close could wait on.
+/// Destinations are sent to concurrently, at most one transaction each and
+/// [`MAX_IN_FLIGHT`] in all. They used to be sent one after another, so a
+/// pass waited out the 30 s timeout of every unreachable server before the
+/// next destination's turn (a ring for matrix.org waited behind hours of
+/// them on reilly.asia). Rows are deleted only after the destination
+/// acknowledged the transaction carrying them.
 pub async fn drain_outbox(
     store: Weak<FjallStore>,
     federation: Weak<Federation>,
     retry_base: Duration,
 ) {
     let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
+    let mut in_flight: tokio::task::JoinSet<Delivered> = tokio::task::JoinSet::new();
+    let mut busy: HashMap<tokio::task::Id, String> = HashMap::new();
+    let poll = retry_base
+        .min(Duration::from_millis(500))
+        .max(Duration::from_millis(25));
     loop {
-        tokio::time::sleep(
-            retry_base
-                .min(Duration::from_millis(500))
-                .max(Duration::from_millis(25)),
-        )
-        .await;
+        let finished = tokio::select! {
+            () = tokio::time::sleep(poll) => None,
+            done = in_flight.join_next_with_id(), if !in_flight.is_empty() => done,
+        };
+        let mut outcomes = Vec::new();
+        let mut take =
+            |done: Result<(tokio::task::Id, Delivered), tokio::task::JoinError>| match done {
+                Ok((id, delivered)) => {
+                    busy.remove(&id);
+                    outcomes.push(delivered);
+                }
+                Err(error) => {
+                    if let Some(destination) = busy.remove(&error.id()) {
+                        outcomes.push(Delivered {
+                            destination,
+                            keys: Vec::new(),
+                            sent: Err(FederationError::Refused(format!(
+                                "delivery task failed: {error}"
+                            ))),
+                        });
+                    }
+                }
+            };
+        if let Some(done) = finished {
+            take(done);
+        }
+        while let Some(done) = in_flight.try_join_next_with_id() {
+            take(done);
+        }
+        for delivered in outcomes {
+            if !settle(&store, &federation, &mut backoff, retry_base, delivered) {
+                return;
+            }
+        }
+        if in_flight.len() >= MAX_IN_FLIGHT {
+            continue;
+        }
         let (transactions, metrics) = {
             let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return;
@@ -2716,67 +2761,110 @@ pub async fn drain_outbox(
             for destination in federation.take_delivery_resets() {
                 backoff.remove(&destination);
             }
-            // The registry is not something the store's close waits on,
-            // so holding it across a send is as harmless as the request.
+            let retrying = busy
+                .values()
+                .filter(|destination| backoff.contains_key(*destination))
+                .count();
+            let slots = Slots {
+                busy: busy.values().cloned().collect(),
+                free: MAX_IN_FLIGHT - in_flight.len(),
+                retry_free: RETRY_SLOTS.saturating_sub(retrying),
+            };
             (
-                plan_transactions(&store, &federation, &backoff),
+                plan_transactions(&store, &federation, &backoff, &slots),
                 Arc::clone(&federation.metrics),
             )
         };
-        for OutboundTransaction {
-            destination,
-            keys,
-            request,
-        } in transactions
-        {
-            let sent = match request {
-                Ok(request) => deliver(request, &destination, &metrics).await,
-                Err(error) => {
-                    metrics.observe_outbound_txn(crate::metrics::TxnResult::Error, Duration::ZERO);
-                    Err(error)
-                }
-            };
-            match sent {
-                Ok(()) => {
-                    // Acknowledged. The rows go through a fresh upgrade: the
-                    // router may have gone while the request was in flight,
-                    // and then the loop ends here and the rows wait for the
-                    // next start to re-send them -- the at-least-once a
-                    // crash between send and delete already promises.
-                    let Some(store) = store.upgrade() else {
-                        return;
-                    };
-                    for key in &keys {
-                        let _ = Store::delete(store.as_ref(), key);
-                    }
-                    backoff.remove(&destination);
-                    if let Some(federation) = federation.upgrade() {
-                        let last_seq = keys
-                            .iter()
-                            .filter_map(|key| key.get(key.len().saturating_sub(8)..))
-                            .filter_map(|bytes| bytes.try_into().ok())
-                            .map(u64::from_be_bytes)
-                            .max();
-                        federation.record_delivery_success(&destination, last_seq);
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!("outbox to {destination}: {error}");
-                    let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
-                    let Some(federation) = federation.upgrade() else {
-                        return;
-                    };
-                    let delay = backoff_delay(
-                        retry_base,
-                        failures,
-                        federation.peer_max_backoff(&destination),
-                    );
-                    federation.record_delivery_failure(&destination, delay);
-                    backoff.insert(destination, (failures, Instant::now() + delay));
-                }
-            }
+        for transaction in transactions {
+            let name = transaction.destination.clone();
+            let handle = in_flight.spawn(send_transaction(transaction, Arc::clone(&metrics)));
+            busy.insert(handle.id(), name);
         }
     }
+}
+
+/// One transaction's delivery, run as its own task.
+async fn send_transaction(
+    transaction: OutboundTransaction,
+    metrics: Arc<crate::metrics::Metrics>,
+) -> Delivered {
+    let OutboundTransaction {
+        destination,
+        keys,
+        request,
+    } = transaction;
+    let sent = match request {
+        Ok(request) => deliver(request, &destination, &metrics).await,
+        Err(error) => {
+            metrics.observe_outbound_txn(crate::metrics::TxnResult::Error, Duration::ZERO);
+            Err(error)
+        }
+    };
+    Delivered {
+        destination,
+        keys,
+        sent,
+    }
+}
+
+/// Record one delivery's outcome. Returns `false` once the store or the
+/// federation is gone, which ends the loop.
+fn settle(
+    store: &Weak<FjallStore>,
+    federation: &Weak<Federation>,
+    backoff: &mut HashMap<String, (u32, Instant)>,
+    retry_base: Duration,
+    delivered: Delivered,
+) -> bool {
+    let Delivered {
+        destination,
+        keys,
+        sent,
+    } = delivered;
+    match sent {
+        Ok(()) => {
+            let Some(store) = store.upgrade() else {
+                return false;
+            };
+            for key in &keys {
+                let _ = Store::delete(store.as_ref(), key);
+            }
+            backoff.remove(&destination);
+            if let Some(federation) = federation.upgrade() {
+                let last_seq = keys
+                    .iter()
+                    .filter_map(|key| key.get(key.len().saturating_sub(8)..))
+                    .filter_map(|bytes| bytes.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .max();
+                federation.record_delivery_success(&destination, last_seq);
+            }
+        }
+        Err(error) => {
+            tracing::debug!("outbox to {destination}: {error}");
+            let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
+            let Some(federation) = federation.upgrade() else {
+                return false;
+            };
+            let delay = backoff_delay(
+                retry_base,
+                failures,
+                federation.peer_max_backoff(&destination),
+            );
+            federation.record_delivery_failure(&destination, delay);
+            backoff.insert(destination, (failures, Instant::now() + delay));
+        }
+    }
+    true
+}
+
+/// What a pass may start: destinations in flight are skipped, at most
+/// `free` transactions are built, at most `retry_free` of them for
+/// destinations that are backing off.
+struct Slots {
+    busy: std::collections::HashSet<String>,
+    free: usize,
+    retry_free: usize,
 }
 
 /// How long to wait before the next attempt at a destination that has
@@ -2807,6 +2895,7 @@ fn plan_transactions(
     store: &FjallStore,
     federation: &Federation,
     backoff: &HashMap<String, (u32, Instant)>,
+    slots: &Slots,
 ) -> Vec<OutboundTransaction> {
     let Ok(rows) = ReadView::scan_prefix(store, &keys::federation_outbox_all()) else {
         return Vec::new();
@@ -2834,11 +2923,30 @@ fn plan_transactions(
             .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
             .collect::<Vec<_>>(),
     );
+    let now = Instant::now();
+    let (healthy, due): (Vec<&String>, Vec<&String>) = by_destination
+        .keys()
+        .filter(|destination| !slots.busy.contains(*destination))
+        .filter(|destination| {
+            backoff
+                .get(*destination)
+                .is_none_or(|(_, until)| *until <= now)
+        })
+        .partition(|destination| !backoff.contains_key(*destination));
+    let healthy_taken = healthy.len().min(slots.free);
+    let retry_taken = due
+        .len()
+        .min(slots.retry_free)
+        .min(slots.free - healthy_taken);
+    let chosen: std::collections::HashSet<String> = healthy
+        .into_iter()
+        .take(healthy_taken)
+        .chain(due.into_iter().take(retry_taken))
+        .cloned()
+        .collect();
     let mut transactions = Vec::new();
     for (destination, rows) in by_destination {
-        if let Some((_, until)) = backoff.get(&destination)
-            && *until > Instant::now()
-        {
+        if !chosen.contains(&destination) {
             continue;
         }
         // At most fifty PDUs per transaction, by spec; the rest wait
@@ -2865,10 +2973,20 @@ fn plan_transactions(
                 .get(key.len() - 8..)
                 .and_then(|bytes| bytes.try_into().ok())
                 .map_or(0, u64::from_be_bytes);
-            // Deterministic by content, not by attempt: a retry after a
-            // crash reuses the same ID, which is what makes redelivery
-            // a no-op on the peer.
-            format!("o{first_seq}")
+            // Deterministic by content, not by attempt: a retry of the same
+            // rows reuses the ID, which makes redelivery a no-op on the
+            // peer; a retry carrying more rows gets a new one, so the peer's
+            // replay table cannot answer for rows it never read (#762).
+            let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+            for (key, _) in &batch {
+                sha2::Digest::update(&mut digest, key);
+            }
+            let rows = u64::from_be_bytes(
+                sha2::Digest::finalize(digest)[..8]
+                    .try_into()
+                    .unwrap_or_default(),
+            );
+            format!("o{first_seq}-{rows:016x}")
         } else {
             // EDU-only: fire-once by design, so uniqueness is all the
             // ID owes anyone.
