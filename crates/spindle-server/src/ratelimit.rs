@@ -442,6 +442,17 @@ pub const OPENID_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60))
 /// it rejoins or its token's window closes.
 pub const LIVEKIT_TOKEN_PER_USER: Limit = Limit::new(20, Duration::from_secs(60));
 
+/// `LiveKit` token requests on the built-in JWT service from users of
+/// another server, per that server.
+///
+/// Each one makes this server ask the other over federation whether its
+/// `OpenID` token is real, before any per-user count can mean anything:
+/// the user ID is only known once the other server has answered. Keyed by
+/// the server the request names, so a flood naming one server spends that
+/// server's budget and no other's, and this server asks it at most this
+/// often. Sixty a minute is a large call joining at once.
+pub const LIVEKIT_TOKEN_PER_REMOTE_SERVER: Limit = Limit::new(60, Duration::from_secs(60));
+
 /// Confirmation emails one account may ask for (#608).
 ///
 /// Each is a mail to an address the account only claims to own, so the

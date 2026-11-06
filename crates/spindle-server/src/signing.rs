@@ -226,7 +226,7 @@ fn decode_base64_unpadded(encoded: &str) -> Result<Vec<u8>, SigningError> {
 /// Matrix uses unpadded base64 throughout, and a padded value is not merely
 /// ugly — it is a different string, so a peer comparing key bytes to a cached
 /// copy would see a mismatch.
-fn base64_unpadded(bytes: &[u8]) -> String {
+pub(crate) fn base64_unpadded(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

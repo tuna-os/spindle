@@ -1,0 +1,6 @@
+# Element Call specs Spindle must pass with its built-in LiveKit minter in
+# the first seat and upstream's Synapse and lk-jwt-service in the second
+# (#796, #795): run.sh with SPINDLE_RTC=builtin SPINDLE_PEER=synapse,
+# checked by scripts/element-call-check.py like allowlist-synapse-peer.txt.
+#
+# Each entry names the run that recorded it passing.

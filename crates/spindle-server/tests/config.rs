@@ -230,6 +230,28 @@ fn the_shipped_example_parses() {
     );
 }
 
+/// The Element Call rig's seats (contrib/element-call/) run only on a
+/// Docker host in CI, an hour into a nightly job; a config that does not
+/// parse would surface there as a homeserver that never answered. Every
+/// seat's config is parsed here instead.
+#[test]
+fn the_element_call_rig_configs_parse() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contrib/element-call");
+    let mut seats = 0;
+    for entry in std::fs::read_dir(dir).expect("the rig directory exists") {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let text = std::fs::read_to_string(&path).unwrap();
+            parse(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            seats += 1;
+        }
+    }
+    assert!(seats >= 4, "both seats, in both minter variants: {seats}");
+}
+
 /// #36 asks for both delayed-event caps to be "rejected loudly". A zero is
 /// the case worth naming: it reads like "no limit" and means the opposite,
 /// so a server that accepted it would start with the dead-man's switch

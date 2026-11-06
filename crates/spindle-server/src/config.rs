@@ -652,6 +652,18 @@ pub struct LivekitConfig {
     /// needs it, knowing what the hour buys.
     #[serde(default = "default_livekit_ttl")]
     pub token_ttl_seconds: u64,
+    /// Other servers whose users may publish on this SFU, by server name.
+    ///
+    /// This server's own users always may. A user of any other server is
+    /// verified over federation (their server's `openid/userinfo`) and,
+    /// unless their server is listed here, minted a token that joins and
+    /// subscribes but does not publish: they can see and hear a call on
+    /// this SFU while their own media goes through their own server's. That
+    /// is `lk-jwt-service`'s split (`LIVEKIT_FULL_ACCESS_HOMESERVERS`),
+    /// minus its `*`: publishing costs this SFU's bandwidth, so every server
+    /// granted it is named.
+    #[serde(default)]
+    pub full_access_servers: Vec<String>,
 }
 
 impl LivekitConfig {
@@ -2129,6 +2141,19 @@ impl Config {
                     message: "must be a path when set — leave it unset for \
                               <storage.path>/livekit.yaml"
                         .to_owned(),
+                });
+            }
+            if let Some(name) = livekit
+                .full_access_servers
+                .iter()
+                .find(|name| ruma::ServerName::parse(name.as_str()).is_err())
+            {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.full_access_servers",
+                    message: format!(
+                        "{name:?} is not a server name — list servers by name; \
+                         there is no wildcard"
+                    ),
                 });
             }
         }

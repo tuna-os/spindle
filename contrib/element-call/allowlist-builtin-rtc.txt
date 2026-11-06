@@ -1,0 +1,7 @@
+# Element Call specs Spindle must pass with its built-in LiveKit minter in
+# place of upstream's lk-jwt-service (#796): run.sh with SPINDLE_RTC=builtin,
+# checked by scripts/element-call-check.py like allowlist.txt.
+#
+# The same rules as allowlist.txt: one `<spec file> :: <test title>` per
+# line, promoted by review, and nothing claimed that has not been seen to
+# pass -- every entry names the run that recorded it.

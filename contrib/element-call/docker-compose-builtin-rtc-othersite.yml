@@ -1,0 +1,11 @@
+# The built-in LiveKit minter in the second seat (#796), after
+# docker-compose-spindle-othersite.yml and docker-compose-builtin-rtc.yml when
+# SPINDLE_RTC=builtin and the second seat is a Spindle: its config with
+# `[rtc.livekit]`, and the second SFU's webhooks sent to it.
+services:
+  synapse-1:
+    volumes:
+      - ${SPINDLE_CONTRIB:-.}/spindle-othersite-builtin-rtc.toml:/cfg/spindle.toml:ro,Z
+  livekit-1:
+    volumes:
+      - ./backend/spindle-builtin-rtc/dev_livekit-othersite.yaml:/etc/livekit.yaml:Z

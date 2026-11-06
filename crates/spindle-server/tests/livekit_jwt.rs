@@ -13,17 +13,28 @@
 //!
 //! The contract is `lk-jwt-service`'s, so a client cannot tell the two
 //! apart, and the discovery test pins that the service advertises itself
-//! the way the external one would be advertised.
+//! the way the external one would be advertised. So are its room names and
+//! Matrix 2.0 identities, and its habit of creating a full-access user's
+//! room through the SFU's API: the harness runs a stand-in SFU for that.
+//! Users of other servers are `livekit_remote.rs`'s.
+
+#[path = "support/mock_sfu.rs"]
+mod mock_sfu;
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hmac::{KeyInit as _, Mac as _};
+use mock_sfu::{MockSfu, lk_hash};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+/// The SFU address the configurations below name; the harness swaps it for
+/// its stand-in's.
+const SFU: &str = "wss://sfu.example.org";
 
 const LIVEKIT: &str = r#"
 [rtc]
@@ -38,11 +49,13 @@ secret = "not-the-signing-key"
 
 const SERVICE_URL: &str = "https://example.org/_spindle/rtc/livekit";
 const SFU_GET: &str = "/_spindle/rtc/livekit/sfu/get";
+const GET_TOKEN: &str = "/_spindle/rtc/livekit/get_token";
 
 struct Harness {
     _dir: TempDir,
     store: Arc<FjallStore>,
     app: axum::Router,
+    sfu: MockSfu,
 }
 
 struct Session {
@@ -55,8 +68,10 @@ impl Harness {
     fn with(rtc: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let sfu = MockSfu::start();
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{rtc}"
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{}",
+            rtc.replace(SFU, &sfu.url)
         ))
         .expect("the configuration is valid");
         let app =
@@ -65,6 +80,7 @@ impl Harness {
             _dir: dir,
             store,
             app,
+            sfu,
         }
     }
 
@@ -162,7 +178,7 @@ impl Harness {
         body
     }
 
-    /// What Element Call posts, field for field.
+    /// What Element Call posts to the legacy endpoint, field for field.
     async fn sfu_get(
         &self,
         room: &str,
@@ -176,6 +192,31 @@ impl Harness {
                 "room": room,
                 "openid_token": openid_token,
                 "device_id": device_id,
+            }),
+        )
+        .await
+    }
+
+    /// What Element Call posts to the Matrix 2.0 endpoint, field for field.
+    async fn get_token(
+        &self,
+        room: &str,
+        openid_token: Value,
+        session: &Session,
+        member_id: &str,
+    ) -> (StatusCode, Value) {
+        self.post(
+            GET_TOKEN,
+            None,
+            json!({
+                "room_id": room,
+                "slot_id": "m.call#ROOM",
+                "openid_token": openid_token,
+                "member": {
+                    "id": member_id,
+                    "claimed_user_id": session.user_id,
+                    "claimed_device_id": session.device_id,
+                },
             }),
         )
         .await
@@ -288,7 +329,9 @@ async fn the_service_is_advertised_first_on_both_surfaces() {
 }
 
 /// The whole flow, as Element Call drives it: `OpenID` token, then the SFU
-/// token, scoped to the room and the device that asked.
+/// token, scoped to the room and the device that asked -- in the room
+/// `lk-jwt-service` would have put the call in, which this server has made
+/// on the SFU before handing the token over.
 #[tokio::test]
 async fn a_joined_member_is_minted_a_token_scoped_to_that_room() {
     let harness = Harness::with(LIVEKIT);
@@ -301,10 +344,7 @@ async fn a_joined_member_is_minted_a_token_scoped_to_that_room() {
     let after = now_secs();
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["url"], "wss://sfu.example.org",
-        "the SFU's own address"
-    );
+    assert_eq!(body["url"], harness.sfu.url, "the SFU's own address");
     let jwt = decode_jwt(body["jwt"].as_str().unwrap(), "not-the-signing-key");
     assert!(jwt.signed, "signed with LiveKit's secret and nothing else");
     assert_eq!(jwt.header, json!({ "alg": "HS256", "typ": "JWT" }));
@@ -314,9 +354,10 @@ async fn a_joined_member_is_minted_a_token_scoped_to_that_room() {
         format!("{}:{}", alice.user_id, alice.device_id),
         "the identity Element Call matches participants by"
     );
+    let alias = lk_hash(&[&room, "m.call#ROOM"]);
     assert_eq!(
-        jwt.claims["video"]["room"], room,
-        "scoped to the room asked for"
+        jwt.claims["video"]["room"], alias,
+        "scoped to the room asked for, named as lk-jwt-service names it"
     );
     assert_eq!(jwt.claims["video"]["roomJoin"], true);
     assert_eq!(jwt.claims["video"]["canPublish"], true);
@@ -329,6 +370,114 @@ async fn a_joined_member_is_minted_a_token_scoped_to_that_room() {
     let exp = jwt.claims["exp"].as_u64().unwrap();
     assert!((before..=after).contains(&nbf), "not before now: {nbf}");
     assert_eq!(exp - nbf, 900, "the default window, fifteen minutes");
+
+    let created = harness.sfu.created();
+    assert_eq!(created.len(), 1, "the room is made on the SFU: {created:?}");
+    assert_eq!(created[0].name, alias);
+    assert_eq!(
+        (
+            &created[0].body["empty_timeout"],
+            &created[0].body["departure_timeout"]
+        ),
+        (&json!(300), &json!(20)),
+        "lk-jwt-service's timeouts"
+    );
+    let admin = decode_jwt(&created[0].bearer, "not-the-signing-key");
+    assert!(admin.signed, "the room API is asked with the SFU's own key");
+    assert_eq!(admin.claims["iss"], "APIkey");
+    assert_eq!(
+        admin.claims["video"],
+        json!({ "room": alias, "roomCreate": true }),
+        "the admin token creates that one room and does nothing else"
+    );
+}
+
+/// The Matrix 2.0 endpoint Element Call asks first: the identity is the
+/// hash of user, device and member ID the client computes for itself, and
+/// the room is the slot's.
+#[tokio::test]
+async fn the_matrix_2_endpoint_mints_the_hashed_identity() {
+    let harness = Harness::with(LIVEKIT);
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let openid = harness.openid_token(&alice).await;
+
+    let (status, body) = harness
+        .get_token(&room, openid.clone(), &alice, "member-1")
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jwt = decode_jwt(body["jwt"].as_str().unwrap(), "not-the-signing-key");
+    assert!(jwt.signed);
+    assert_eq!(
+        jwt.claims["sub"],
+        lk_hash(&[&alice.user_id, &alice.device_id, "member-1"])
+    );
+    assert_eq!(
+        jwt.claims["video"]["room"],
+        lk_hash(&[&room, "m.call#ROOM"])
+    );
+    assert_eq!(jwt.claims["video"]["canPublish"], true);
+
+    let mallory = Session {
+        user_id: "@mallory:example.org".to_owned(),
+        device_id: alice.device_id.clone(),
+        access_token: alice.access_token.clone(),
+    };
+    let (status, body) = harness
+        .get_token(&room, openid.clone(), &mallory, "member-1")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the member's claimed user must be the token's: {body}"
+    );
+    assert_eq!(body["errcode"], "M_UNAUTHORIZED", "{body}");
+
+    let (status, body) = harness
+        .post(
+            GET_TOKEN,
+            None,
+            json!({
+                "room_id": room,
+                "slot_id": "m.call#ROOM",
+                "openid_token": openid,
+                "member": { "id": "member-1", "claimed_user_id": alice.user_id },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no device: {body}");
+    assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
+}
+
+/// A request that also asks the transport to hold the delayed leave is
+/// refused the way a service without delegation refuses it, so the client
+/// retries without -- rather than minted while the hold is silently
+/// dropped. This server holds leaves on the homeserver path.
+#[tokio::test]
+async fn delegation_to_the_transport_is_refused_not_dropped() {
+    let harness = Harness::with(LIVEKIT);
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let openid = harness.openid_token(&alice).await;
+
+    let (status, body) = harness
+        .post(
+            SFU_GET,
+            None,
+            json!({
+                "room": room,
+                "openid_token": openid,
+                "device_id": alice.device_id,
+                "delay_id": "syd_abc",
+                "delay_timeout": 18000,
+            }),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
+    assert!(harness.sfu.created().is_empty(), "nothing was made");
 }
 
 /// The signature is bound to the secret: a token the SFU would honour is
@@ -473,20 +622,23 @@ async fn a_token_this_server_never_minted_is_refused() {
     assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN", "{body}");
 }
 
-/// This server mints for its own users. A token claiming another server
-/// is not verified over federation; it is refused.
+/// A token naming another server is that server's to confirm, never this
+/// one's: this server's own token, relabelled, is not redeemed here. (The
+/// server named is one this server will not contact, so nothing confirms
+/// it; `livekit_remote.rs` has the servers that do.)
 #[tokio::test]
-async fn a_token_for_another_server_is_refused() {
+async fn a_token_for_another_server_is_not_redeemed_here() {
     let harness = Harness::with(LIVEKIT);
     let alice = harness.register("alice").await;
     let room = harness.create_room(&alice).await;
     let mut openid = harness.openid_token(&alice).await;
-    openid["matrix_server_name"] = json!("elsewhere.example.org");
+    openid["matrix_server_name"] = json!("127.0.0.1:1");
 
     let (status, body) = harness.sfu_get(&room, openid, &alice.device_id).await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_UNAUTHORIZED", "{body}");
+    assert!(harness.sfu.created().is_empty(), "nothing was made");
 }
 
 /// An `OpenID` token is not consumed by minting: Element Call may ask twice
@@ -672,5 +824,12 @@ fn misconfiguration_is_refused_at_startup() {
     assert!(
         refused("url = \"wss://sfu.example.org\"\nkey = \"k\"\n").contains("secret"),
         "the secret is not optional"
+    );
+    assert!(
+        refused(
+            "url = \"wss://sfu.example.org\"\nkey = \"k\"\nsecret = \"s\"\nfull_access_servers = [\"*\"]\n"
+        )
+        .contains("no wildcard"),
+        "publishing on this SFU is granted server by server"
     );
 }

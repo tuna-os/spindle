@@ -470,7 +470,14 @@ registrations = []
 # holds their token until it expires — which is why the window below is
 # short, and why it is the whole of the guarantee.
 #
+# Users of other servers in a call are confirmed with their own server
+# (its federation openid/userinfo, as lk-jwt-service does) and get a token
+# that joins and subscribes but does not publish. The call's room is made
+# on the SFU through its API for this server's users, so the SFU can keep
+# `auto_create: false`, and this server must be able to reach `url` below.
+#
 # The SFU's own websocket address, as handed to clients with their token.
+# Its http(s) twin is where rooms are created.
 # url = "wss://livekit.example.org"
 #
 # LiveKit's API key and secret — the same pair the SFU was started with
@@ -483,6 +490,12 @@ registrations = []
 # Set exactly one of secret and secret_file. The file is read once at
 # startup and its trailing newline is ignored; a missing or empty file
 # stops the server. Restart to use a rotated secret.
+#
+# Other servers whose users may publish on this SFU, as if they were this
+# server's own (lk-jwt-service's LIVEKIT_FULL_ACCESS_HOMESERVERS). Named
+# one by one: there is no wildcard, because publishing spends this SFU's
+# bandwidth. Empty by default: other servers' users subscribe only.
+# full_access_servers = ["friend.example.net"]
 #
 # How long a minted token admits its holder, in seconds. Fifteen minutes by
 # default: enough to join and ride out a reconnect, short enough that a
