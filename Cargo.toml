@@ -26,6 +26,10 @@ sha2 = "0.11"
 sha1 = "0.11"
 hmac = "0.13"
 blake3 = "1.8"
+# Verifying upstream identity providers' ID tokens (#610): RS256/PS256,
+# ES256/ES384 and EdDSA signatures from a JWKS. Already in the tree as the
+# rustls and lettre crypto provider, so this adds no crate.
+ring = "0.17"
 # Thumbnails only. Default features off and codecs named, because the default
 # set drags in every format the crate knows -- each decoder is attack surface
 # fed with attacker-controlled bytes, so the list is the formats we thumbnail

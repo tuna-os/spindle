@@ -308,6 +308,28 @@ registrations = []
 # builtin_oidc = true.
 # oidc_issuer = "https://auth.example.org/"
 
+# Upstream OIDC identity providers (#610): sign-in through Authelia,
+# Keycloak, Kanidm, ... with each upstream identity linked to one account
+# here, as MAS's upstream_oauth2. The sign-in pages show a button per
+# provider and the client API offers them as m.login.sso. Register the
+# redirect URI {issuer}/upstream/callback/{id} at the provider. Not with
+# [auth.delegated]. A first sign-in creates an account from
+# localpart_claim and refuses a name that is taken.
+# upstream_oidc = []    # empty by default; one table like this per provider:
+# [[auth.upstream_oidc]]
+# id = "keycloak"                    # stable: in the callback URL and links
+# name = "Keycloak"                  # the button label (default: id)
+# issuer = "https://sso.example.org/realms/main"
+# client_id = "spindle"
+# client_secret_file = "/run/secrets/keycloak"   # or client_secret = "..."
+# token_endpoint_auth_method = "client_secret_basic"  # or client_secret_post, none
+# scopes = ["openid", "profile", "email"]
+# localpart_claim = "preferred_username"
+# displayname_claim = "name"
+# email_claim = "email"              # used only with email_verified = true
+# link_existing_by_email = false     # link a first sign-in by verified address
+# fetch_userinfo = false             # read claims from userinfo too (Authelia)
+
 # MSC3861 delegation: an external OIDC provider (typically the Matrix
 # Authentication Service) owns identity, and this server validates its
 # access tokens by introspection. Local password login and registration

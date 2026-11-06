@@ -371,26 +371,44 @@ What carries over, and how:
    this once, because the browser session then covers the rest.
 4. **Email addresses** do not carry over yet: users add them again on
    the Email page.
-5. **Upstream identity providers** (MAS `upstream_oauth2`) are not
-   supported. A user who only signed in through one has no password here.
-   Give that user an administrator's reset link (above), with or without
-   mail.
+5. **Upstream identity providers** (MAS `upstream_oauth2`). Configure
+   each provider as `[[auth.upstream_oidc]]` (below). Use the ULID of the
+   MAS provider as `id`, so the callback URL at the provider stays the same.
+   The links of MAS do not carry over yet. A first sign-in links by name
+   only when the name is free. For a user whose account exists, give an
+   administrator's reset link (above), or set `link_existing_by_email`.
 
-### Upstream identity providers (#610): not yet
+### Upstream identity providers (#610)
 
-Sign-in through another OIDC provider is the next step. It is not in
-this release.
+Sign-in can go to another OIDC provider (Authelia, Keycloak, Kanidm).
+The issuer that clients know stays the issuer of Spindle.
+`spindle.example.toml` shows each key of `[[auth.upstream_oidc]]`.
+Register `{issuer}/upstream/callback/{id}` as the redirect URI at the
+provider. The server does not start if `[auth.delegated]` is also set.
 
-The design hook is the authorization page. `authorize` in
-`oidc.rs` finds *who* signs in (today: a password, or a browser session)
-and then mints a code. An upstream provider becomes a third way to find
-the localpart. It adds a redirect to the upstream with its own PKCE and
-state. It adds a callback that validates the ID token and maps the
-subject to a localpart.
+- The sign-in pages show a "Sign in with …" button for each provider.
+  `GET /login` shows `m.login.sso` with the providers, and
+  `/login/sso/redirect` and `/login/sso/redirect/{idpId}` start the flow.
+- The flow is the authorization code flow with PKCE `S256`, a `state`
+  and a `nonce`. A cookie binds the flow to the browser that started it.
+  The flow works once and stops after ten minutes.
+- Spindle reads the discovery document and the JWKS at first use and
+  keeps them for an hour. Spindle checks the signature of the ID token
+  (RS256, PS256, ES256, ES384 or EdDSA). It also checks the issuer, the
+  audience, the expiry time and the nonce of the flow.
+- The link table (keyspace `0x49`) maps the provider `id` and the `sub`
+  to an account. A second sign-in uses the link, not the name.
+- A first sign-in makes an account from `localpart_claim`. It sets the
+  display name, and binds the email address if the provider marks it as
+  verified. If an account has that name, the sign-in fails: Spindle does
+  not give an existing account to a new identity. With
+  `link_existing_by_email`, a verified address that an account here holds
+  links to that account. This is off by default.
+- For the client API, the callback shows a page with a link back to the
+  client. The link has a single-use login token for `m.login.token`.
 
-That map is a link table with issuer and subject as its key, beside the `BrowserSession` and `EmailOwner` keyspaces. After
-that come the same browser session and code issue as a password sign-in.
-Nothing downstream of the localpart changes.
+The metric `spindle_auth_logins_total{method="upstream"}` counts each
+callback by result.
 
 The proof it works — Element Web completing the whole OIDC-native flow
 against a lone Spindle process, with nothing else running — is

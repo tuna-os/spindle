@@ -17,6 +17,10 @@ extend-ignore-re = [
     # of zeroes then SPINDLE in the leetspeak shape MAS uses for its own
     # fixed client ids. `typos` reads the ND out of the middle of it.
     "0+SP1ND1E",
+    # Published test vectors (RFC 7515's RS256 key and token, #610) are
+    # base64url, which `typos` reads as words. A region between
+    # `spellchecker:off` and `spellchecker:on` comments is skipped.
+    "(?s)//\\s*spellchecker:off.*?//\\s*spellchecker:on",
 ]
 
 [default.extend-words]

@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**298 routes implemented; 0 known gaps in scope.**
+**302 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -297,7 +297,7 @@ neither implemented nor counted.
 - `GET/PUT /_matrix/client/v3/profile/{user_id}/displayname`
 - `GET/PUT/DELETE /_matrix/client/v3/profile/{user_id}/{key}`
 
-### Accounts, devices & auth — 18 implemented, 0 planned
+### Accounts, devices & auth — 20 implemented, 0 planned
 
 - `GET /_matrix/client/v3/account/3pid`
 - `POST /_matrix/client/v3/account/3pid/add`
@@ -311,6 +311,8 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/devices`
 - `GET/PUT/DELETE /_matrix/client/v3/devices/{device_id}`
 - `GET/POST /_matrix/client/v3/login`
+- `GET /_matrix/client/v3/login/sso/redirect`
+- `GET /_matrix/client/v3/login/sso/redirect/{idp_id}`
 - `POST /_matrix/client/v3/logout`
 - `POST /_matrix/client/v3/logout/all`
 - `POST /_matrix/client/v3/refresh`
@@ -318,7 +320,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/register/available`
 - `POST /_matrix/client/v3/register/email/requestToken`
 
-### Server, discovery & operations — 53 implemented, 0 planned
+### Server, discovery & operations — 55 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -373,6 +375,8 @@ neither implemented nor counted.
 - `POST /account/sessions/end`
 - `GET /health`
 - `GET /ready`
+- `GET /upstream/authorize/{id}`
+- `GET /upstream/callback/{id}`
 
 ## Benchmarks
 

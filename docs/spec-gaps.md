@@ -10,7 +10,7 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-140 of 166 operations served.
+142 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
@@ -40,11 +40,6 @@ and the diff is the work the release brought.
 - `GET /_matrix/media/v3/preview_url` *(deprecated)* — `content-repo.yaml`
 - `GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}` *(deprecated)* — `content-repo.yaml`
 
-### Not served, added in v1.1
-
-- `GET /_matrix/client/v3/login/sso/redirect` — `sso_login_redirect.yaml`
-- `GET /_matrix/client/v3/login/sso/redirect/{idpId}` — `sso_login_redirect.yaml`
-
 ### Not served, added in v1.18
 
 - `GET /.well-known/matrix/policy_server` — `policy_server.yaml`
@@ -66,7 +61,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-154 routes the pinned spec does not define: MSC surfaces under
+156 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -225,3 +220,5 @@ newer than the pin. Each MSC route must be accounted for in
 - `/oauth2/revoke`
 - `/oauth2/token`
 - `/ready`
+- `/upstream/authorize/{}`
+- `/upstream/callback/{}`

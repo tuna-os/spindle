@@ -713,6 +713,132 @@ pub struct AuthConfig {
     /// Absent, the issuer is the client base URL, as before.
     #[serde(default)]
     pub oidc_issuer: Option<String>,
+    /// Upstream OIDC identity providers (#610): sign-in delegated to
+    /// Authelia, Keycloak, Kanidm and the like, with each upstream
+    /// identity linked to one account here, as MAS's `upstream_oauth2`
+    /// does. The built-in provider's authorization and account pages offer
+    /// them as buttons, and the client API offers them as `m.login.sso`.
+    /// Never beside `[auth.delegated]`, whose provider owns sign-in.
+    #[serde(default)]
+    pub upstream_oidc: Vec<UpstreamOidcConfig>,
+}
+
+/// One upstream identity provider.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamOidcConfig {
+    /// A stable name: part of the callback URL registered at the provider
+    /// (`{issuer}/upstream/callback/{id}`) and of every account link, so it
+    /// must not change. A MAS provider's ULID keeps MAS's callback URL.
+    pub id: String,
+    /// The button's label; the `id` when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The provider's issuer; its discovery document is read from
+    /// `{issuer}/.well-known/openid-configuration` on first use.
+    pub issuer: String,
+    pub client_id: String,
+    /// The client secret inline. Prefer `client_secret_file`.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// A file holding the client secret (trailing newline ignored).
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// How the secret is presented at the token endpoint.
+    #[serde(default)]
+    pub token_endpoint_auth_method: UpstreamClientAuth,
+    /// Must include `openid`.
+    #[serde(default = "default_upstream_scopes")]
+    pub scopes: Vec<String>,
+    /// The claim a new account's localpart is taken from.
+    #[serde(default = "default_localpart_claim")]
+    pub localpart_claim: String,
+    /// The claim a new account's display name is taken from.
+    #[serde(default = "default_displayname_claim")]
+    pub displayname_claim: String,
+    /// The claim an email address is taken from; it is used only when the
+    /// provider also says `email_verified: true`.
+    #[serde(default = "default_email_claim")]
+    pub email_claim: String,
+    /// Link a first sign-in to the existing account whose confirmed address
+    /// is the provider's verified one. Off by default: it hands the account
+    /// to whoever controls that address at the provider, which is only as
+    /// safe as the provider's own address verification.
+    #[serde(default)]
+    pub link_existing_by_email: bool,
+    /// Read the claims from the userinfo endpoint too, for a provider
+    /// (Authelia, by default) that puts only `sub` in its ID token.
+    #[serde(default)]
+    pub fetch_userinfo: bool,
+}
+
+impl std::fmt::Debug for UpstreamOidcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamOidcConfig")
+            .field("id", &self.id)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "…"))
+            .field("client_secret_file", &self.client_secret_file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpstreamOidcConfig {
+    /// The client secret, from wherever it was configured; empty for a
+    /// public client.
+    ///
+    /// # Errors
+    ///
+    /// When `client_secret_file` cannot be read — naming the file, never
+    /// the contents.
+    pub fn resolve_secret(&self) -> Result<String, String> {
+        if let Some(path) = &self.client_secret_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| {
+                    format!(
+                        "auth.upstream_oidc {:?} client_secret_file {}: {error}",
+                        self.id,
+                        path.display()
+                    )
+                });
+        }
+        Ok(self.client_secret.clone().unwrap_or_default())
+    }
+}
+
+/// RFC 6749 §2.3 client authentication at the upstream token endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClientAuth {
+    /// HTTP Basic, the method every provider must support.
+    #[default]
+    ClientSecretBasic,
+    /// The secret in the form body.
+    ClientSecretPost,
+    /// A public client: PKCE alone.
+    None,
+}
+
+fn default_upstream_scopes() -> Vec<String> {
+    ["openid", "profile", "email"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_localpart_claim() -> String {
+    "preferred_username".to_owned()
+}
+
+fn default_displayname_claim() -> String {
+    "name".to_owned()
+}
+
+fn default_email_claim() -> String {
+    "email".to_owned()
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -1820,6 +1946,7 @@ impl Config {
             });
         }
         self.validate_builtin_oidc()?;
+        self.validate_upstream_oidc()?;
         if let Some(email) = &self.email {
             email.validate(self.auth.builtin_oidc)?;
         }
@@ -1948,6 +2075,65 @@ impl Config {
                               <storage.path>/livekit.yaml"
                         .to_owned(),
                 });
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream providers: never beside delegation, each with an id that
+    /// is safe in a URL and unique, an http(s) issuer, `openid` among its
+    /// scopes, and a secret configured exactly when its client method
+    /// presents one.
+    fn validate_upstream_oidc(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            field: "auth.upstream_oidc",
+            message,
+        };
+        if !self.auth.upstream_oidc.is_empty() && self.auth.delegated.is_some() {
+            return Err(invalid(
+                "cannot be combined with auth.delegated — the delegated provider owns sign-in"
+                    .to_owned(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.auth.upstream_oidc {
+            let id = &provider.id;
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            {
+                return Err(invalid(format!(
+                    "id {id:?} must be 1-64 characters of letters, digits and - . _ ~ \
+                     (it is part of the callback URL)"
+                )));
+            }
+            if !seen.insert(id.as_str()) {
+                return Err(invalid(format!("id {id:?} is used twice")));
+            }
+            if !provider.issuer.starts_with("https://") && !provider.issuer.starts_with("http://") {
+                return Err(invalid(format!(
+                    "{id:?}: issuer {:?} is not an http(s) URL",
+                    provider.issuer
+                )));
+            }
+            if provider.client_id.is_empty() {
+                return Err(invalid(format!("{id:?}: client_id is empty")));
+            }
+            if !provider.scopes.iter().any(|scope| scope == "openid") {
+                return Err(invalid(format!(
+                    "{id:?}: scopes must include \"openid\" — without it there is no ID token"
+                )));
+            }
+            let secrets = usize::from(provider.client_secret.is_some())
+                + usize::from(provider.client_secret_file.is_some());
+            let wants_secret = provider.token_endpoint_auth_method != UpstreamClientAuth::None;
+            if secrets > 1 || (secrets == 1) != wants_secret {
+                return Err(invalid(format!(
+                    "{id:?}: set exactly one of client_secret and client_secret_file, or \
+                     neither with token_endpoint_auth_method = \"none\""
+                )));
             }
         }
         Ok(())

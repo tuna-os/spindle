@@ -124,18 +124,23 @@ fn session_body(user_id: &str, session: &crate::accounts::Session) -> Value {
 /// `GET /_matrix/client/v3/login`
 ///
 /// Password login, and token login for the tokens `POST /login/get_token`
-/// mints (spec v1.7), which is what `get_login_token: true` tells an
-/// unauthenticated client. SSO is advertised by servers that implement it;
+/// and the SSO callback mint (spec v1.7), which is what
+/// `get_login_token: true` tells an unauthenticated client. `m.login.sso`
+/// is listed only with upstream identity providers configured (#610):
 /// listing a flow we cannot complete would send a client down a path that
 /// dead-ends.
 async fn login_flows(State(state): State<AppState>) -> Result<Json<Value>, MatrixError> {
     if state.delegated.is_some() {
         return Err(delegated_refusal());
     }
-    Ok(Json(json!({ "flows": [
-        { "type": "m.login.password" },
-        { "type": "m.login.token", "get_login_token": true },
-    ] })))
+    let mut flows = vec![
+        json!({ "type": "m.login.password" }),
+        json!({ "type": "m.login.token", "get_login_token": true }),
+    ];
+    if let Some(providers) = crate::upstream::identity_providers(&state) {
+        flows.push(json!({ "type": "m.login.sso", "identity_providers": providers }));
+    }
+    Ok(Json(json!({ "flows": flows })))
 }
 
 /// The `m.login.token` half of `POST /login`: one token, one session.

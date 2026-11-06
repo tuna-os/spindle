@@ -1879,10 +1879,20 @@ pub enum LoginMethod {
     OidcSession,
     /// The account-management sign-in page.
     Account,
+    /// An upstream identity provider's callback (#610): `success`, or
+    /// `error` for an answer that could not be verified or an account that
+    /// could not be found or made.
+    Upstream,
 }
 
 impl LoginMethod {
-    const ALL: [Self; 4] = [Self::Password, Self::Oidc, Self::OidcSession, Self::Account];
+    const ALL: [Self; 5] = [
+        Self::Password,
+        Self::Oidc,
+        Self::OidcSession,
+        Self::Account,
+        Self::Upstream,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -1890,6 +1900,7 @@ impl LoginMethod {
             Self::Oidc => "oidc",
             Self::OidcSession => "oidc_session",
             Self::Account => "account",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -2082,7 +2093,7 @@ impl PasswordRecoveryResult {
 /// label value, which is both the cardinality rule and the privacy one.
 #[derive(Debug, Default)]
 struct AuthCounters {
-    logins: [[AtomicU64; 4]; 4],
+    logins: [[AtomicU64; 4]; 5],
     grants: [[AtomicU64; 4]; 2],
     /// `[requested, completed]`.
     resets: [AtomicU64; 2],

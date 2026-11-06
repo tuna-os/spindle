@@ -89,6 +89,7 @@ pub mod threepid;
 pub mod timeline_routes;
 pub mod tokens;
 pub mod typing;
+pub mod upstream;
 pub mod voip_routes;
 pub mod web;
 
@@ -127,6 +128,9 @@ pub struct AppState {
     /// Present exactly when the built-in OIDC provider is configured
     /// (#159): this server is then its own MSC3861 issuer.
     pub oidc: Option<Arc<oidc::BuiltinOidc>>,
+    /// Present exactly when upstream identity providers are configured
+    /// (#610): sign-in delegated to them, accounts linked here.
+    pub upstream: Option<Arc<upstream::Upstream>>,
     pub federation: Arc<federation::Federation>,
     /// The one registry every counter in this server records into, and
     /// the one `/metrics` renders.
@@ -172,6 +176,7 @@ pub enum AppError {
     PushConfig(String),
     Appservice(String),
     Email(String),
+    Upstream(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -183,6 +188,7 @@ impl std::fmt::Display for AppError {
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
             Self::Email(why) => write!(formatter, "email: {why}"),
+            Self::Upstream(why) => write!(formatter, "upstream identity provider: {why}"),
         }
     }
 }
@@ -494,6 +500,9 @@ fn app_state_with(
         .auth
         .builtin_oidc
         .then(|| Arc::new(oidc::BuiltinOidc::new()));
+    let upstream = upstream::Upstream::new(&config.auth.upstream_oidc)
+        .map_err(AppError::Upstream)?
+        .map(Arc::new);
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
     let delayed = delayed_for(&config, &store);
@@ -523,6 +532,7 @@ fn app_state_with(
         appservices,
         delegated,
         oidc: oidc_provider,
+        upstream,
         federation,
         delayed,
         push,
