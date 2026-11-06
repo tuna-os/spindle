@@ -192,7 +192,8 @@ request. The two tests are `crates/spindle-store/tests/disk_full.rs` and
 ## Migration
 
 ```
-spindle migrate <config> [--dry-run]
+spindle migrate <config> [--dry-run] [--progress text|json]
+spindle migrate --list [<config>]
 ```
 
 Moves a store forward to the schema the current binary speaks.
@@ -205,6 +206,13 @@ ask for it — with the chance to take a backup first.
 
 `--dry-run` prints the plan and writes nothing. Use it. It is where you find
 out whether the plan contains a step you cannot undo.
+
+`--list` prints each step of this binary: its id, the schema it starts from,
+the schema it goes to, and if you can undo it. Without a config, the list
+tells you which schemas this release can move a store from. With a config, it
+also gives the status of each step on that store. The status is `applied`
+(with the time and the number of rows), `pending`, `pending, interrupted`
+(with the position), or `not needed`.
 
 ### Take a backup first
 
@@ -234,16 +242,79 @@ Two limits worth stating plainly, because neither is obvious:
   written, because the version they lead to did not exist when that binary was
   built. Upgrade the binary, or restore a backup from before the migration.
 
+### Steps
+
+Each step has an id. The id does not change, and no other step gets it.
+When a step is complete, `migrate` writes a ledger row with the id in the
+store. The same commit moves the schema marker to the schema that the step
+goes to. Backups copy the ledger with the other rows.
+
+| id | from | to | rollback | what it does |
+|---|---|---|---|---|
+| `intern-state-keys` | 1/1/2 | 1/1/3 | irreversible | rewrites the state tries of version 2 with interned key ids (#79) |
+
+The schemas are key schema/record schema/content digest, as in
+[Format versions](#format-versions). A new step must have a row in this
+table. `crates/spindle-store/tests/schema_migration.rs` fails if a step id
+is not here.
+
+### Progress
+
+A step tells you its phase and its count while it runs, on stderr (#656).
+Each line has the step id and the phase, and counts in a stated unit:
+records, rooms or nodes.
+
+- When a phase knows its total, the line shows done/total and a percentage.
+  After one second, it also shows a rate and an ETA.
+- When a phase does not know its total, the line shows the count and
+  "total unknown". The count changes while the work continues. There is no
+  percentage and no ETA.
+
+Each phase writes a line when it starts and when it ends. Between these, it
+writes one line each 5 seconds at most, so a long step does not fill the log.
+
+`--progress json` writes each line as one JSON object, for scripts and
+Kubernetes jobs. The `event` field is `started`, `progress`, `applied` or
+`error`. A `progress` object has `step`, `phase`, `stage`
+(`started`/`running`/`finished`), `unit`, `done`, `total`, `percent`,
+`resumed`, `elapsed_seconds`, `rate_per_second` and `eta_seconds`. A field
+has the value `null` when the step cannot calculate it. The report on stdout
+does not change.
+
+The `intern-state-keys` step has three phases:
+
+| phase | unit | total |
+|---|---|---|
+| `count` | records | unknown: this phase finds the total |
+| `convert` | records | known |
+| `delete-v2-nodes` | nodes | known |
+
 ### What a failure leaves behind
 
-The schema marker is written **last**, and only after every step succeeded.
+The schema marker moves only at the end of a step, after the step is
+complete. It never moves during a step.
 
-A store whose marker claims to be current while its data is half-rewritten
-would be refused by nothing and misread by everything — exactly the silent
-failure the marker exists to prevent, reintroduced by the tool meant to move
-past it. So a failed step leaves the marker where it was: the store still
-describes itself as the version it can still be read as, and you can fix the
-cause and run `migrate` again rather than reaching for the backup.
+If the marker of a store claims a schema that its data does not have, no
+check refuses the store. Then each read can be wrong. The marker exists to
+stop this silent failure, and `migrate` must not cause it. Thus a failed step
+leaves the marker at the schema that the step starts from. The store
+continues to name the version that a binary can read.
+
+You can repair the cause and run `migrate` again, without a restore from the
+backup. Steps that are complete stay complete. The next run starts at the
+step that failed.
+
+A long step also writes a progress record in the store when a part of its
+work is durable. The `intern-state-keys` step writes one after each room. If
+the step stops (an error, a kill, a power failure), the next `migrate` reads
+the record and continues after the last room in it. `--dry-run` and `--list`
+show this position. `migrate` locks the store while it runs. Thus, during
+the run, stderr is where you see the progress.
+
+A step continues from a record only if the record has its id. If the record
+has a different id, `migrate` deletes it, and the step starts again from the
+start. Each step must give the same result when it runs again from the
+start or from its record.
 
 ### Format versions
 
@@ -271,7 +342,7 @@ The transitions so far, numbered so they can be referred to:
 |---|---|---|---|---|---|
 | 1 | engine format | fjall 2 | fjall 3 | #193 | it does not. fjall 3 refuses a v2 directory with `InvalidVersion(Some(V2))` and has no in-process upgrade. Restore from a backup taken under fjall 3, or start a fresh store. |
 | 2 | content digest | 1 | 2 | #330 | it does not, yet. The store is refused as `content_digest 1` (a store from before the marker existed counts as 1 if it holds any row), and no migration step re-derives the addresses. Start a fresh store. |
-| 3 | content digest | 2 | 3 | #79 | `spindle migrate` rewrites state tries with interned keys and persists their intern rows. Irreversible; restore the pre-migration backup to return to version 2. |
+| 3 | content digest | 2 | 3 | #79 | `spindle migrate` runs step `intern-state-keys`: it rewrites state tries with interned keys and persists their intern rows. Irreversible; restore the pre-migration backup to return to version 2. |
 
 The first two were accepted deliberately, because no Spindle had data to lose. They
 are kept on the books rather than forgotten because each is an example of
@@ -283,12 +354,16 @@ nobody has needed it. Key and record schemas have never moved.
 
 ### The current state of the table
 
-The first data rewrite is the version-2 to version-3 content-digest step (#79).
-It converts roots in the linear log, sidelined records and gap history, and
-writes the intern rows with their new nodes. Old nodes are deleted after all
-rooms have converted, because content addresses can be shared across rooms.
-A partial run keeps the old marker; rerunning preserves already converted roots
-and finishes the remaining work. Take a backup before this irreversible step.
+The first data rewrite is the version-2 to version-3 content-digest step (#79),
+`intern-state-keys`. It converts roots in the linear log, sidelined records and
+gap history, and writes the intern rows with their new nodes. It deletes the
+old nodes after all rooms have converted, because rooms can share a content
+address. Take a backup before this irreversible step.
+
+A partial run keeps the old marker. The next run continues after the last
+converted room and finishes the remaining work. The old nodes of the rooms
+that the next run does not convert again stay on disk without a reference.
+`spindle gc` deletes them.
 
 The migration machinery is covered by `crates/spindle-store/tests/schema_migration.rs`;
 the actual rewrite and reopening are covered by `tests/state_migration.rs` in

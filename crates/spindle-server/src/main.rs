@@ -1,5 +1,8 @@
 //! The `spindle` binary.
 
+mod migrate_command;
+
+use migrate_command::migrate;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -139,9 +142,11 @@ async fn main() -> ExitCode {
 /// `gc`. `None` when the command is neither.
 fn store_maintenance_command() -> Option<ExitCode> {
     let command = std::env::args().nth(1)?;
-    let run: fn(&str, bool) -> ExitCode = match command.as_str() {
-        // `spindle migrate <config> [--dry-run]` -- move a store forward to
-        // the schema this binary speaks (#20).
+    match command.as_str() {
+        // `spindle migrate <config> [--dry-run] [--progress text|json]` and
+        // `spindle migrate --list [<config>]` -- move a store forward to
+        // the schema this binary speaks (#20), or say which steps that
+        // takes.
         //
         // Its own command rather than something the server does on start.
         // An upgrade that rewrites the store the moment a new binary boots
@@ -149,21 +154,22 @@ fn store_maintenance_command() -> Option<ExitCode> {
         // know it happened, the old bytes are gone. So `open` refuses and
         // names this, and the rewrite waits for somebody to ask -- having
         // had the chance to take a backup first.
-        "migrate" => migrate,
+        "migrate" => Some(migrate(&std::env::args().skip(2).collect::<Vec<_>>())),
         // `spindle gc <config> [--dry-run]` -- delete the state-trie nodes
         // no stored root reaches (#742). Offline for the reason the
         // collector's module docs give: a sweep racing an append can delete
         // a node the append has just made live again. Opening the store
         // takes the engine's directory lock, so a running server refuses it.
-        "gc" => gc,
-        _ => return None,
-    };
-    let Some(config_path) = std::env::args().nth(2) else {
-        eprintln!("usage: spindle {command} <config> [--dry-run]");
-        return Some(ExitCode::FAILURE);
-    };
-    let dry_run = std::env::args().any(|argument| argument == "--dry-run");
-    Some(run(&config_path, dry_run))
+        "gc" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle gc <config> [--dry-run]");
+                return Some(ExitCode::FAILURE);
+            };
+            let dry_run = std::env::args().any(|argument| argument == "--dry-run");
+            Some(gc(&config_path, dry_run))
+        }
+        _ => None,
+    }
 }
 
 /// Collect the store's unreachable state-trie nodes, or with `dry_run`
@@ -719,64 +725,6 @@ fn import_synapse_rehearsal(
     println!(
         "rehearsal only: no media, remote cached keys, receipts, pushers, or federation cutover"
     );
-    ExitCode::SUCCESS
-}
-
-/// Move a store forward to the schema this binary speaks.
-fn migrate(config_path: &str, dry_run: bool) -> ExitCode {
-    let config = match Config::load(config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("cannot read {config_path}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Unchecked on purpose: the store this is being run on is one the
-    // ordinary open has already refused.
-    let store = match spindle_store::FjallStore::open_unchecked(&config.storage.path) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("cannot open store: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let report =
-        match spindle_store::migrate::run(&store, spindle_store::migrate::MIGRATIONS, dry_run) {
-            Ok(report) => report,
-            Err(error) => {
-                eprintln!("migrate: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-    if report.steps.is_empty() {
-        println!("migrate: the store is already at this binary's schema");
-        return ExitCode::SUCCESS;
-    }
-    // The irreversibility notice comes first, and on a dry run it is the
-    // whole point of the exercise: the operator is being told what they
-    // cannot undo while they can still choose not to do it.
-    if report.irreversible() {
-        println!(
-            "migrate: this plan CANNOT be undone -- going back means restoring \
-             a backup taken before it runs"
-        );
-    }
-    for (summary, reversible, rows) in &report.steps {
-        let note = match reversible {
-            spindle_store::migrate::Reversible::Yes => "reversible",
-            spindle_store::migrate::Reversible::No => "IRREVERSIBLE",
-        };
-        if dry_run {
-            println!("migrate: would apply [{note}] {summary}");
-        } else {
-            println!("migrate: applied [{note}] {summary} ({rows} rows)");
-        }
-    }
-    if dry_run {
-        println!("migrate: dry run, nothing written");
-    } else {
-        println!("migrate: done, store is now at this binary's schema");
-    }
     ExitCode::SUCCESS
 }
 
