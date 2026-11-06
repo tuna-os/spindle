@@ -514,7 +514,7 @@ struct Pass<'a> {
     account_data: &'a AccountData,
     profiles: &'a Profiles,
     pushers_of: HashMap<String, Vec<Value>>,
-    rulesets: HashMap<String, Value>,
+    rulesets: HashMap<String, std::sync::Arc<Value>>,
     facts: HashMap<String, RoomFacts>,
 }
 
@@ -679,7 +679,7 @@ impl Pass<'_> {
         &self.pushers_of[user_id]
     }
 
-    fn ruleset_of(&mut self, user_id: &str) -> Value {
+    fn ruleset_of(&mut self, user_id: &str) -> std::sync::Arc<Value> {
         if !self.rulesets.contains_key(user_id) {
             let ruleset = self
                 .account_data
@@ -687,12 +687,12 @@ impl Pass<'_> {
                 .ok()
                 .flatten()
                 .map_or_else(
-                    || crate::push_rules::defaults(user_id),
-                    |stored| crate::push_rules::with_defaults(stored, user_id),
+                    || crate::push_rules::shared_defaults(user_id),
+                    |stored| std::sync::Arc::new(crate::push_rules::with_defaults(stored, user_id)),
                 );
             self.rulesets.insert(user_id.to_owned(), ruleset);
         }
-        self.rulesets[user_id].clone()
+        std::sync::Arc::clone(&self.rulesets[user_id])
     }
 
     /// The sender as the room knows them, falling back to their profile.

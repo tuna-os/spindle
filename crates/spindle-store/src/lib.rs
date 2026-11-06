@@ -626,6 +626,10 @@ pub struct FjallStore {
     /// for a setting or a key; it is the defect for anything an event
     /// needs, which is why the append path is held to writing none (#84).
     unbatched: AtomicU64,
+    /// Ungrouped fsyncs -- `Durability::Strict` and [`Store::flush`] --
+    /// performed since open. With the group's own count, every disk
+    /// barrier this store has paid: see [`FjallStore::barriers`].
+    ungrouped_syncs: AtomicU64,
     /// Batches journalled but not necessarily synced, ever, since open.
     ///
     /// Exists so a caller can ask "did anything get written while I held
@@ -730,6 +734,19 @@ impl FjallStore {
     #[must_use]
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Disk barriers -- fsyncs -- this store has performed since open, of
+    /// every durability: the grouped ones counted once per sync led, not
+    /// once per commit that rode it.
+    ///
+    /// A barrier costs more than anything else a request can do, and on a
+    /// shared runner's disk it is the cost a benchmark sees. A path that
+    /// should pay none, like a `/sync`, is held to that by subtracting two
+    /// readings (#701).
+    #[must_use]
+    pub fn barriers(&self) -> u64 {
+        self.ungrouped_syncs.load(Ordering::Relaxed) + self.group.counters().0
     }
 
     /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
@@ -870,6 +887,7 @@ impl FjallStore {
             scanned: AtomicU64::new(0),
             written: AtomicU64::new(0),
             unbatched: AtomicU64::new(0),
+            ungrouped_syncs: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
             write_refused: AtomicBool::new(false),
@@ -1362,7 +1380,10 @@ impl Store for FjallStore {
             Durability::Relaxed => Ok(()),
             // Not coalesced: `strict` exists for deployments that want the
             // barrier they asked for, not the cheapest correct one.
-            Durability::Strict => self.latch(self.db.persist(mode).map_err(StoreError::from)),
+            Durability::Strict => {
+                self.ungrouped_syncs.fetch_add(1, Ordering::Relaxed);
+                self.latch(self.db.persist(mode).map_err(StoreError::from))
+            }
             // Take the next sync going -- ours to lead if nobody else is
             // already running one. The group hands the leader's failure to
             // every follower, so each of them latches too.
@@ -1372,6 +1393,7 @@ impl Store for FjallStore {
 
     fn flush(&self) -> Result<(), StoreError> {
         self.injected(true)?;
+        self.ungrouped_syncs.fetch_add(1, Ordering::Relaxed);
         self.latch(
             self.db
                 .persist(PersistMode::SyncAll)

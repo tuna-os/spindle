@@ -487,14 +487,21 @@ pub(crate) fn limit_exceeded(what: &str, limit: usize) -> MatrixError {
 /// change as the spec adds rules, and a user who registered before a rule
 /// existed should get it. Only an edit freezes a ruleset, because only then is
 /// there something of the user's to preserve.
-pub(crate) fn ruleset_of(state: &AppState, user_id: &str) -> Result<Value, MatrixError> {
+///
+/// Shared rather than owned, because the unedited case -- most users -- is
+/// the memoized default ruleset, and the evaluators only read it. A caller
+/// that edits takes its own copy with [`std::sync::Arc::unwrap_or_clone`].
+pub(crate) fn ruleset_of(
+    state: &AppState,
+    user_id: &str,
+) -> Result<std::sync::Arc<Value>, MatrixError> {
     Ok(state
         .account_data
         .get(user_id, "", crate::push_rules::TYPE)
         .map_err(|error| account_data_error(&error))?
         .map_or_else(
-            || crate::push_rules::defaults(user_id),
-            |stored| crate::push_rules::with_defaults(stored, user_id),
+            || crate::push_rules::shared_defaults(user_id),
+            |stored| std::sync::Arc::new(crate::push_rules::with_defaults(stored, user_id)),
         ))
 }
 
@@ -1150,13 +1157,17 @@ pub(crate) struct RoomRuleContext {
 impl RoomRuleContext {
     /// The room-kind facts the rules ask about: the joined count and the
     /// power levels.
+    ///
+    /// The count comes from the roster, not from the member events: `/sync`
+    /// builds this for every room whose new events it scores, and reading
+    /// and parsing every member's body to keep `.len()` of them made a
+    /// one-event delta cost a read per member (#701).
     pub(crate) fn of(state: &AppState, room_id: &str) -> Result<Self, MatrixError> {
         Ok(Self {
             member_count: state
                 .rooms
-                .joined_members(room_id)
-                .map_err(room_error)?
-                .len(),
+                .joined_member_count(room_id)
+                .map_err(room_error)?,
             power_levels: state
                 .rooms
                 .state_event_unscoped(room_id, "m.room.power_levels", "")
