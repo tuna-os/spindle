@@ -6108,6 +6108,7 @@ impl Rooms {
             },
         )?;
         self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+        self.prune_stuck_extremities(log, room_id, &entry.event_id, &json);
         self.enqueue_outbound(log, room_id, &json)?;
         Ok(event_id)
     }
@@ -6505,6 +6506,7 @@ impl Rooms {
             },
         )?;
         self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+        self.prune_stuck_extremities(log, room_id, &entry.event_id, json);
         // A federated redaction has the same effect as one authored here.
         // The target's location changed in v11, so it was resolved above
         // under this room's rules rather than by looking in both places and

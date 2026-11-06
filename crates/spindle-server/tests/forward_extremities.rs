@@ -4,12 +4,14 @@
 //! every append. Production showed a room whose extremities never merged:
 //! the tips from a Synapse import and the peers' tips, in a room where only
 //! remote users speak. Each remote state event then resolved the same
-//! conflicted events again. These tests pin the three parts of the fix:
+//! conflicted events again. These tests pin the parts of the fix:
 //!
 //! - an append whose extremities' states are unchanged is a resolution-cache
 //!   hit, and a state change on one branch is a new question;
 //! - a room that is crowded with extremities, or forked and stale, is merged
 //!   by an `org.matrix.dummy_event` from a local member, which federates;
+//! - a remote tip that lost the resolution and has been left behind is
+//!   dropped, so the branch that beat it stops resolving against it;
 //! - a dummy event is nobody's unread message.
 //!
 //! The peer is the same deliberate stale-parent peer `federation_fork.rs`
@@ -382,6 +384,7 @@ impl Harness {
     }
 
     /// A PDU from the peer naming `parent` as its only parent.
+    #[allow(clippy::too_many_arguments, reason = "one PDU's fields")]
     fn peer_pdu(
         &self,
         peer: &Peer,
@@ -390,6 +393,7 @@ impl Harness {
         event_type: &str,
         state_key: Option<&str>,
         content: &Value,
+        depth: u64,
     ) -> Value {
         let mut pdu = json!({
             "type": event_type,
@@ -397,7 +401,7 @@ impl Harness {
             "room_id": room,
             "content": content,
             "origin_server_ts": now_millis(),
-            "depth": 20,
+            "depth": depth,
             "prev_events": [parent],
             "auth_events": [],
         });
@@ -415,10 +419,22 @@ impl Harness {
             "m.room.message",
             None,
             &json!({ "msgtype": "m.text", "body": text }),
+            20,
         )
     }
 
     fn topic(&self, peer: &Peer, room: &str, parent: &str, topic: &str) -> Value {
+        self.topic_at_depth(peer, room, parent, topic, 20)
+    }
+
+    fn topic_at_depth(
+        &self,
+        peer: &Peer,
+        room: &str,
+        parent: &str,
+        topic: &str,
+        depth: u64,
+    ) -> Value {
         self.peer_pdu(
             peer,
             room,
@@ -426,6 +442,7 @@ impl Harness {
             "m.room.topic",
             Some(""),
             &json!({ "topic": topic }),
+            depth,
         )
     }
 
@@ -520,6 +537,87 @@ async fn an_unmerged_fork_resolves_once_until_a_branch_state_moves() {
     harness.inject(&peer, "topic2", pdu).await;
     let (moved, _, _) = harness.metrics.state_res_counts();
     assert_eq!(moved, after + 1);
+}
+
+/// A tip that lost the resolution and that no local member can merge
+/// (#626). Dummy events are off here, as they are in effect in a room where
+/// no local member may send. The peer's old branch held no state the room
+/// still has, so the first state event on the live branch drops it, and the
+/// state events after that are linear: one resolution for the lot. Before,
+/// each moved the live branch's root and resolved against the stuck tip
+/// again.
+#[tokio::test]
+async fn a_stuck_remote_tip_is_dropped_and_the_branch_resolves_once() {
+    let peer = Peer::start().await;
+    let harness = Harness::new("dummy_events = false\n");
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+    let pdu = harness.message(&peer, &room, &fork_point, "stuck");
+    let stuck = harness.inject(&peer, "stuck", pdu).await;
+
+    let (resolved_before, _, _) = harness.metrics.state_res_counts();
+    let mut tip = fork_point;
+    let mut extremities = Vec::new();
+    for index in 0..6_u64 {
+        let pdu = harness.topic_at_depth(&peer, &room, &tip, &format!("live {index}"), 50 + index);
+        tip = harness.inject(&peer, &format!("live{index}"), pdu).await;
+        extremities.push(harness.extremities(&room));
+    }
+    let (resolved, _, _) = harness.metrics.state_res_counts();
+    assert_eq!(
+        resolved - resolved_before,
+        1,
+        "six state events past a stuck tip resolved once"
+    );
+    assert_eq!(extremities, [1; 6], "the first one dropped the stuck tip");
+    assert_eq!(harness.metrics.extremities_pruned(), 1);
+    assert_eq!(
+        harness.state.rooms.forward_extremity_ids(&room).unwrap(),
+        vec![tip.clone()]
+    );
+
+    // The current state is the live branch's, and the dropped event is still
+    // in the room's history; only the extremity set forgot it.
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["topic"], "live 5");
+    assert!(harness.state.rooms.pdu(&room, &stuck).is_ok());
+
+    // The commits after the drop carried the smaller set to the store, so a
+    // restart does not bring the stuck tip back to be resolved against.
+    let restored = spindle_store::RoomStore::new(harness.store.as_ref(), &room)
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored
+            .log
+            .forward_extremities()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec![tip]
+    );
+}
+
+/// A losing tip stays while it may still be live: the peer's own branch,
+/// fewer than 20 events behind the event that beat it. (Which tips count as
+/// our own, and so always stay, is pinned by the unit tests beside the rule.)
+#[tokio::test]
+async fn a_young_losing_tip_is_kept() {
+    let peer = Peer::start().await;
+    let harness = Harness::new("dummy_events = false\n");
+    let (room, _alice, fork_point) = harness.shared_room(&peer).await;
+    let pdu = harness.message(&peer, &room, &fork_point, "young");
+    harness.inject(&peer, "young", pdu).await;
+    let pdu = harness.topic_at_depth(&peer, &room, &fork_point, "live", 40);
+    harness.inject(&peer, "live", pdu).await;
+    assert_eq!(harness.extremities(&room), 2);
+    assert_eq!(harness.metrics.extremities_pruned(), 0);
 }
 
 /// A room with more extremities than `max_forward_extremities` is merged by

@@ -556,7 +556,9 @@ registrations = []
 # password_hashes_waiting = 32
 
 [logging]
-# A `tracing-subscriber` filter directive.
+# A `tracing-subscriber` filter directive. The default is
+# "info,ruma_state_res=warn": the state resolution library logs two INFO
+# lines for every event it authorizes. Name its target to see them again.
 # filter = "spindle=debug,warn"
 # Export spans as traces. Off unless named; the only value is "otlp", which
 # sends OTLP/HTTP to the endpoint OTEL_EXPORTER_OTLP_ENDPOINT names (its

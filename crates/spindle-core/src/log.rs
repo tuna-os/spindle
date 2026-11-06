@@ -682,6 +682,35 @@ impl RoomLog {
         }
     }
 
+    /// Keep only `keep` of the forward extremities and forget the rest.
+    ///
+    /// For tips the server has shown to be stuck (#626): extremities no
+    /// event will cite, whose states lost the room's resolution to the
+    /// others'. Every kept tip must hold one and the same state. That state
+    /// is the room's current state, with no resolution to record, and an
+    /// event built on the kept tips is linear again instead of one more
+    /// resolution against the stuck branch. The dropped events stay in the
+    /// log; only the extremity set forgets them.
+    ///
+    /// Returns `false` and changes nothing unless `keep` is a non-empty
+    /// subset of the extremities whose states are resident and equal.
+    pub fn retain_forward_extremities(&mut self, keep: &BTreeSet<EventId>) -> bool {
+        if keep.is_empty() || !keep.is_subset(&self.forward_extremities) {
+            return false;
+        }
+        let mut states = keep.iter().map(|tip| self.state_after_event(tip));
+        let Some(Some(state)) = states.next() else {
+            return false;
+        };
+        let root = state.root();
+        if !states.all(|other| other.is_some_and(|other| other.root() == root)) {
+            return false;
+        }
+        self.current = (keep.len() > 1).then(|| state.clone());
+        self.forward_extremities.clone_from(keep);
+        true
+    }
+
     /// How many snapshots are currently held in memory.
     ///
     /// Exposed so a test can assert the bound holds rather than assume it. A
