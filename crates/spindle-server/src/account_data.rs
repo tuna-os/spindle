@@ -10,6 +10,7 @@
 //! Two kinds, global and per-room, in one keyspace. They differ only in
 //! whether a room ID sits in the key, and `/sync` wants both.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -161,6 +162,37 @@ impl AccountData {
             }
         }
         Ok(out)
+    }
+
+    /// The rooms whose entries of `user_id` changed in `(since, until]`,
+    /// with the empty string for the global kind.
+    ///
+    /// One scan of the user's stream marks, which the per-user cap bounds,
+    /// and no contents: `/sync` asks this on every incremental request and
+    /// every long-poll wake. A room with only account-data news has no
+    /// events for the sync's read to find, and per-room scans would price
+    /// each request at the user's room count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountDataError`] if the scan fails.
+    pub fn rooms_changed_between(
+        &self,
+        user_id: &str,
+        since: u64,
+        until: u64,
+    ) -> Result<HashSet<String>, AccountDataError> {
+        let prefix = keys::account_data_stream_user_prefix(user_id);
+        let mut rooms = HashSet::new();
+        for (key, bytes) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let changed = <[u8; 8]>::try_from(&bytes[..])
+                .map(u64::from_be_bytes)
+                .is_ok_and(|position| position > since && position <= until);
+            if changed && let Some(room_id) = keys::account_data_stream_room(user_id, &key) {
+                rooms.insert(room_id.to_owned());
+            }
+        }
+        Ok(rooms)
     }
 }
 

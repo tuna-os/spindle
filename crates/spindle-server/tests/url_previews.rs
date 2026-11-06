@@ -28,9 +28,14 @@ impl Harness {
     fn new(allow_private: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        // The storage path too, not only the store: a preview's image is
+        // stored under `<storage.path>/media`, and the default `./data` is
+        // the crate's source tree.
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
-             [previews]\nallow_private = [{allow_private}]\n"
+            "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n\
+             [ratelimit]\nenabled = false\n\
+             [previews]\nallow_private = [{allow_private}]\n",
+            dir.path().display(),
         ))
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");

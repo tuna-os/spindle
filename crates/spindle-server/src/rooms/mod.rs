@@ -3792,7 +3792,7 @@ impl Rooms {
         .is_some())
     }
 
-    /// Wake everything blocked in [`Self::wait_for_event`].
+    /// Wake everything blocked in [`Self::wait_past`].
     ///
     /// For appends the append itself notifies; this is for the other thing a
     /// waiting `/sync` can be waiting on — a to-device message, which lands
@@ -3936,7 +3936,7 @@ impl Rooms {
             .collect()
     }
 
-    /// Wait until an event lands, or the deadline passes.
+    /// Wait until the stream moves past `seen`, or the deadline passes.
     ///
     /// SPEC §10.3 wants `/sync` to be push rather than poll, and this is the
     /// smallest thing that is: a waiter is woken by the append itself, so a
@@ -3945,23 +3945,15 @@ impl Rooms {
     /// strictly needed -- correct, and coarser than §10.3's per-room
     /// subscriber lists, which is the shape to reach for when rooms stop
     /// sharing one lock.
-    pub async fn wait_for_event(&self, timeout: std::time::Duration) {
-        // `notified()` must be created *before* the position is re-checked by
-        // the caller, or an append landing in between is missed and the client
-        // waits out the full timeout for news that already arrived.
-        let notified = self.appended.notified();
-        self.metrics.sync_waiter_started();
-        let _ = tokio::time::timeout(timeout, notified).await;
-        self.metrics.sync_waiter_finished();
-    }
-
-    /// [`Self::wait_for_event`] for a caller that has already read up to
-    /// `seen`: returns at once if the stream has moved past it since,
-    /// rather than waiting for the next wake. `/sync` reads, finds nothing
-    /// for its user and waits again, so a move landing between that read
+    ///
+    /// Returns at once if the stream has already moved past `seen`, rather
+    /// than waiting for the next wake. A long-poll reads, finds nothing for
+    /// its connection and waits again, so a move landing between that read
     /// and this wait would otherwise be missed until the one after it.
     pub async fn wait_past(&self, seen: u64, timeout: std::time::Duration) {
-        // Created before the check, so a wake in between is not lost.
+        // `notified()` must be created *before* the position is checked, or
+        // an append landing in between is missed and the client waits out
+        // the full timeout for news that already arrived.
         let notified = self.appended.notified();
         if self.stream_position() > seen {
             return;
@@ -5083,6 +5075,27 @@ impl Rooms {
             }
         }
         Ok(changed)
+    }
+
+    /// Whether any of `rooms` had an event in `(since, until]`:
+    /// [`Self::changed_rooms`] for a caller that needs only the answer, so
+    /// it stops at the first room that did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn any_changed<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> Result<bool, RoomError> {
+        for room_id in rooms {
+            if !self.room_slice(room_id, since, until)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The newest `limit` timeline events of a room, oldest first, stamped.

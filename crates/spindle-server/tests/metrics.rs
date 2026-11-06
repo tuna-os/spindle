@@ -490,7 +490,7 @@ async fn a_blocked_sync_shows_up_as_a_subscriber() {
 
     // An initial sync returns at once — there is state to hand over, so
     // nothing waits. Only a sync from a known position with nothing new
-    // reaches wait_for_event, which is the thing being counted.
+    // reaches `Rooms::wait_past`, which is the thing being counted.
     let (status, body) = server
         .request(
             reqwest::Method::GET,

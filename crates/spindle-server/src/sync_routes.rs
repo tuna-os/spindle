@@ -337,44 +337,90 @@ async fn sliding_sync(
     // Timed apart from the rest (#625): a request that may wait its
     // timeout on purpose is not latency anybody should be paged about.
     let long_poll = since.is_some() && timeout_ms > 0;
-    let position =
-        sliding_long_poll(&state, since, timeout_ms, params.extensions.typing.on()).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let typing_wakes = params.extensions.typing.on();
     let to_device_since = request.extensions.to_device.since;
     let txn_id = request.txn_id;
+    let identity = std::sync::Arc::new(identity);
 
-    // Everything below is synchronous room work -- for a cold room, a load
-    // from the store -- so it runs on the blocking pool, not on one of the
-    // handful of async workers the whole server shares (#614).
-    let worker_state = state.clone();
-    crate::blocking::offload(
-        std::sync::Arc::clone(&state.metrics),
-        crate::metrics::BlockingTask::SlidingSync,
-        move || {
-            let (mut body, connection) = sliding_answer(
-                &worker_state,
-                &identity,
-                SlidingInputs {
-                    previous: previous.as_deref(),
-                    params,
-                    position,
-                    to_device_since: to_device_since.as_deref(),
-                },
-            )?;
-            let pos = worker_state.sliding.record(
-                key,
-                connection,
-                previous.is_none(),
-                std::time::Instant::now(),
-            );
-            body.insert("pos".to_owned(), json!(pos));
-            if let Some(txn_id) = txn_id {
-                body.insert("txn_id".to_owned(), json!(txn_id));
+    // Everything in an answer is synchronous room work -- for a cold room, a
+    // load from the store -- so it runs on the blocking pool, not on one of
+    // the handful of async workers the whole server shares (#614).
+    let assemble = |position: u64| {
+        let worker_state = state.clone();
+        let identity = std::sync::Arc::clone(&identity);
+        let previous = previous.clone();
+        let params = params.clone();
+        let to_device_since = to_device_since.clone();
+        crate::blocking::offload(
+            std::sync::Arc::clone(&state.metrics),
+            crate::metrics::BlockingTask::SlidingSync,
+            move || {
+                sliding_answer(
+                    &worker_state,
+                    &identity,
+                    SlidingInputs {
+                        previous: previous.as_deref(),
+                        params,
+                        position,
+                        to_device_since: to_device_since.as_deref(),
+                    },
+                )
+            },
+        )
+    };
+
+    // Long-poll before answering, not after assembling, and until there is
+    // news for this connection rather than until the stream moves. The
+    // stream is server-global: it moves for another user's to-device
+    // message or an event in a room this user is not in, and answering each
+    // move hands the client an empty response. matrix-rust-sdk then sleeps a
+    // second before its next request, and a room key sent in that second
+    // waits it out -- what #781 fixed for classic `/sync` (#705).
+    let mut position = state.rooms.stream_position();
+    let mut typing_moved = false;
+    let (mut body, connection) = loop {
+        // Nothing at all since the connection's position, so there is no
+        // answer to assemble to find that out -- unless a typing change
+        // woke the wait, which moves no position.
+        let quiet = since == Some(position) && !typing_moved;
+        let expired = tokio::time::Instant::now() >= deadline;
+        if !long_poll || expired || !quiet {
+            let (body, connection, news) = assemble(position).await?;
+            // A typing wake is news on its own: the typing extension
+            // answers who is typing now, and has no "since" to say whether
+            // that differs from what the client last saw.
+            if !long_poll || expired || news || typing_moved {
+                break (body, connection);
             }
-            Ok(Json(Value::Object(body)))
-        },
-    )
-    .await
-    .map(|body| mark_long_poll(body.into_response(), long_poll))
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        typing_moved = if typing_wakes {
+            tokio::select! {
+                () = state.rooms.wait_past(position, left) => false,
+                () = state.typing.wait(left) => true,
+            }
+        } else {
+            state.rooms.wait_past(position, left).await;
+            false
+        };
+        position = state.rooms.stream_position();
+    };
+
+    let pos = state.sliding.record(
+        key,
+        connection,
+        previous.is_none(),
+        std::time::Instant::now(),
+    );
+    body.insert("pos".to_owned(), json!(pos));
+    if let Some(txn_id) = txn_id {
+        body.insert("txn_id".to_owned(), json!(txn_id));
+    }
+    Ok(mark_long_poll(
+        Json(Value::Object(body)).into_response(),
+        long_poll,
+    ))
 }
 
 /// Tag a sync response that was allowed to long-poll, so the request
@@ -406,12 +452,24 @@ struct SlidingInputs<'a> {
 }
 
 /// The body of a sliding-sync response, assembled synchronously, without
-/// its `pos`; and what the connection holds once the client has it.
+/// its `pos`; what the connection holds once the client has it; and whether
+/// the answer tells the client anything it does not hold: a room, a list
+/// count, or an extension's news. With the E2EE extension on and keys held,
+/// an event in any of the user's rooms is news too. The one-time-key
+/// counts, the account data and the typing rooms are in every answer, so
+/// being there is not news: see [`sliding_extensions`].
 fn sliding_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
     inputs: SlidingInputs<'_>,
-) -> Result<(serde_json::Map<String, Value>, crate::sliding::Connection), MatrixError> {
+) -> Result<
+    (
+        serde_json::Map<String, Value>,
+        crate::sliding::Connection,
+        bool,
+    ),
+    MatrixError,
+> {
     let SlidingInputs {
         previous,
         params,
@@ -454,7 +512,7 @@ fn sliding_answer(
         .keys()
         .map(|name| (name.clone(), json!({ "count": ordered.len() })))
         .collect();
-    let (extensions, receipts_current) = sliding_extensions(
+    let (extensions, receipts_current, extension_news) = sliding_extensions(
         state,
         identity,
         &params.extensions,
@@ -502,6 +560,30 @@ fn sliding_answer(
             .map(|room_id| (room_id, position)),
     );
 
+    let mut news = previous.is_none_or(|held| held.listed != ordered.len())
+        || !rooms_out.is_empty()
+        || extension_news.news;
+    // Synapse counts its E2EE extension as data whenever the device holds
+    // keys, so a wake from any of the user's rooms answers the connection
+    // that carries it. matrix-rust-sdk depends on that: it uploads new room
+    // keys to the backup after its encryption connection, which has no
+    // rooms, processes an answer. Without these answers, a key for the
+    // user's own message did not reach the backup before the client stopped
+    // (its `test_pinned_events_are_decrypted_after_recovering_*` and
+    // `test_permalink_timelines_redecrypt`).
+    if let Some(held) = previous
+        && !news
+        && extension_news.rooms_wake
+    {
+        let joined = ordered
+            .iter()
+            .map(|(room_id, _)| room_id.as_str())
+            .filter(|room_id| !invited.contains(*room_id));
+        news = state
+            .rooms
+            .any_changed(joined, held.stream, position)
+            .map_err(room_error)?;
+    }
     let mut body = serde_json::Map::new();
     body.insert("lists".to_owned(), Value::Object(lists_out));
     body.insert("rooms".to_owned(), Value::Object(rooms_out));
@@ -511,8 +593,9 @@ fn sliding_answer(
         params,
         rooms,
         receipts,
+        listed: ordered.len(),
     };
-    Ok((body, connection))
+    Ok((body, connection, news))
 }
 
 /// One room of a response to render, and how.
@@ -640,34 +723,14 @@ fn sliding_rooms(
     Ok(rooms_out)
 }
 
-/// Long-poll before answering, not after assembling: an incremental request
-/// with nothing new blocks here, and answers fresh when something lands.
-/// Typing is not an event and has no stream position, so with the typing
-/// extension on a change in who is typing ends the wait too, as it does for
-/// classic sync. Returns the stream position to answer at.
-async fn sliding_long_poll(
-    state: &AppState,
-    since: Option<u64>,
-    timeout_ms: u64,
-    typing_wakes: bool,
-) -> u64 {
-    let position = state.rooms.stream_position();
-    let Some(since) = since else {
-        return position;
-    };
-    if position > since || timeout_ms == 0 {
-        return position;
-    }
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    if typing_wakes {
-        tokio::select! {
-            () = state.rooms.wait_for_event(timeout) => {}
-            () = state.typing.wait(timeout) => {}
-        }
-    } else {
-        state.rooms.wait_for_event(timeout).await;
-    }
-    state.rooms.stream_position()
+/// What the extensions say about whether an answer is news.
+#[derive(Clone, Copy, Default)]
+struct ExtensionNews {
+    /// An extension says something the client does not hold.
+    news: bool,
+    /// The E2EE extension reports one-time or fallback keys, which makes an
+    /// event in any of the user's rooms news: see [`sliding_answer`].
+    rooms_wake: bool,
 }
 
 /// What [`sliding_extensions`] answers from.
@@ -683,23 +746,25 @@ struct ExtensionInputs<'a> {
     receipts: Option<&'a std::collections::HashMap<String, u64>>,
 }
 
-/// The `extensions` object of a sliding-sync response, and the rooms whose
-/// receipts the client is current to once it has it.
+/// The `extensions` object of a sliding-sync response, the rooms whose
+/// receipts the client is current to once it has it, and whether any
+/// extension has news since the connection's previous response.
 ///
 /// Each room extension speaks about its own scope (see
 /// [`crate::sliding::RoomExtension::scope`]). The account data and typing
-/// extensions answer for every room in theirs, changed or not: neither an
-/// account-data nor a typing change bumps a stream position, so there is
-/// no "since" to ask from, and repeating a scope's worth is the answer that
-/// cannot silently drop one -- the same trade classic sync makes for room
-/// account data. Receipts do bump one (`Rooms::mark_receipt`), so their
-/// extension is incremental: see [`receipts_extension`].
+/// extensions answer for every room in theirs, changed or not: typing has
+/// no stream position to ask "since" from, and repeating a scope's worth is
+/// the answer that cannot silently drop one -- the same trade classic sync
+/// makes for room account data. So whether account data is news is asked
+/// of its stream marks rather than of what the extension sends. Receipts
+/// bump the stream too (`Rooms::mark_receipt`), and their extension is
+/// incremental: see [`receipts_extension`].
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
     inputs: ExtensionInputs<'_>,
-) -> Result<(Value, Vec<String>), MatrixError> {
+) -> Result<(Value, Vec<String>, ExtensionNews), MatrixError> {
     let ExtensionInputs {
         since,
         position,
@@ -709,27 +774,27 @@ fn sliding_extensions(
     } = inputs;
     let mut out = serde_json::Map::new();
     let mut receipts_current = Vec::new();
+    let mut news = ExtensionNews::default();
     if !extensions.any() {
-        return Ok((Value::Object(out), receipts_current));
+        return Ok((Value::Object(out), receipts_current, news));
     }
 
     if extensions.to_device.on() {
-        out.insert(
-            "to_device".to_owned(),
-            to_device_extension(
-                state,
-                identity,
-                to_device_since,
-                extensions.to_device.limit,
-                position,
-            )?,
-        );
+        let (to_device, delivered) = to_device_extension(
+            state,
+            identity,
+            to_device_since,
+            extensions.to_device.limit,
+            position,
+        )?;
+        news.news |= delivered;
+        out.insert("to_device".to_owned(), to_device);
     }
     if extensions.e2ee.on() {
-        out.insert(
-            "e2ee".to_owned(),
-            e2ee_extension(state, identity, since, position)?,
-        );
+        let (e2ee, changed, holds_keys) = e2ee_extension(state, identity, since, position)?;
+        news.news |= changed;
+        news.rooms_wake = holds_keys;
+        out.insert("e2ee".to_owned(), e2ee);
     }
     if extensions.account_data.on() {
         let scope = extensions
@@ -739,15 +804,19 @@ fn sliding_extensions(
             "account_data".to_owned(),
             account_data_extension(state, identity, &scope)?,
         );
+        if let Some(since) = since
+            && !news.news
+        {
+            news.news = account_data_moved(state, identity, &scope, since, position)?;
+        }
     }
     if extensions.receipts.on() {
         let scope = extensions
             .receipts
             .scope(&selection.windows, &selection.subscribed);
-        out.insert(
-            "receipts".to_owned(),
-            receipts_extension(state, identity, &scope, receipts, position)?,
-        );
+        let (receipts, any) = receipts_extension(state, identity, &scope, receipts, position)?;
+        news.news |= any;
+        out.insert("receipts".to_owned(), receipts);
         receipts_current = scope.into_iter().map(str::to_owned).collect();
     }
     if extensions.typing.on() {
@@ -763,21 +832,39 @@ fn sliding_extensions(
         out.insert("typing".to_owned(), json!({ "rooms": rooms }));
     }
 
-    Ok((Value::Object(out), receipts_current))
+    Ok((Value::Object(out), receipts_current, news))
+}
+
+/// Whether the global account data, or that of a room in `scope`, changed
+/// in `(since, position]`.
+fn account_data_moved(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    scope: &std::collections::BTreeSet<&str>,
+    since: u64,
+    position: u64,
+) -> Result<bool, MatrixError> {
+    let moved = state
+        .account_data
+        .rooms_changed_between(&identity.user_id, since, position)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(moved
+        .iter()
+        .any(|room_id| room_id.is_empty() || scope.contains(room_id.as_str())))
 }
 
 /// The to-device extension: what is pending for this device, acknowledged
-/// by the extension's own token rather than by `pos`. A client that restarts
-/// its sliding sync from nothing must not lose the to-device messages it has
-/// already decrypted, and one that lost its E2EE state must be able to ask
-/// for them again.
+/// by the extension's own token rather than by `pos`, and whether there is
+/// any. A client that restarts its sliding sync from nothing must not lose
+/// the to-device messages it has already decrypted, and one that lost its
+/// E2EE state must be able to ask for them again.
 fn to_device_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     since: Option<&str>,
     limit: Option<usize>,
     position: u64,
-) -> Result<Value, MatrixError> {
+) -> Result<(Value, bool), MatrixError> {
     // Another server's to-device token acknowledges nothing here: every
     // pending message is delivered, which is the side to err on.
     let acknowledged = crate::tokens::Sync::resume(since)
@@ -793,20 +880,26 @@ fn to_device_extension(
             limit,
         )
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok(json!({
-        "next_batch": crate::tokens::Sync(delivered_until).to_string(),
-        "events": events,
-    }))
+    let any = !events.is_empty();
+    Ok((
+        json!({
+            "next_batch": crate::tokens::Sync(delivered_until).to_string(),
+            "events": events,
+        }),
+        any,
+    ))
 }
 
 /// The E2EE extension: the same three things classic sync carries at the
-/// top level, for the same reasons.
+/// top level, for the same reasons; whether a device list changed; and
+/// whether the device holds one-time or fallback keys. The key counts are
+/// in every answer, so they are not news on their own.
 fn e2ee_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     since: Option<u64>,
     position: u64,
-) -> Result<Value, MatrixError> {
+) -> Result<(Value, bool, bool), MatrixError> {
     let changed = match since {
         Some(since) => visible_device_changes(state, identity, since, position)?,
         None => Vec::new(),
@@ -819,11 +912,20 @@ fn e2ee_extension(
         .devices
         .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok(json!({
-        "device_lists": { "changed": changed, "left": [] },
-        "device_one_time_keys_count": key_counts,
-        "device_unused_fallback_key_types": unused_fallback,
-    }))
+    let any = !changed.is_empty();
+    let holds_keys = !unused_fallback.is_empty()
+        || key_counts
+            .values()
+            .any(|count| count.as_u64().is_some_and(|count| count > 0));
+    Ok((
+        json!({
+            "device_lists": { "changed": changed, "left": [] },
+            "device_one_time_keys_count": key_counts,
+            "device_unused_fallback_key_types": unused_fallback,
+        }),
+        any,
+        holds_keys,
+    ))
 }
 
 /// The account-data extension: the global events, and each room in scope
@@ -868,7 +970,7 @@ fn receipts_extension(
     scope: &std::collections::BTreeSet<&str>,
     held: Option<&std::collections::HashMap<String, u64>>,
     position: u64,
-) -> Result<Value, MatrixError> {
+) -> Result<(Value, bool), MatrixError> {
     let mut by_since: std::collections::BTreeMap<u64, Vec<&str>> =
         std::collections::BTreeMap::new();
     for &room_id in scope {
@@ -902,7 +1004,8 @@ fn receipts_extension(
             );
         }
     }
-    Ok(json!({ "rooms": rooms }))
+    let any = !rooms.is_empty();
+    Ok((json!({ "rooms": rooms }), any))
 }
 
 /// One room's sliding-sync entry.
@@ -1984,11 +2087,9 @@ fn sync_join(
             .map_err(room_error)?;
         let badge = badge(state, identity, &room.room_id, &unread)?;
         // Sent in full on every sync, incremental ones included, rather than
-        // only when it changed. Account data has no stream position of its
-        // own -- the sync token counts room events, and a `PUT` to
-        // `/account_data` appends nothing -- so sending only the delta would
-        // need a second cursor. Until there is one, repeating it is the
-        // answer that cannot silently drop a change.
+        // only what changed: repeating it is the answer that cannot silently
+        // drop a change. A room whose only news is its account data has no
+        // events to bring it here, and `sync_quiet_rooms` adds it.
         let room_data = state
             .account_data
             .all(&identity.user_id, &room.room_id)
@@ -2078,27 +2179,52 @@ fn sync_join(
         join.insert(room.room_id, raw(&entry)?);
     }
 
-    sync_ephemeral_only(
+    // Rooms whose account data the user changed inside the window: only an
+    // incremental sync can leave a room out, an initial one sent them all.
+    let moved_account_data = since
+        .map(|since| {
+            state
+                .account_data
+                .rooms_changed_between(&identity.user_id, since, until)
+                .map_err(|error| account_data_error(&error))
+        })
+        .transpose()?;
+    sync_quiet_rooms(
         state,
         identity,
         filter,
         joined,
-        moved_receipts.as_ref(),
+        QuietNews {
+            receipts: moved_receipts.as_ref(),
+            account_data: moved_account_data.as_ref(),
+        },
         &mut join,
     )?;
     Ok(join)
 }
 
-/// A room where the only news is that someone is typing, or that a
-/// receipt moved, has no timeline events, so `Rooms::sync` leaves it out
-/// -- correctly, since it knows nothing about either. Adding it back here
-/// is what keeps both out of the log layer entirely.
-fn sync_ephemeral_only(
+/// What moved in an incremental sync's window that `Rooms::sync` does not
+/// see: receipts by room, and the rooms whose account data changed.
+#[derive(Clone, Copy)]
+struct QuietNews<'a> {
+    receipts: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    account_data: Option<&'a std::collections::HashSet<String>>,
+}
+
+/// A room where the only news is that someone is typing, that a receipt
+/// moved, or that the user changed its account data -- a tag, say -- has
+/// no timeline events, so `Rooms::sync` leaves it out, correctly, since it
+/// knows nothing about any of them. Adding it back here is what keeps all
+/// three out of the log layer. Without the account data, a long-poll slept
+/// through a tag on a quiet room, and matrix-rust-sdk's protected
+/// `test_room_account_data`, which waits three seconds for one, failed
+/// (#488).
+fn sync_quiet_rooms(
     state: &AppState,
     identity: &crate::accounts::Identity,
     filter: Option<&crate::filters::Filter>,
     joined: &[String],
-    moved_receipts: Option<&std::collections::HashMap<String, Vec<String>>>,
+    moved: QuietNews<'_>,
     join: &mut BTreeMap<String, Box<RawValue>>,
 ) -> Result<(), MatrixError> {
     for room_id in joined {
@@ -2107,7 +2233,7 @@ fn sync_ephemeral_only(
         }
         // An initial sync spoke about every room already; only an
         // incremental one has receipt-only rooms to add.
-        let receipts = match moved_receipts.and_then(|moved| moved.get(room_id)) {
+        let receipts = match moved.receipts.and_then(|moved| moved.get(room_id)) {
             Some(readers) => sync_receipts(state, identity, room_id, Some(readers), &[])?,
             None => None,
         };
@@ -2121,13 +2247,31 @@ fn sync_ephemeral_only(
             filter.and_then(|filter| filter.room.ephemeral.as_ref()),
             events,
         );
-        if events.is_empty() {
+        let room_data = if moved
+            .account_data
+            .is_some_and(|moved| moved.contains(room_id))
+        {
+            crate::filters::Filter::apply(
+                filter.and_then(|filter| filter.room.account_data.as_ref()),
+                state
+                    .account_data
+                    .all(&identity.user_id, room_id)
+                    .map_err(|error| account_data_error(&error))?,
+            )
+        } else {
+            Vec::new()
+        };
+        if events.is_empty() && room_data.is_empty() {
             continue;
         }
-        join.insert(
-            room_id.clone(),
-            raw(&json!({ "ephemeral": { "events": events } }))?,
-        );
+        let mut entry = serde_json::Map::new();
+        if !events.is_empty() {
+            entry.insert("ephemeral".to_owned(), json!({ "events": events }));
+        }
+        if !room_data.is_empty() {
+            entry.insert("account_data".to_owned(), json!({ "events": room_data }));
+        }
+        join.insert(room_id.clone(), raw(&entry)?);
     }
     Ok(())
 }

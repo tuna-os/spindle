@@ -1487,3 +1487,203 @@ async fn an_invite_is_a_room_in_the_list() {
     assert!(entry.get("invite_state").is_none(), "{entry}");
     assert_eq!(entry["joined_count"], json!(2), "{entry}");
 }
+
+/// Bob's connection, up to date, with the to-device extension on: the
+/// request body to long-poll it with, and its `pos`.
+async fn up_to_date_with_to_device(harness: &Harness, bob: &str) -> (Value, String) {
+    let enabled = with_extensions(json!({ "to_device": { "enabled": true } }));
+    let first = harness.sliding(bob, None, &enabled).await;
+    let mut poll = enabled;
+    poll["timeout"] = json!(30_000);
+    poll["extensions"]["to_device"]["since"] =
+        first["extensions"]["to_device"]["next_batch"].clone();
+    (poll, pos(&first))
+}
+
+async fn device_of(harness: &Harness, token: &str) -> String {
+    let (status, whoami) = harness
+        .request(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            token,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{whoami}");
+    whoami["device_id"].as_str().unwrap().to_owned()
+}
+
+/// The stream is server-global, so other users' news moves it too. Classic
+/// `/sync` stopped answering such moves in #781; a sliding long-poll
+/// answered each one with an empty response, and matrix-rust-sdk sleeps a
+/// second before a request that follows the last within a second -- so a
+/// room key sent to the device next waited that second out, and messages
+/// fetched meanwhile stayed undecryptable (#705). The poll stays open
+/// through someone else's room message and someone else's to-device
+/// message, and answers with the one meant for it.
+#[tokio::test]
+async fn a_long_poll_waits_through_news_for_someone_else() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let alice_device = device_of(&harness, &alice).await;
+    let bob_device = device_of(&harness, &bob).await;
+    let alices_room = harness.named_room(&alice, "Hers").await;
+    harness.named_room(&bob, "His").await;
+    let (poll, since) = up_to_date_with_to_device(&harness, &bob).await;
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let bob = bob.clone();
+        tokio::spawn(async move { harness.sliding(&bob, Some(&since), &poll).await })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&alices_room, &alice, "not for bob", "t1").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/to-herself",
+            &alice,
+            &json!({"messages": {"@alice:example.org": {&alice_device: {"ciphertext": "hers"}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/the-room-key",
+            &alice,
+            &json!({"messages": {"@bob:example.org": {&bob_device: {"ciphertext": "the key"}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll did not return when bob's to-device message landed")
+        .unwrap();
+    let to_device: Vec<&str> = response["extensions"]["to_device"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["content"]["ciphertext"].as_str())
+        .collect();
+    assert_eq!(
+        to_device,
+        vec!["the key"],
+        "the poll answered before bob's message: {response}"
+    );
+    assert_eq!(response["rooms"], json!({}), "{response}");
+}
+
+/// Waiting through someone else's news still ends at the timeout, with an
+/// answer that tells the client nothing.
+#[tokio::test]
+async fn a_long_poll_with_nothing_for_its_connection_times_out() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let alices_room = harness.named_room(&alice, "Hers").await;
+    harness.named_room(&bob, "His").await;
+    let (mut poll, since) = up_to_date_with_to_device(&harness, &bob).await;
+    poll["timeout"] = json!(300);
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let bob = bob.clone();
+        tokio::spawn(async move { harness.sliding(&bob, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&alices_room, &alice, "not for bob", "t1").await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll outlived its timeout")
+        .unwrap();
+    assert_eq!(response["rooms"], json!({}), "{response}");
+    assert_eq!(
+        response["extensions"]["to_device"]["events"],
+        json!([]),
+        "{response}"
+    );
+}
+
+/// What the connection does see still ends the wait: a message in a room
+/// in view.
+#[tokio::test]
+async fn a_long_poll_answers_news_in_a_room_in_view() {
+    let harness = Arc::new(Harness::new());
+    let bob = harness.register("bob").await;
+    let his = harness.named_room(&bob, "His").await;
+    let (poll, since) = up_to_date_with_to_device(&harness, &bob).await;
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let bob = bob.clone();
+        tokio::spawn(async move { harness.sliding(&bob, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&his, &bob, "for bob", "t1").await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll did not return for a message in view")
+        .unwrap();
+    assert_eq!(
+        bodies(&response["rooms"][&his]),
+        vec!["for bob"],
+        "{response}"
+    );
+}
+
+/// A connection with no lists or rooms, only the E2EE and to-device
+/// extensions -- matrix-rust-sdk's encryption connection -- still answers
+/// an event in one of its user's rooms once the device holds keys, as
+/// Synapse does. The client uploads the room key of its own message to
+/// the backup after processing such an answer; without it the key never
+/// reached the backup, and a second device recovering from the backup
+/// could not decrypt the message.
+#[tokio::test]
+async fn an_encryption_connection_answers_its_users_room_events() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "Hers").await;
+    let (status, body) = harness
+        .request(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            &alice,
+            &json!({ "one_time_keys": { "signed_curve25519:AAAAAQ": { "key": "one" } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let encryption = json!({
+        "extensions": { "e2ee": { "enabled": true }, "to_device": { "enabled": true } },
+    });
+    let first = harness.sliding(&alice, None, &encryption).await;
+    let since = pos(&first);
+    let mut poll = encryption;
+    poll["timeout"] = json!(30_000);
+    poll["extensions"]["to_device"]["since"] =
+        first["extensions"]["to_device"]["next_batch"].clone();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        tokio::spawn(async move { harness.sliding(&alice, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&room, &alice, "her own message", "t1").await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the encryption connection slept through its user's own message")
+        .unwrap();
+    assert_eq!(
+        response["extensions"]["e2ee"]["device_one_time_keys_count"]["signed_curve25519"], 1,
+        "{response}"
+    );
+}

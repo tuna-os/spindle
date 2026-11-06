@@ -125,7 +125,7 @@ impl Typing {
     /// battery for as long as the conversation lasted.
     pub async fn wait(&self, timeout: Duration) {
         // Created before the caller re-reads, for the same reason
-        // `Rooms::wait_for_event` does it: a change landing in between would
+        // `Rooms::wait_past` does it: a change landing in between would
         // otherwise be missed and the client would wait out the full timeout.
         let notified = self.changed.notified();
         let _ = tokio::time::timeout(timeout, notified).await;
