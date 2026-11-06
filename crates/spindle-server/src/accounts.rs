@@ -1500,11 +1500,11 @@ mod password_hash_tests {
     const MAS_ARGON2: &str = "$argon2id$v=19$m=19456,t=2,p=1$1WdxAF1UChkYSTnJ6NDbKg$\
         ajKAfwlUmkbxITSdh55j+Hvoxzppx20ArNUF44oV9Nk";
 
-    fn pepper() -> Option<PasswordScheme> {
-        Some(PasswordScheme {
+    fn pepper() -> PasswordScheme {
+        PasswordScheme {
             pepper: Some(hex(b"a-secret-pepper")),
             nfkc: false,
-        })
+        }
     }
 
     #[test]
@@ -1515,9 +1515,9 @@ mod password_hash_tests {
         accounts.register("dave", "unused").unwrap();
         for (hash, scheme) in [
             (MAS_BCRYPT, None),
-            (MAS_BCRYPT_PEPPERED, pepper()),
+            (MAS_BCRYPT_PEPPERED, Some(pepper())),
             (MAS_ARGON2, None),
-            (MAS_ARGON2_PEPPERED, pepper()),
+            (MAS_ARGON2_PEPPERED, Some(pepper())),
         ] {
             let peppered = scheme.is_some();
             assert!(accounts.import_password_hash("dave", hash, scheme).unwrap());
@@ -1566,10 +1566,10 @@ mod password_hash_tests {
         let accounts = Accounts::new(&store, "example.org");
         accounts.register("fay", "unused").unwrap();
         accounts
-            .import_password_hash("fay", MAS_ARGON2_PEPPERED, pepper())
+            .import_password_hash("fay", MAS_ARGON2_PEPPERED, Some(pepper()))
             .unwrap();
         let imported = accounts.account("fay").unwrap().unwrap();
-        assert_eq!(imported.password_scheme, pepper());
+        assert_eq!(imported.password_scheme, Some(pepper()));
         assert_eq!(
             imported.imported_hash_digest.as_deref(),
             Some(hash_digest(MAS_ARGON2_PEPPERED).as_str())
