@@ -325,8 +325,12 @@ pub struct RoomLog {
     forward_extremities: BTreeSet<EventId>,
     /// Soft-failed and rejected events: in the DAG, out of the timeline.
     sidelined: HashMap<EventId, SidelinedEntry>,
-    /// Their states, held resident: they are few, and a child naming one
-    /// needs its state at once.
+    /// Their states, for the ones this process sidelined: a child naming
+    /// one usually arrives right behind it. A restored room leaves them
+    /// out ([`RoomLog::restore_sidelined_entry`]) and reads one through
+    /// [`RoomLog::state_after_any`] when something names it: a busy room
+    /// accumulates thousands, almost none of which anything names again,
+    /// and hydrating each was a quarter of a large room's cold load (#724).
     sidelined_state: HashMap<EventId, StateSnapshot>,
     /// Rejection decisions imported from a former homeserver and preserved
     /// by operator choice. These IDs remain auth-graph references, never
@@ -709,6 +713,66 @@ impl RoomLog {
         self.current = (keep.len() > 1).then(|| state.clone());
         self.forward_extremities.clone_from(keep);
         true
+    }
+
+    /// What the resolution of this room's forward extremities depends on,
+    /// as one digest: each tip with the root of its state, the native
+    /// rejections and the imported ones. `None` with one extremity or
+    /// none, where there is nothing to resolve.
+    ///
+    /// A recorded resolution whose digest equals this one is the answer
+    /// the resolver would give again, so a reopened room can take it
+    /// instead of resolving its fork afresh (#724). The rejection sets are
+    /// hashed sorted rather than taken from
+    /// [`Self::resolution_policy_id`], which chains decisions in the order
+    /// they arrived: a restore replays them in key order, and a digest
+    /// that depended on arrival order would never match across a restart.
+    #[must_use]
+    pub fn current_inputs(&self) -> Option<[u8; 32]> {
+        if self.forward_extremities.len() <= 1 {
+            return None;
+        }
+        let framed = |hash: &mut blake3::Hasher, bytes: &[u8]| {
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        };
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"spindle current-state inputs v1");
+        hash.update(&(self.forward_extremities.len() as u64).to_be_bytes());
+        for tip in &self.forward_extremities {
+            let entry = self.get(tip)?;
+            framed(&mut hash, tip.as_str().as_bytes());
+            hash.update(entry.state_root.as_bytes());
+        }
+        let mut rejected: Vec<&str> = self
+            .sidelined
+            .values()
+            .filter(|entry| entry.kind == Sideline::Rejected)
+            .map(|entry| entry.event_id.as_str())
+            .collect();
+        rejected.sort_unstable();
+        hash.update(&(rejected.len() as u64).to_be_bytes());
+        for id in rejected {
+            framed(&mut hash, id.as_bytes());
+        }
+        hash.update(&(self.historical_rejections.len() as u64).to_be_bytes());
+        for id in &self.historical_rejections {
+            framed(&mut hash, id.as_str().as_bytes());
+        }
+        Some(*hash.finalize().as_bytes())
+    }
+
+    /// The recorded resolution of an open fork, if there is one: what
+    /// [`Self::set_current`] last stored while the room had several
+    /// extremities. `None` in a linear room, whose current state is its
+    /// tip's and needs no record.
+    #[must_use]
+    pub fn resolved_current(&self) -> Option<&StateSnapshot> {
+        if self.forward_extremities.len() > 1 {
+            self.current.as_ref()
+        } else {
+            None
+        }
     }
 
     /// How many snapshots are currently held in memory.
@@ -1262,6 +1326,20 @@ impl RoomLog {
         // at the door, so everything this log persists resolves through one
         // table. Same table is a no-op clone.
         let state = state.with_table(&self.table);
+        self.sidelined_state.insert(entry.event_id.clone(), state);
+        self.record_sidelined(entry);
+    }
+
+    /// Put back a sidelined event read from storage without its state,
+    /// which [`Self::state_after_any`] reads from the store, verified, if
+    /// anything names the event. What a runtime restore does: the root is
+    /// the record's, so nothing is lost but the hydration nobody asked for.
+    pub fn restore_sidelined_entry(&mut self, entry: SidelinedEntry) {
+        self.sidelined_state.remove(&entry.event_id);
+        self.record_sidelined(entry);
+    }
+
+    fn record_sidelined(&mut self, entry: SidelinedEntry) {
         let previous = self.sidelined.get(&entry.event_id).map(|old| old.kind);
         if previous != Some(entry.kind)
             && (entry.kind == Sideline::Rejected || previous == Some(Sideline::Rejected))
@@ -1273,7 +1351,6 @@ impl RoomLog {
             hash.update(&[u8::from(entry.kind == Sideline::Rejected)]);
             self.native_rejection_policy_id = *hash.finalize().as_bytes();
         }
-        self.sidelined_state.insert(entry.event_id.clone(), state);
         self.sidelined.insert(entry.event_id.clone(), entry);
     }
 
@@ -1629,6 +1706,9 @@ pub struct LogRestore {
     /// and a good part of the time.
     entries: Vec<(i64, LogEntry)>,
     previous: Option<i64>,
+    /// A recorded resolution of the room's fork: the digest of what it
+    /// resolved ([`RoomLog::current_inputs`]) and its state's root.
+    current: Option<([u8; 32], StateRoot)>,
 }
 
 impl LogRestore {
@@ -1652,7 +1732,40 @@ impl LogRestore {
             log,
             entries: Vec::with_capacity(reserve),
             previous: None,
+            current: None,
         }
+    }
+
+    /// Offer a recorded resolution of the room's fork. [`Self::finish`]
+    /// adopts it as the current state only if `inputs` is still what the
+    /// restored room's resolution depends on and its root reads back
+    /// verified; anything else leaves the fork unresolved, for the caller
+    /// to resolve as it would have without the record.
+    #[must_use]
+    pub fn with_current(mut self, inputs: [u8; 32], root: StateRoot) -> Self {
+        self.current = Some((inputs, root));
+        self
+    }
+
+    /// Restore a sidelined event without its state (see
+    /// [`RoomLog::restore_sidelined_entry`]). Before [`Self::finish`], so
+    /// the rejections it carries are part of what a recorded resolution
+    /// is checked against.
+    pub fn sideline(&mut self, entry: SidelinedEntry) {
+        self.log.restore_sidelined_entry(entry);
+    }
+
+    /// Restore an imported historical rejection, as
+    /// [`RoomLog::preserve_historical_rejection`]. Before [`Self::finish`]
+    /// for the reason [`Self::sideline`] is.
+    pub fn preserve_historical_rejection(&mut self, event_id: EventId) {
+        self.log.preserve_historical_rejection(event_id);
+    }
+
+    /// Whether an accepted record holds `event_id`.
+    #[must_use]
+    pub fn holds_entry(&self, event_id: &EventId) -> bool {
+        self.log.positions.contains_key(event_id)
     }
 
     /// Accept the next record, which must sort after every one before it.
@@ -1823,6 +1936,18 @@ impl LogRestore {
                 let state = hydrate(root, li, &mut verified_nodes)?;
                 log.resident.insert(li, state);
             }
+        }
+        // After the tips, so the resolved state -- built on one tip's state
+        // and differing from it in the contested slots only -- reads back
+        // as those slots' paths rather than a second walk of the whole
+        // trie. A record that no longer matches, or will not read back
+        // verified, is a stale cache, not damage: the fork stays open and
+        // the caller resolves it.
+        if let Some((inputs, root)) = self.current
+            && log.current_inputs() == Some(inputs)
+            && let Ok(state) = hydrate(root, 0, &mut verified_nodes)
+        {
+            log.current = Some(state);
         }
         Ok(log)
     }

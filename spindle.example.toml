@@ -36,7 +36,9 @@ bind = "127.0.0.1:8008"
 path = "./data"
 # Rooms loaded in the background after startup, at once, so the first
 # requests after a restart do not each pay for a cold load. Readiness does
-# not wait for it. 0 turns the warm-up off.
+# not wait for it. Rooms of 10,000 entries or more load first, largest
+# first, so the slowest load starts early; the rest follow newest activity
+# first. 0 turns the warm-up off.
 # warm_concurrency = 2
 
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and

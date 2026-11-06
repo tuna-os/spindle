@@ -234,7 +234,7 @@ fn injected_id(body: &Value) -> String {
 }
 
 struct Harness {
-    _dir: TempDir,
+    dir: Arc<TempDir>,
     app: axum::Router,
     metrics: Arc<Metrics>,
     store: Arc<FjallStore>,
@@ -244,6 +244,10 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        Self::over(Arc::new(dir), store)
+    }
+
+    fn over(dir: Arc<TempDir>, store: Arc<FjallStore>) -> Self {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
@@ -253,11 +257,17 @@ impl Harness {
         let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
             .expect("the app builds");
         Self {
-            _dir: dir,
+            dir,
             app,
             metrics,
             store,
         }
+    }
+
+    /// A new server over the same store, as a restart finds it: no room
+    /// resident, no resolution cached, counters at zero.
+    fn restarted(&self) -> Self {
+        Self::over(Arc::clone(&self.dir), Arc::clone(&self.store))
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -783,6 +793,116 @@ async fn a_fork_on_new_slots_uses_room_version_resolution() {
     let state = harness.state_ids(&room, &alice).await;
     assert!(state.contains_key("m.room.topic/"), "{state:?}");
     assert!(state.contains_key("m.room.name/"), "{state:?}");
+}
+
+/// A room left forked: our topic and the peer's name, each on its own tip
+/// off the fork point, and nothing since that names both. Returns the
+/// room, alice's token and the room's state as alice reads it.
+async fn open_fork(
+    harness: &Harness,
+    peer: &Peer,
+) -> (String, String, std::collections::BTreeMap<String, String>) {
+    let (room, alice, fork_point) = harness.shared_room(peer).await;
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+            .await,
+        StatusCode::OK
+    );
+    let pdu = harness.stale_state(
+        peer,
+        &room,
+        &fork_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "theirs" }),
+    );
+    harness.inject(peer, "open-fork", pdu).await;
+    assert!(
+        harness.metrics.state_res_counts().0 >= 1,
+        "the fork was resolved where it opened"
+    );
+    let state = harness.state_ids(&room, &alice).await;
+    assert!(state.contains_key("m.room.topic/"), "{state:?}");
+    assert!(state.contains_key("m.room.name/"), "{state:?}");
+    (room, alice, state)
+}
+
+/// A restart does not resolve a fork that was resolved before it (#724).
+///
+/// A room reopened with an open fork resolved its forward extremities on
+/// every cold load, though nothing about the fork had changed: one room of
+/// 88,670 entries spent 3.3 s of its 7 s load doing so at each restart.
+/// The resolution is recorded where it is made, and a reopened room whose
+/// fork still matches the record takes it -- counted here by the
+/// resolver's own counter, on two restarts in a row.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_restart_does_not_resolve_a_fork_again() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, before) = open_fork(&harness, &peer).await;
+
+    for restart in 1..=2 {
+        let reopened = harness.restarted();
+        assert_eq!(
+            reopened.state_ids(&room, &alice).await,
+            before,
+            "restart {restart} reads the state the fork resolved to"
+        );
+        assert_eq!(
+            reopened.metrics.cold_loads_total(),
+            1,
+            "restart {restart} reopened the room from the store"
+        );
+        assert_eq!(
+            reopened.metrics.state_res_counts().0,
+            0,
+            "restart {restart} resolved the fork again"
+        );
+    }
+}
+
+/// A fork reopened without a record of its resolution -- one a build
+/// before the record existed left, say -- is resolved once, by the load,
+/// and the answer recorded: the next restart takes it.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_reopened_without_a_record_is_resolved_once() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, before) = open_fork(&harness, &peer).await;
+    spindle_store::Store::delete(
+        harness.store.as_ref(),
+        &spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::CurrentState, &room),
+    )
+    .unwrap();
+
+    for (restart, resolutions) in [(1, 1), (2, 0)] {
+        let reopened = harness.restarted();
+        assert_eq!(
+            reopened.state_ids(&room, &alice).await,
+            before,
+            "restart {restart}"
+        );
+        assert_eq!(
+            reopened.metrics.state_res_counts().0,
+            resolutions,
+            "restart {restart}"
+        );
+    }
 }
 
 /// Both branches write the same slot. The room-version resolver picks

@@ -5202,8 +5202,9 @@ impl Rooms {
     ///
     /// A slow one is logged with where its time went -- reading and
     /// checking the log rows, verifying the resident roots, the sidelined
-    /// events, the imported rejections, resolving an open fork -- so a
-    /// slow cold load in production says which part to look at.
+    /// records, the imported rejections, resolving an open fork -- and how
+    /// many trie nodes it read, so a slow cold load in production says
+    /// which part to look at.
     fn load_cold(&self, room_id: &str) -> Result<RoomLog, RoomError> {
         let started = std::time::Instant::now();
         let (log, profile, resolving) = self.restore_room(room_id)?;
@@ -5220,6 +5221,7 @@ impl Rooms {
                 elapsed_ms = ms(elapsed),
                 rows = profile.rows,
                 row_mib = profile.row_bytes >> 20,
+                node_reads = profile.node_reads,
                 records_ms = ms(profile.records),
                 roots_ms = ms(profile.roots),
                 sidelined_ms = ms(profile.sidelined),
@@ -5231,6 +5233,14 @@ impl Rooms {
         Ok(log)
     }
 
+    /// The room as the store holds it, with an open fork resolved.
+    ///
+    /// The store hands back the fork's recorded resolution when it still
+    /// holds (`Keyspace::CurrentState`). Only a fork without one -- new
+    /// since the last resolution was recorded, or recorded by a build
+    /// before this one -- is resolved here, and the answer is recorded so
+    /// the next load does not resolve it again. That resolution was most
+    /// of a large room's cold load, repeated at every restart (#724).
     fn restore_room(
         &self,
         room_id: &str,
@@ -5244,7 +5254,10 @@ impl Rooms {
             match self.resolve_in(&log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
-                Ok(current) => log.set_current(current),
+                Ok(current) => {
+                    log.set_current(current);
+                    self.record_current(&log, room_id);
+                }
                 Err(error) => tracing::warn!(
                     room = room_id,
                     "cannot resolve the reopened room's forward extremities: {error}"
@@ -5252,6 +5265,25 @@ impl Rooms {
             }
         }
         Ok((log, profile, started.elapsed()))
+    }
+
+    /// Journal the room's fork resolution for the next cold load to take
+    /// instead of resolving again. A failure is logged and otherwise
+    /// ignored: the record is a cache, and without it the next load
+    /// resolves as it always did. Not tried at all on a store that has
+    /// stopped taking writes, where a cache is no reason to fail another
+    /// write. The sync is the next one anybody makes, since a record lost
+    /// to a crash costs only the resolution it saved.
+    fn record_current(&self, log: &RoomLog, room_id: &str) {
+        if !spindle_store::Store::accepts_writes(self.store.as_ref()) {
+            return;
+        }
+        if let Err(error) = RoomStore::new(self.store.as_ref(), room_id).journal_current(log) {
+            tracing::warn!(
+                room = room_id,
+                "cannot record the room's resolved current state: {error}"
+            );
+        }
     }
 
     /// The room's lock if this process holds it open, without loading it.
@@ -5329,8 +5361,20 @@ impl Rooms {
     }
 
     /// The rooms worth warming after a restart: every room a local user is
-    /// joined to that is not already resident, newest activity first, so
-    /// the rooms at the top of a client's list are the first to be ready.
+    /// joined to that is not already resident. Rooms of at least
+    /// [`WARM_FIRST_ENTRIES`] entries come first, largest first; the rest
+    /// follow newest activity first, so the rooms at the top of a client's
+    /// list are the next to be ready.
+    ///
+    /// The warm-up's workers share one queue, so its wall time is at
+    /// least the start of its largest room plus that room's load. Taken in
+    /// activity order, a room that loads for seconds could start last and
+    /// set the whole warm-up's length -- one room of 88,670 entries was
+    /// 7 s of a 9 s warm-up (#724). Started first, it runs beside the rest.
+    /// The small rooms lose little by waiting: a request for one that is
+    /// still cold loads it in milliseconds, and a request for a large one
+    /// waits for the warm-up's load of it, which is the one worth starting
+    /// early.
     ///
     /// # Errors
     ///
@@ -5353,15 +5397,35 @@ impl Rooms {
                 rooms.insert(room_id);
             }
         }
-        let mut ordered: Vec<(String, i64)> = rooms
+        let mut ordered: Vec<(String, i64, u64)> = rooms
             .into_iter()
             .map(|room_id| {
                 let activity = self.last_activity(&room_id).unwrap_or(0);
-                (room_id, activity)
+                let entries = self.stored_entries(&room_id);
+                (room_id, activity, entries)
             })
             .collect();
-        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(ordered.into_iter().map(|(room_id, _)| room_id).collect())
+        sort_for_warming(&mut ordered);
+        Ok(ordered.into_iter().map(|(room_id, _, _)| room_id).collect())
+    }
+
+    /// How many log entries the store holds for a room, from its counters
+    /// alone -- one point read, not a scan; zero for a room it cannot read.
+    fn stored_entries(&self, room_id: &str) -> u64 {
+        let key = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::RoomMeta, room_id);
+        spindle_store::ReadView::get(self.store.as_ref(), &key)
+            .ok()
+            .flatten()
+            .and_then(|raw| spindle_store::codec::RoomRecord::decode(&raw).ok())
+            .map_or(0, |meta| {
+                // The occupied positions are contiguous between the counters.
+                u64::try_from(
+                    meta.next_forward
+                        .saturating_sub(meta.next_backward)
+                        .saturating_sub(1),
+                )
+                .unwrap_or(0)
+            })
     }
 
     /// The registry, shared, with the wait timed.
@@ -5958,7 +6022,12 @@ impl Rooms {
             match self.resolve_in(log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
-                Ok(current) => log.set_current(current),
+                Ok(current) => {
+                    log.set_current(current);
+                    // So a restart reopens the fork already resolved
+                    // rather than paying for this again (#724).
+                    self.record_current(log, room_id);
+                }
                 Err(error) => {
                     tracing::warn!(
                         room = room_id,
@@ -7477,6 +7546,34 @@ fn purged_marker() -> Value {
         "type": "org.spindle.purged",
         "content": {},
     })
+}
+
+/// Rooms of at least this many log entries are warmed before the rest,
+/// largest first ([`Rooms::warm_candidates`]). Below it a room loads in
+/// well under a second -- 98 rooms under a thousand entries took 0.42 s
+/// between them on the deployment #724 measured, and none under ten
+/// thousand took more than half a second -- so only the rooms above it can
+/// set the length of the warm-up.
+pub const WARM_FIRST_ENTRIES: u64 = 10_000;
+
+/// Order `(room_id, last activity, entries)` for the warm-up: rooms of at
+/// least [`WARM_FIRST_ENTRIES`] entries first, largest first, then the
+/// rest by newest activity; the room id breaks ties so the order is
+/// deterministic.
+fn sort_for_warming(rooms: &mut [(String, i64, u64)]) {
+    rooms.sort_by(|a, b| {
+        let (a_large, b_large) = (a.2 >= WARM_FIRST_ENTRIES, b.2 >= WARM_FIRST_ENTRIES);
+        b_large
+            .cmp(&a_large)
+            .then_with(|| {
+                if a_large {
+                    b.2.cmp(&a.2)
+                } else {
+                    b.1.cmp(&a.1)
+                }
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 /// The `(user_id, room_id)` a membership-index key names: a schema byte,
@@ -9037,6 +9134,38 @@ mod cold_registry_tests {
                 .event_id
                 .as_str(),
             "$new"
+        );
+    }
+}
+
+#[cfg(test)]
+mod warm_order_tests {
+    use super::{WARM_FIRST_ENTRIES, sort_for_warming};
+
+    /// The rooms that can set the warm-up's length start it, largest
+    /// first, whatever their activity; every other room keeps the
+    /// newest-activity order a client's room list has.
+    #[test]
+    fn large_rooms_are_warmed_first_and_the_rest_by_activity() {
+        let large = WARM_FIRST_ENTRIES;
+        let mut rooms = vec![
+            ("!busy-small".to_owned(), 900, 40),
+            ("!quiet-huge".to_owned(), 1, large * 9),
+            ("!idle-small".to_owned(), 10, 5),
+            ("!busy-large".to_owned(), 800, large),
+            ("!mid".to_owned(), 500, large - 1),
+        ];
+        sort_for_warming(&mut rooms);
+        let order: Vec<&str> = rooms.iter().map(|room| room.0.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "!quiet-huge",
+                "!busy-large",
+                "!busy-small",
+                "!mid",
+                "!idle-small"
+            ]
         );
     }
 }

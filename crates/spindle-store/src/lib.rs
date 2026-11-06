@@ -50,8 +50,8 @@ use spindle_core::{
 };
 
 use crate::codec::{
-    CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord, decode_intern_pair,
-    encode_intern_pair,
+    CodecError, CurrentStateRecord, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord,
+    decode_intern_pair, encode_intern_pair,
 };
 
 /// How hard a commit tries to be on disk before it is acknowledged.
@@ -1610,12 +1610,17 @@ pub struct RestoreProfile {
     pub row_bytes: u64,
     /// Reading, decoding and checking every row: order, uniqueness, chain.
     pub records: std::time::Duration,
-    /// Hydrating and verifying the resident window's and every tip's state.
+    /// Hydrating and verifying the resident window's and every tip's
+    /// state, and the recorded resolution of an open fork.
     pub roots: std::time::Duration,
-    /// Restoring soft-failed and rejected events with their states.
+    /// Restoring soft-failed and rejected events' records. Their states
+    /// are read when something names one, not here.
     pub sidelined: std::time::Duration,
     /// Restoring imported historical rejection markers.
     pub rejections: std::time::Duration,
+    /// State-trie nodes read from the store. A count rather than a time,
+    /// so a test can say what a load reads without a clock.
+    pub node_reads: u64,
 }
 
 /// Persist a room's log, and read it back.
@@ -1859,6 +1864,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
         Ok(())
     }
 
+    /// [`Self::restore_sidelined`] for the exhaustive check: every
+    /// sidelined state must read back verified.
     fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
         let mut load_node = |address: &StateRoot| {
@@ -1878,6 +1885,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
             log.restore_sidelined(entry, state);
         }
         Ok(())
+    }
+
+    /// The runtime form: each sidelined record, without its state (see
+    /// [`RoomLog::restore_sidelined_entry`]).
+    fn restore_sidelined_entries(&self, restore: &mut LogRestore) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        self.store.visit_prefix(&prefix, &mut |_, value| {
+            restore.sideline(SidelinedRecord::decode(value)?.to_entry()?);
+            Ok(())
+        })
     }
 
     /// Commit imported historical rejection decisions and their PDU records.
@@ -1916,6 +1933,37 @@ impl<'a, S: Store> RoomStore<'a, S> {
 
     /// Restore imported rejection markers without treating them as timeline entries.
     fn restore_historical_rejections(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        self.visit_historical_rejections(|id| {
+            if log.get(&id).is_some() {
+                return Err(Self::rejection_overlaps());
+            }
+            log.preserve_historical_rejection(id);
+            Ok(())
+        })
+    }
+
+    /// [`Self::restore_historical_rejections`], into a restore in progress.
+    fn restore_historical_rejections_into(
+        &self,
+        restore: &mut LogRestore,
+    ) -> Result<(), StoreError> {
+        self.visit_historical_rejections(|id| {
+            if restore.holds_entry(&id) {
+                return Err(Self::rejection_overlaps());
+            }
+            restore.preserve_historical_rejection(id);
+            Ok(())
+        })
+    }
+
+    fn rejection_overlaps() -> StoreError {
+        StoreError::Backend("historical rejection overlaps accepted log".into())
+    }
+
+    fn visit_historical_rejections(
+        &self,
+        mut each: impl FnMut(EventId) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::HistoricalRejection, &self.room_id);
         for (key, value) in self.store.scan_prefix(&prefix)? {
             if value != [1] {
@@ -1926,15 +1974,51 @@ impl<'a, S: Store> RoomStore<'a, S> {
             if id.is_empty() {
                 return Err(CodecError::Truncated.into());
             }
-            let id = EventId::new(id);
-            if log.get(&id).is_some() {
-                return Err(StoreError::Backend(
-                    "historical rejection overlaps accepted log".into(),
-                ));
-            }
-            log.preserve_historical_rejection(id);
+            each(EventId::new(id))?;
         }
         Ok(())
+    }
+
+    /// Journal the room's recorded fork resolution, if it has one: the
+    /// digest of what it resolved, its root, and the trie nodes the
+    /// resolution created over the state of the tip it was built on. Like
+    /// [`Self::journal_entry_with`], the sync is the caller's.
+    ///
+    /// Returns whether anything was journalled: nothing is for a linear
+    /// room, or a fork nobody has resolved yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled, or
+    /// [`StoreError::ForeignStateTable`] for a state of another table.
+    pub fn journal_current(&self, log: &RoomLog) -> Result<bool, StoreError> {
+        let (Some(inputs), Some(state)) = (log.current_inputs(), log.resolved_current()) else {
+            return Ok(false);
+        };
+        self.check_state_table(state)?;
+        // The resolver builds its answer on the first distinct tip state,
+        // so against any tip only the contested paths are new; nodes the
+        // store already holds are rewritten as the same bytes at worst.
+        let base = log
+            .forward_extremities()
+            .iter()
+            .find_map(|tip| log.state_after_event(tip));
+        let mut writes = vec![(
+            room_prefix(Keyspace::CurrentState, &self.room_id),
+            CurrentStateRecord {
+                inputs,
+                root: *state.root().as_bytes(),
+            }
+            .encode(),
+        )];
+        for (address, node) in state.delta_nodes(base) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        self.store.commit_state_deferred(&writes, state.table())?;
+        Ok(true)
     }
 
     fn meta(log: &RoomLog) -> RoomRecord {
@@ -2130,9 +2214,37 @@ impl<'a, S: Store> RoomStore<'a, S> {
             })?;
             restore
         };
+        // An unreadable record is a stale cache, not a damaged room: the
+        // restore goes ahead without it, and the fork is resolved afresh.
+        let restore = match view.get(&room_prefix(Keyspace::CurrentState, &self.room_id))? {
+            Some(raw) => match CurrentStateRecord::decode(&raw) {
+                Ok(record) => {
+                    restore.with_current(record.inputs, StateRoot::from_bytes(record.root))
+                }
+                Err(_) => restore,
+            },
+            None => restore,
+        };
         profile.rows = restore.len();
         profile.records = started.elapsed();
         Ok(Some((restore, profile)))
+    }
+
+    /// Put the sidelined records and imported rejections into a restore
+    /// in progress: before its roots, because whether a recorded fork
+    /// resolution still holds depends on the rejections among them.
+    fn stream_outside_records(
+        &self,
+        restore: &mut LogRestore,
+        profile: &mut RestoreProfile,
+    ) -> Result<(), StoreError> {
+        let started = std::time::Instant::now();
+        self.restore_sidelined_entries(restore)?;
+        profile.sidelined = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_historical_rejections_into(restore)?;
+        profile.rejections = started.elapsed();
+        Ok(())
     }
 
     /// Runtime restoration checks all ordered metadata/chain and selected
@@ -2151,24 +2263,22 @@ impl<'a, S: Store> RoomStore<'a, S> {
     pub fn load_runtime_profiled(
         &self,
     ) -> Result<Option<(RuntimeRestoredLog, RestoreProfile)>, StoreError> {
-        let Some((restore, mut profile)) = self.stream_records()? else {
+        let Some((mut restore, mut profile)) = self.stream_records()? else {
             return Ok(None);
         };
+        self.stream_outside_records(&mut restore, &mut profile)?;
+        let mut node_reads = 0_u64;
         let mut load_node = |address: &StateRoot| {
+            node_reads += 1;
             self.store
                 .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
                 .ok()
                 .flatten()
         };
         let started = std::time::Instant::now();
-        let mut restored = restore.finish_runtime(&mut load_node)?;
+        let restored = restore.finish_runtime(&mut load_node)?;
         profile.roots = started.elapsed();
-        let started = std::time::Instant::now();
-        self.restore_sidelined_checked(&mut restored.log)?;
-        profile.sidelined = started.elapsed();
-        let started = std::time::Instant::now();
-        self.restore_historical_rejections(&mut restored.log)?;
-        profile.rejections = started.elapsed();
+        profile.node_reads = node_reads;
         Ok(Some((restored, profile)))
     }
 
@@ -2178,9 +2288,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// # Errors
     /// Returns an error for unreadable records, chain, tips or any state root.
     pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((restore, _)) = self.stream_records()? else {
+        let Some((mut restore, mut profile)) = self.stream_records()? else {
             return Ok(None);
         };
+        self.stream_outside_records(&mut restore, &mut profile)?;
         let mut load_node = |address: &StateRoot| {
             self.store
                 .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
@@ -2188,8 +2299,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .flatten()
         };
         let mut restored = restore.finish_exhaustive(&mut load_node)?;
+        // The records are in already; this reads and verifies each state.
         self.restore_sidelined_checked(&mut restored.log)?;
-        self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 

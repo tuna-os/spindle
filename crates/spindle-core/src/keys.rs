@@ -483,6 +483,17 @@ pub enum Keyspace {
     /// "active" would bring the device back and the ended session with it.
     /// Deleted when the device row is written again.
     RevokedDevice = 0x63,
+    /// `room_id` -> the resolution of the room's open fork: the digest of
+    /// what it resolved (`RoomLog::current_inputs`) and its state's root,
+    /// whose nodes are stored like any other state's.
+    ///
+    /// A cache, not a record of the room: the log alone determines the
+    /// answer. It exists because the answer can cost seconds -- a large
+    /// room's thirteen-tip fork, resolved again at every restart (#724) --
+    /// and a reopened room whose tips, their states and its rejections
+    /// match the digest takes it instead. One that does not match is
+    /// ignored and overwritten by the next resolution.
+    CurrentState = 0x64,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
