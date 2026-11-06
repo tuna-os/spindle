@@ -83,19 +83,24 @@ export async function startDm(
     timeout: 15_000,
   });
 
+  // The caller's client sees the callee's join once it has crossed
+  // federation; that is the moment the DM is ready to call.
   let roomId: string | undefined;
   await expect
-    .poll(async () => {
-      roomId = await caller.clientHandle.evaluate(
-        (client, calleeId) =>
-          client
-            .getRooms()
-            .find((room) => room.getMember(calleeId)?.membership === "join")
-            ?.roomId,
-        callee.mxId,
-      );
-      return roomId;
-    })
+    .poll(
+      async () => {
+        roomId = await caller.clientHandle.evaluate(
+          (client, calleeId) =>
+            client
+              .getRooms()
+              .find((room) => room.getMember(calleeId)?.membership === "join")
+              ?.roomId,
+          callee.mxId,
+        );
+        return roomId;
+      },
+      { timeout: 30_000 },
+    )
     .toBeTruthy();
   return roomId as string;
 }
