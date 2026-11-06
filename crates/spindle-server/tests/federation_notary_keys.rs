@@ -107,12 +107,20 @@ fn key_document(
     document
 }
 
-/// A free loopback port nothing listens on: a server that is down.
-async fn dead_name() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("127.0.0.1:{port}")
+/// A loopback address nothing listens on: a server that is down. Hold the
+/// socket for as long as the server must stay down.
+///
+/// The socket keeps the port bound but not listening, so a connection to
+/// it is refused. Freeing the port instead let the next listener bound on
+/// the host take it: this test's own relay, or another test's key server.
+/// That listener then answered for the dead server with its own valid
+/// document, the direct fetch counted as a success, and the
+/// `Direct, Error` assertion failed (#777).
+fn dead_name() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (format!("127.0.0.1:{port}"), socket)
 }
 
 /// A server that answers `/_matrix/key/v2/server` with whatever
@@ -461,7 +469,7 @@ async fn relay(harness: &Harness, join: Value) -> Value {
 #[tokio::test]
 async fn an_unreachable_servers_event_verifies_with_keys_a_notary_vouches_for() {
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let dead_key = pair("d");
     notary.hold(key_document(
         &dead,
@@ -514,7 +522,7 @@ async fn a_notary_answer_the_notary_did_not_sign_is_refused() {
     // Signed by a key the notary does not publish: what an on-path
     // attacker posing as the notary would serve.
     let notary = Notary::start(true).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let dead_key = pair("d");
     notary.hold(key_document(
         &dead,
@@ -547,7 +555,7 @@ async fn a_notary_answer_the_origin_did_not_sign_is_refused() {
     // The notary vouches for a document the origin never signed: a notary
     // alone cannot mint a server's key.
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let dead_key = pair("d");
     notary.hold(key_document(
         &dead,
@@ -575,7 +583,7 @@ async fn a_pinned_notary_key_is_required() {
     // The notary signs with its published key, but the operator pinned
     // another: its answers are not believed.
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let dead_key = pair("d");
     notary.hold(key_document(
         &dead,
@@ -615,7 +623,7 @@ async fn a_key_that_lapsed_before_the_event_was_signed_verifies_nothing() {
     // minutes ago; the event says it was signed one minute ago. Room
     // version 11 enforces key validity.
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let dead_key = pair("d");
     let now = now_millis();
     notary.hold(key_document(
@@ -648,7 +656,7 @@ async fn a_key_that_lapsed_before_the_event_was_signed_verifies_nothing() {
 #[tokio::test]
 async fn a_key_retired_before_the_event_was_signed_verifies_nothing() {
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let (old, new) = (pair("old"), pair("new"));
     let clock = now_millis();
     notary.hold(key_document(
@@ -673,7 +681,7 @@ async fn a_retired_key_verifies_what_was_signed_before_it_was_retired() {
     // `old_verify_keys`, as a notary hands them on for a dark server --
     // Tuwunel's shape, two retired keys beside the current one.
     let notary = Notary::start(false).await;
-    let dead = dead_name().await;
+    let (dead, _down) = dead_name();
     let (older, old, new) = (pair("older"), pair("old"), pair("new"));
     let clock = now_millis();
     notary.hold(key_document(

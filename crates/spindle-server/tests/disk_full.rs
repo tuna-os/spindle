@@ -199,19 +199,34 @@ async fn a_full_disk_takes_the_server_out_of_rotation_and_keeps_it_alive() {
         "and stays alive: a restart onto the same full disk is a crash loop",
     );
 
-    // Reads keep working: the history up to the full disk is still served.
+    // Reads keep working: the history up to the full disk is still served,
+    // and nothing acknowledged is lost.
+    //
+    // The refused send can be served too. A 5xx does not say that the event
+    // was not stored. fjall's background flush can fill the disk after the
+    // send's batch is in the journal, and the flush poisons the database.
+    // Then the next write of the send fails: the sync that acknowledges the
+    // batch, or the transaction record after it. The batch stays in the
+    // journal, and the server serves it after a restart too (#770).
     let (status, messages) = authed(
         &app,
         "GET",
-        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=1"),
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=2"),
         &token,
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{messages}");
-    assert_eq!(
-        messages["chunk"][0]["content"]["body"],
-        json!(body(sent - 1)),
-        "the last acknowledged message is the newest one served",
+    let served = |n: usize| &messages["chunk"][n]["content"]["body"];
+    let newest_acknowledged = if *served(0) == json!(body(sent)) {
+        served(1)
+    } else {
+        served(0)
+    };
+    // Not `assert_eq!`: each body is 32 KiB of noise.
+    assert!(
+        *newest_acknowledged == json!(body(sent - 1)),
+        "the last acknowledged message is the newest one served, after the refused send if \
+         that is served",
     );
 }
