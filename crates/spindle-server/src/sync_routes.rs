@@ -1581,6 +1581,7 @@ fn sync_answer(
         state,
         identity,
         result.rooms,
+        &result.joined,
         filter,
         state_label,
         (since, result.next_batch),
@@ -1949,12 +1950,12 @@ fn sync_join(
     state: &AppState,
     identity: &crate::accounts::Identity,
     rooms: Vec<crate::rooms::SyncRoom>,
+    joined: &[String],
     filter: Option<&crate::filters::Filter>,
     state_label: &'static str,
     (since, until): (Option<u64>, u64),
 ) -> Result<BTreeMap<String, Box<RawValue>>, MatrixError> {
     let mut join: BTreeMap<String, Box<RawValue>> = BTreeMap::new();
-    let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
     // Readers whose receipt moved inside this sync's window, local or
     // federated, per room: what an incremental sync owes as `m.receipt`.
     let moved_receipts = since.map(|since| {
@@ -2081,7 +2082,7 @@ fn sync_join(
         state,
         identity,
         filter,
-        &joined,
+        joined,
         moved_receipts.as_ref(),
         &mut join,
     )?;

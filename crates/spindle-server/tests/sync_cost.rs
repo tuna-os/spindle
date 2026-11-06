@@ -319,6 +319,139 @@ async fn a_sync_does_not_pay_for_its_own_history() {
     );
 }
 
+/// A sync that carries news pays no disk barrier.
+///
+/// A sync writes nothing a client sent, but it hands out a token, and a
+/// restart must never allocate a position at or below one a client holds.
+/// The checkpoint that promises it was a full fsync on every sync that
+/// moved the stream -- that is, on every sync that carried anything --
+/// measured before the fix at one barrier per sync: 8 for the 8 below.
+/// That is the benchmark's `sync_delta` cell, which lost to Tuwunel on
+/// three sittings in a row (#701). The checkpoint now reaches ahead of the
+/// token, so one barrier covers many syncs.
+///
+/// Barriers rather than rows, because the push loop writes its cursor in
+/// the background after each send, and only a barrier is the sync's own.
+#[tokio::test]
+async fn a_sync_carrying_news_pays_no_disk_barrier() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.room(&alice).await;
+    harness.invite_and_join(&room, &alice, &bob).await;
+    let mut batch = harness.sync(&alice, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut barriers = 0;
+    for index in 0..8 {
+        harness.send(&room, &bob, &format!("m{index}")).await;
+        let before = harness.store.barriers();
+        let body = harness.sync(&alice, Some(&batch)).await;
+        barriers += harness.store.barriers() - before;
+        let timeline = &body["rooms"]["join"][&room]["timeline"]["events"];
+        assert_eq!(timeline.as_array().map(Vec::len), Some(1), "{body}");
+        batch = body["next_batch"].as_str().unwrap().to_owned();
+    }
+    assert_eq!(
+        barriers, 0,
+        "8 syncs, each carrying one message, paid {barriers} fsyncs between \
+         them -- the stream checkpoint is being written for every token again"
+    );
+}
+
+/// The user's rooms are read once per sync, not once per section.
+///
+/// Every section -- joined, invited, knocked, left, banned -- scanned the
+/// user's whole membership index for its own kind, and the joined rooms
+/// were scanned again for the ephemeral sections: six rows per room the
+/// user is in, on every sync, before any room was looked at. Measured
+/// before the fix as the rows a quiet sync scans:
+///
+/// ```text
+/// rooms     1    8
+/// scanned   6    48
+/// ```
+///
+/// One row per room is the floor: a sync has to know which rooms it is
+/// answering for.
+#[tokio::test]
+async fn a_sync_reads_the_membership_index_once() {
+    let mut measured = Vec::new();
+    for rooms in [1usize, 8] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        for index in 0..rooms {
+            let room = harness.room(&alice).await;
+            harness.send(&room, &alice, &format!("seed{index}")).await;
+        }
+        let batch = harness.sync(&alice, None).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let before = harness.store.scanned();
+        harness.sync(&alice, Some(&batch)).await;
+        measured.push(harness.store.scanned() - before);
+    }
+    assert!(
+        measured[1] - measured[0] <= 7,
+        "a quiet sync scanned {} rows for one room and {} for eight -- more \
+         than one row for each room added, so the membership index is being \
+         read once per section again",
+        measured[0],
+        measured[1]
+    );
+}
+
+/// Nor for the rooms the user left long ago.
+///
+/// An incremental sync says nothing about a room nobody spoke in since
+/// the token, but for every room the user had ever left it read the
+/// forgotten flag and the departure's body to find that out: two point
+/// reads per left room, on every sync, for as long as the account lives.
+/// Measured before the fix as a quiet sync's reads:
+///
+/// ```text
+/// left   1    8
+/// reads  6    20
+/// ```
+#[tokio::test]
+async fn rooms_left_long_ago_cost_a_sync_nothing() {
+    let mut measured = Vec::new();
+    for left in [1usize, 8] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let home = harness.room(&alice).await;
+        harness.send(&home, &alice, "seed").await;
+        for index in 0..left {
+            let room = harness.room(&alice).await;
+            harness.send(&room, &alice, &format!("bye{index}")).await;
+            harness
+                .post(
+                    &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                    &alice,
+                    &json!({}),
+                )
+                .await;
+        }
+        let batch = harness.sync(&alice, None).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let before = harness.store.reads();
+        harness.sync(&alice, Some(&batch)).await;
+        measured.push(harness.store.reads() - before);
+    }
+    assert_eq!(
+        measured[0], measured[1],
+        "a quiet sync read {} rows with one room left behind and {} with \
+         eight -- every departed room is being read on every sync again",
+        measured[0], measured[1]
+    );
+}
+
 /// A highlight is a push-rule question answered against the body, so an
 /// unread mention has to be read once. Once: the tally remembers how far it
 /// scored, and a sync that finds nothing new after that position reads no

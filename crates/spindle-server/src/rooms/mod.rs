@@ -313,7 +313,10 @@ pub struct Rooms {
     /// that event for that client forever, silently. Building and proving it
     /// first makes the lock change mechanical instead of frightening.
     stream: crate::stream::Stream,
-    issued_position: Mutex<u64>,
+    /// The stream position the durable checkpoint reaches: a restart
+    /// resumes the counter at or above it, so every token issued at or
+    /// below it is safe. See [`Rooms::checkpoint_stream_position`].
+    checkpointed_position: Mutex<u64>,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
@@ -337,10 +340,26 @@ pub struct Context {
 pub struct SyncResult {
     pub next_batch: u64,
     pub rooms: Vec<SyncRoom>,
+    /// Every room the user is joined to, news or not: the rooms the
+    /// ephemeral sections are asked about. Read in the same scan of the
+    /// membership index as the other sections, so the caller does not scan
+    /// it again.
+    pub joined: Vec<String>,
     pub invited: Vec<String>,
     /// Rooms knocked on and not yet answered — see [`Rooms::knocked`].
     pub knocked: Vec<String>,
     pub left: Vec<SyncRoom>,
+}
+
+/// A user's rooms by their membership in each, from one scan of the
+/// membership index.
+#[derive(Default)]
+struct Memberships {
+    joined: Vec<String>,
+    invited: Vec<String>,
+    knocked: Vec<String>,
+    /// Left or banned from: the rooms of the `leave` section.
+    departed: Vec<String>,
 }
 
 impl SyncResult {
@@ -562,7 +581,7 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
-            issued_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
+            checkpointed_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
             stream: crate::stream::Stream::resuming_at(highest_stream_id(
                 store_for_stream.as_ref(),
                 stream_high,
@@ -2273,14 +2292,12 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
-        let (root, members) = self.with_room_read(room_id, |_, log| {
-            let root = log.current_state().map(|state| *state.root().as_bytes());
-            let members = current_state(log)
-                .into_iter()
-                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
-                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
-                .collect::<Vec<_>>();
-            Ok((root, members))
+        // The cache is asked with the root alone. Collecting the member keys
+        // first, as this did, copied out every member's user ID on every
+        // call -- a per-member cost on the warm path that the cache exists
+        // to make flat (#701).
+        let root = self.with_room_read(room_id, |_, log| {
+            Ok(log.current_state().map(|state| *state.root().as_bytes()))
         })?;
         let Some(root) = root else {
             return Ok(Arc::new(Roster::default()));
@@ -2294,6 +2311,20 @@ impl Rooms {
         {
             return Ok(Arc::clone(roster));
         }
+        // Root and members again, under one lock, so the roster is cached
+        // against the state it was built from even if the state moved since.
+        let (root, members) = self.with_room_read(room_id, |_, log| {
+            let root = log.current_state().map(|state| *state.root().as_bytes());
+            let members = current_state(log)
+                .into_iter()
+                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
+                .collect::<Vec<_>>();
+            Ok((root, members))
+        })?;
+        let Some(root) = root else {
+            return Ok(Arc::new(Roster::default()));
+        };
         let mut joined = Vec::new();
         let mut invited = Vec::new();
         let mut invited_heroes = Vec::new();
@@ -3793,6 +3824,17 @@ impl Rooms {
     /// Queue rows and ephemeral marks can disappear; they cannot be the only
     /// evidence that a client already holds a position above the room log.
     ///
+    /// The checkpoint is written [`CHECKPOINT_LEASE`] positions ahead of
+    /// the one asked for, and positions under it need no write at all.
+    /// What a restart needs is a floor at or above every issued token, and
+    /// a higher floor is as good: the counter resumes above it and skips
+    /// the positions between, which nothing was ever handed. Writing the
+    /// exact position instead put a full fsync on every `/sync` that
+    /// moved the stream -- every sync that carried news. That barrier was
+    /// most of the `sync_delta` loss against Tuwunel (#701): about 1.1 ms of
+    /// a 1.9 ms one-event sync on a dev host, against 0.5 ms for an empty
+    /// poll.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError`] if the checkpoint cannot be made durable.
@@ -3802,20 +3844,21 @@ impl Rooms {
                 "uncommitted stream position".to_owned(),
             ));
         }
-        let mut issued = self
-            .issued_position
+        let mut checkpointed = self
+            .checkpointed_position
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if position > *issued {
+        if position > *checkpointed {
+            let lease = position.saturating_add(CHECKPOINT_LEASE);
             spindle_store::Store::commit(
                 self.store.as_ref(),
                 &[(
                     spindle_core::keys::stream_checkpoint(),
-                    position.to_be_bytes().to_vec(),
+                    lease.to_be_bytes().to_vec(),
                 )],
                 spindle_store::Durability::Strict,
             )?;
-            *issued = position;
+            *checkpointed = lease;
         }
         Ok(())
     }
@@ -3955,16 +3998,16 @@ impl Rooms {
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         self.checkpoint_stream_position(position)?;
-        let joined = self.joined(user_id)?;
-        let invited = self.invited_since(user_id, since, position)?;
-        let knocked = self.knocked(user_id)?;
+        // One scan of the membership index for every section, not one each.
+        let memberships = self.memberships(user_id)?;
+        let invited = self.invited_since(user_id, memberships.invited, since, position)?;
 
         // The range each room is asked about. `None` on an initial sync,
         // which reads tails instead and has no range to walk.
         let range = since.map(|since| (since, position));
 
         let mut rooms = Vec::new();
-        for room_id in joined {
+        for room_id in &memberships.joined {
             // A room joined inside the window is one the client knows only
             // from its invite, if at all, so it is told the room the way an
             // initial sync would: the tail of the timeline rather than the
@@ -3975,11 +4018,11 @@ impl Rooms {
             let (events, limited, prev_batch, fresh) = match range {
                 None => {
                     let (events, limited, prev_batch) =
-                        self.timeline_tail(&room_id, timeline_limit)?;
+                        self.timeline_tail(room_id, timeline_limit)?;
                     (events, limited, prev_batch, true)
                 }
                 Some((since, until)) => {
-                    let slice = self.room_slice(&room_id, since, until)?;
+                    let slice = self.room_slice(room_id, since, until)?;
                     // A join lands in the window, so a quiet room needs no
                     // lookup: `sync_cost.rs` counts reads per joined room,
                     // and this must stay flat across rooms where nothing
@@ -3987,7 +4030,7 @@ impl Rooms {
                     let joined_at = if slice.is_empty() {
                         None
                     } else {
-                        self.membership_event(&room_id, user_id)?.map(|(_, li)| li)
+                        self.membership_li(room_id, user_id)?
                     };
                     // A partial-state room whose resync completed in the
                     // window is told afresh too (MSC3706): the members the
@@ -3996,15 +4039,15 @@ impl Rooms {
                     // client can learn of them. An in-memory check, so the
                     // quiet room still costs no read.
                     if joined_at.is_some_and(|li| slice.contains(&li))
-                        || self.resynced_between(&room_id, since, until)
+                        || self.resynced_between(room_id, since, until)
                     {
                         let (events, limited, prev_batch) =
-                            self.timeline_tail(&room_id, timeline_limit)?;
+                            self.timeline_tail(room_id, timeline_limit)?;
                         (events, limited, prev_batch, true)
                     } else {
                         let first = slice.iter().copied().min();
                         (
-                            self.timeline_of(&room_id, &slice, None)?,
+                            self.timeline_of(room_id, &slice, None)?,
                             false,
                             first,
                             false,
@@ -4032,7 +4075,7 @@ impl Rooms {
             // topic, alias or power level change after its first sync.
             let (state, cached_state) = if fresh {
                 self.initial_state(
-                    &room_id,
+                    room_id,
                     user_id,
                     state_block,
                     &events,
@@ -4054,7 +4097,7 @@ impl Rooms {
             });
         }
 
-        let mut left = self.left_rooms(user_id, since, range)?;
+        let mut left = self.left_rooms(user_id, memberships.departed, range)?;
         // The timeline only: Synapse's `filter_events_for_client` sees the
         // timeline, never the state block, and pruning state would serve a
         // later joiner an erased user's `m.room.encryption` as `{}`.
@@ -4091,8 +4134,9 @@ impl Rooms {
         Ok(SyncResult {
             next_batch: position,
             rooms,
+            joined: memberships.joined,
             invited,
-            knocked,
+            knocked: memberships.knocked,
             left,
         })
     }
@@ -4117,10 +4161,10 @@ impl Rooms {
     fn invited_since(
         &self,
         user_id: &str,
+        invited: Vec<String>,
         since: Option<u64>,
         until: u64,
     ) -> Result<Vec<String>, RoomError> {
-        let invited = self.invited(user_id)?;
         let Some(since) = since else {
             return Ok(invited);
         };
@@ -4135,7 +4179,7 @@ impl Rooms {
                 }
                 continue;
             }
-            let Some((_, membership_li)) = self.membership_event(&room_id, user_id)? else {
+            let Some(membership_li) = self.membership_li(&room_id, user_id)? else {
                 continue;
             };
             if self
@@ -4178,48 +4222,64 @@ impl Rooms {
     /// know the room exists and that it is out of it; replaying the whole
     /// history of every room a user ever left would make the first sync
     /// proportional to their entire past.
+    ///
+    /// `departed` is the rooms the user left or was banned from.
     fn left_rooms(
         &self,
         user_id: &str,
-        since: Option<u64>,
+        departed: Vec<String>,
         range: Option<(u64, u64)>,
     ) -> Result<Vec<SyncRoom>, RoomError> {
         let mut out = Vec::new();
-        for membership in [LEAVE, BAN] {
-            for room_id in self.membership_rooms(user_id, membership)? {
-                if self.is_forgotten(user_id, &room_id)? {
-                    continue;
-                }
-                let Some((departure, departed_at)) = self.membership_event(&room_id, user_id)?
-                else {
-                    continue;
-                };
-                let (events, prev_batch) = match range {
-                    None => (vec![departure], Some(departed_at)),
-                    Some((since, until)) => {
-                        let slice = self.room_slice(&room_id, since, until)?;
-                        let first = slice.iter().copied().min();
-                        (
-                            self.timeline_of(&room_id, &slice, Some(departed_at))?,
-                            first,
-                        )
+        for room_id in departed {
+            // An incremental sync says nothing about a room the user left
+            // long ago, for the same reason it says nothing about a joined
+            // room where nothing happened -- and asks that first, as a scan
+            // that is empty for such a room, so it costs no read. It read
+            // the forgotten flag and the departure's body for every room
+            // the user had ever left, on every sync.
+            let slice = match range {
+                None => None,
+                Some((since, until)) => {
+                    let slice = self.room_slice(&room_id, since, until)?;
+                    if slice.is_empty() {
+                        continue;
                     }
-                };
-                // An incremental sync says nothing about a room the user left
-                // long ago, for the same reason it says nothing about a joined
-                // room where nothing happened.
-                if since.is_some() && events.is_empty() {
-                    continue;
+                    Some(slice)
                 }
-                out.push(SyncRoom {
-                    room_id,
-                    state: Vec::new(),
-                    events,
-                    limited: false,
-                    prev_batch,
-                    cached_state: false,
-                });
+            };
+            if self.is_forgotten(user_id, &room_id)? {
+                continue;
             }
+            let (events, prev_batch) = match slice {
+                None => {
+                    let Some((departure, departed_at)) =
+                        self.membership_event(&room_id, user_id)?
+                    else {
+                        continue;
+                    };
+                    (vec![departure], Some(departed_at))
+                }
+                Some(slice) => {
+                    let Some(departed_at) = self.membership_li(&room_id, user_id)? else {
+                        continue;
+                    };
+                    let events = self.timeline_of(&room_id, &slice, Some(departed_at))?;
+                    // Everything in the window came after the departure.
+                    if events.is_empty() {
+                        continue;
+                    }
+                    (events, slice.iter().copied().min())
+                }
+            };
+            out.push(SyncRoom {
+                room_id,
+                state: Vec::new(),
+                events,
+                limited: false,
+                prev_batch,
+                cached_state: false,
+            });
         }
         out.sort_by(|a, b| a.room_id.cmp(&b.room_id));
         Ok(out)
@@ -4236,12 +4296,35 @@ impl Rooms {
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<(Value, i64)>, RoomError> {
+        let Some((event_id, li)) = self.current_membership(room_id, user_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((self.event(room_id, &event_id)?, li)))
+    }
+
+    /// The `li` of `user_id`'s current membership event in `room_id`,
+    /// without its body.
+    ///
+    /// What `/sync` asks of every room it reports -- where the reader's
+    /// unread count starts, and whether they joined inside the window --
+    /// is a position, and reading and parsing the event to learn it was a
+    /// body read per room on every sync with news (#701).
+    fn membership_li(&self, room_id: &str, user_id: &str) -> Result<Option<i64>, RoomError> {
+        Ok(self.current_membership(room_id, user_id)?.map(|(_, li)| li))
+    }
+
+    /// The ID and `li` of `user_id`'s current membership event.
+    fn current_membership(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(String, i64)>, RoomError> {
         let wanted = StateKey::new("m.room.member", user_id);
         // One lookup, under one lock. This walked every state key in the
         // room to find one, then took the room lock a second time to read
         // that entry's position -- on a path `unread` runs for every room
         // on every sync, which made each sync scale with the member list.
-        let found = self.with_room_read(room_id, |_, log| {
+        self.with_room_read(room_id, |_, log| {
             let Some(event_id) = current_state_id(log, &wanted) else {
                 return Ok(None);
             };
@@ -4249,11 +4332,7 @@ impl Rooms {
                 .get(&EventId::new(event_id.as_str()))
                 .map(|entry| entry.li.get());
             Ok(li.map(|li| (event_id, li)))
-        })?;
-        let Some((event_id, li)) = found else {
-            return Ok(None);
-        };
-        Ok(Some((self.event(room_id, &event_id)?, li)))
+        })
     }
 
     /// The stretches of `room_id` during which `user_id` could see it:
@@ -4281,7 +4360,7 @@ impl Rooms {
         from_invite: bool,
     ) -> Result<Vec<(i64, i64)>, RoomError> {
         let mut rows = self.member_history(room_id, user_id)?;
-        if rows.is_empty() && self.membership_event(room_id, user_id)?.is_some() {
+        if rows.is_empty() && self.membership_li(room_id, user_id)?.is_some() {
             self.backfill_member_history(room_id, user_id)?;
             rows = self.member_history(room_id, user_id)?;
         }
@@ -5123,6 +5202,38 @@ impl Rooms {
             prev_batch: first,
             event_ids: ids.into_iter().map(|(_, event_id)| event_id).collect(),
         })
+    }
+
+    /// Every room `user_id` has a membership in, split by that membership,
+    /// from one scan of their index: what [`Self::membership_rooms`] reads
+    /// once per kind.
+    fn memberships(&self, user_id: &str) -> Result<Memberships, RoomError> {
+        let prefix =
+            spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);
+        let mut out = Memberships::default();
+        for (key, membership) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+        {
+            let bucket = match membership.as_slice() {
+                JOIN => &mut out.joined,
+                INVITE => &mut out.invited,
+                KNOCK => &mut out.knocked,
+                LEAVE | BAN => &mut out.departed,
+                _ => continue,
+            };
+            if let Some(room_id) = spindle_core::keys::room_from_user_room(user_id, &key) {
+                bucket.push(room_id);
+            }
+        }
+        for rooms in [
+            &mut out.joined,
+            &mut out.invited,
+            &mut out.knocked,
+            &mut out.departed,
+        ] {
+            rooms.sort();
+            rooms.dedup();
+        }
+        Ok(out)
     }
 
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
@@ -7917,6 +8028,15 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
     }
     written
 }
+
+/// How many positions past an issued token the stream checkpoint reaches.
+///
+/// One checkpoint write covers this many stream advances, and a restart
+/// skips at most this many positions. Postgres pre-logs its sequences the
+/// same way, for the same reason: the counter must never go back, and
+/// paying a disk barrier for every value it hands out is the expensive way
+/// to promise that.
+const CHECKPOINT_LEASE: u64 = 1_024;
 
 fn read_stream_checkpoint(store: &FjallStore) -> u64 {
     spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())

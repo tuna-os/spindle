@@ -12,6 +12,8 @@
 //! and, in [`evaluate`], what the rules say about one event: the question
 //! `/notifications` asks of every event it walks past.
 
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
 /// The five rule kinds, **in the order they are evaluated**.
@@ -49,6 +51,38 @@ pub fn defaults(user_id: &str) -> Value {
         "sender": [],
         "underride": underrides(),
     })
+}
+
+/// [`defaults`] for `user_id`, built once and shared.
+///
+/// The ruleset is evaluated far more often than it changes: `/sync` scores
+/// every new event against the reader's rules, and the push loop does the
+/// same for every reader of every event. Building it each time was a few
+/// hundred allocations and most of the CPU of a one-event delta sync
+/// (#701), for a value that is a pure function of the user ID -- so the
+/// memo needs no invalidation. Bounded the way [`glob`]'s is: past
+/// `DEFAULTS_CACHE_CAP` users it starts over, which costs a rebuild and
+/// never memory (a ruleset is around ten kilobytes in memory).
+#[must_use]
+pub fn shared_defaults(user_id: &str) -> Arc<Value> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, Arc<Value>>>> = Mutex::new(None);
+    const DEFAULTS_CACHE_CAP: usize = 1_024;
+
+    let mut guard = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(ruleset) = cache.get(user_id) {
+        return Arc::clone(ruleset);
+    }
+    let ruleset = Arc::new(defaults(user_id));
+    if cache.len() >= DEFAULTS_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(user_id.to_owned(), Arc::clone(&ruleset));
+    ruleset
 }
 
 /// The kind evaluated first, so it is where the rules that *suppress* live:
@@ -236,7 +270,7 @@ fn underrides() -> Value {
 /// priority the spec gives it holds.
 #[must_use]
 pub fn with_defaults(mut stored: Value, user_id: &str) -> Value {
-    let defaults = defaults(user_id);
+    let defaults = shared_defaults(user_id);
     for kind in KINDS {
         let Some(wanted) = defaults[kind].as_array() else {
             continue;

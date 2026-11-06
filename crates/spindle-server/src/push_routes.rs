@@ -210,7 +210,7 @@ async fn get_push_rules(
     Authenticated(identity): Authenticated,
 ) -> Result<Json<Value>, MatrixError> {
     let ruleset = ruleset_of(&state, &identity.user_id)?;
-    Ok(Json(json!({ "global": ruleset })))
+    Ok(Json(json!({ "global": *ruleset })))
 }
 
 /// `GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}`
@@ -263,7 +263,7 @@ async fn set_push_rule(
     }
     rule["default"] = Value::Bool(false);
 
-    let mut ruleset = ruleset_of(&state, &identity.user_id)?;
+    let mut ruleset = std::sync::Arc::unwrap_or_clone(ruleset_of(&state, &identity.user_id)?);
     crate::push_rules::upsert(&mut ruleset, &kind, &rule_id, rule);
     save_ruleset(&state, &identity.user_id, &ruleset)?;
     Ok(Json(json!({})))
@@ -277,7 +277,7 @@ async fn delete_push_rule(
 ) -> Result<Json<Value>, MatrixError> {
     check_scope(&scope)?;
     check_kind(&kind)?;
-    let mut ruleset = ruleset_of(&state, &identity.user_id)?;
+    let mut ruleset = std::sync::Arc::unwrap_or_clone(ruleset_of(&state, &identity.user_id)?);
     if !crate::push_rules::remove(&mut ruleset, &kind, &rule_id) {
         return Err(rule_not_found(&kind, &rule_id));
     }
@@ -373,7 +373,7 @@ fn edit_rule(
 ) -> Result<Json<Value>, MatrixError> {
     check_scope(scope)?;
     check_kind(kind)?;
-    let mut ruleset = ruleset_of(state, user_id)?;
+    let mut ruleset = std::sync::Arc::unwrap_or_clone(ruleset_of(state, user_id)?);
     let index = crate::push_rules::position(&ruleset, kind, rule_id)
         .ok_or_else(|| rule_not_found(kind, rule_id))?;
     change(&mut ruleset[kind][index]);
