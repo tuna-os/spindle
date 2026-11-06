@@ -1701,6 +1701,7 @@ async fn set_room_state(
             &event_type,
             Some(&state_key),
             &content,
+            None,
         ))
         .await?
     {

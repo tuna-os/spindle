@@ -270,6 +270,7 @@ async fn send_delayed_now(
                     &event.event_type,
                     &event.content,
                     event.sticky_ms,
+                    None,
                 )
                 .await
         }

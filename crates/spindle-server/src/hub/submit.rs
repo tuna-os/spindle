@@ -25,7 +25,7 @@ use super::{
 use crate::AppState;
 use crate::errors::MatrixError;
 use crate::federation::FederationError;
-use crate::rooms::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
+use crate::rooms::{ChainEntry, ClientTransaction, HUB_EVENT_TYPE, Sequenced};
 use crate::routes::room_error;
 
 /// Events handed back with a stale answer. The spec's own window for
@@ -324,7 +324,8 @@ async fn verify_submission(
 /// [`try_send`] behind the client transaction: a retried transaction is
 /// left to the ordinary path, which answers it from what it recorded. The
 /// transaction's turn is held across the send, as the ordinary path holds
-/// it, so two concurrent retries cannot both send.
+/// it, so two concurrent retries cannot both send. The transaction is
+/// recorded in the event's own batch (#779).
 ///
 /// # Errors
 ///
@@ -338,26 +339,27 @@ pub(crate) async fn send_with_transaction(
     state_key: Option<&str>,
     content: &Value,
 ) -> Result<Option<Json<Value>>, MatrixError> {
-    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    let transaction = ClientTransaction {
+        user_id: &identity.user_id,
+        device_id: &identity.device_id,
+        txn_id,
+    };
+    let key = transaction.key();
     let _turn = state.transactions.enter(&key).await;
     if let Ok(Some(_)) = spindle_store::ReadView::get(state.store.as_ref(), &key) {
         return Ok(None);
     }
-    match Box::pin(try_send(
+    Ok(Box::pin(try_send(
         state,
         &identity.user_id,
         room_id,
         event_type,
         state_key,
         content,
+        Some(&transaction),
     ))
     .await?
-    {
-        Some(event_id) => {
-            crate::routes::record_transaction(state, identity, txn_id, &event_id).map(Some)
-        }
-        None => Ok(None),
-    }
+    .map(|event_id| Json(json!({ "event_id": event_id }))))
 }
 
 /// The hub answered at all: whatever it said, it is up.
@@ -376,6 +378,9 @@ fn heard_from(state: &AppState, room_id: &str) {
 /// what gets sent, so a submission whose answer was lost can never become
 /// two copies of one message.
 ///
+/// `transaction` is the client's, for a `PUT /send`: its rows land with the
+/// event, whichever way it is committed.
+///
 /// A hub that has not answered for `failover_after_ms` is replaced, if this
 /// server is its first backup: see `epoch::claim_failover`.
 ///
@@ -390,6 +395,7 @@ pub(crate) async fn try_send(
     event_type: &str,
     state_key: Option<&str>,
     content: &Value,
+    transaction: Option<&ClientTransaction<'_>>,
 ) -> Result<Option<String>, MatrixError> {
     let config = &state.config.federation.hub;
     if !config.enabled
@@ -435,7 +441,7 @@ pub(crate) async fn try_send(
                 heard_from(state, room_id);
                 state
                     .rooms
-                    .commit_placed(room_id, &event_id, &json)
+                    .commit_placed(room_id, &event_id, &json, transaction)
                     .map_err(room_error)?;
                 metrics.bump(Counter::SubmissionPlaced);
                 if placed["attestation"].is_object() {
@@ -461,7 +467,14 @@ pub(crate) async fn try_send(
             }
             outcome => {
                 Box::pin(fall_back(
-                    state, sender, room_id, &current, &event_id, &json, &outcome,
+                    state,
+                    sender,
+                    room_id,
+                    &current,
+                    &event_id,
+                    &json,
+                    &outcome,
+                    transaction,
                 ))
                 .await?;
                 return Ok(Some(event_id));
@@ -518,6 +531,7 @@ async fn fall_back(
     event_id: &str,
     json: &Value,
     outcome: &Result<Result<Value, FederationError>, tokio::time::error::Elapsed>,
+    transaction: Option<&ClientTransaction<'_>>,
 ) -> Result<(), MatrixError> {
     let config = &state.config.federation.hub;
     let unreachable = matches!(outcome, Err(_) | Ok(Err(FederationError::Refused(_))));
@@ -535,7 +549,7 @@ async fn fall_back(
     state.metrics.hub().bump(Counter::SubmissionFallback);
     state
         .rooms
-        .commit_placed(room_id, event_id, json)
+        .commit_placed(room_id, event_id, json, transaction)
         .map_err(room_error)?;
     if !unreachable {
         heard_from(state, room_id);
@@ -685,7 +699,7 @@ fn finish_handoff(
 ) -> Result<String, MatrixError> {
     state
         .rooms
-        .commit_placed(room_id, event_id, json)
+        .commit_placed(room_id, event_id, json, None)
         .map_err(room_error)?;
     state.metrics.hub().bump(Counter::HandoffCompleted);
     after_local_send(state, room_id);

@@ -5,9 +5,10 @@ use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
 use crate::ratelimit::{Budget, limit_write};
+use crate::rooms::ClientTransaction;
 use crate::routes::{
     DelayQuery, TimestampToEventQuery, as_seen_by, delay_error, may_read_room, optional_body,
-    record_transaction, room_error, timestamp_lookup, with_transaction_id,
+    room_error, timestamp_lookup, with_transaction_id,
 };
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get, routing::post};
 use serde::Deserialize;
@@ -172,7 +173,12 @@ async fn redact_event(
     axum::extract::Path((room_id, event_id, txn_id)): axum::extract::Path<(String, String, String)>,
     Json(request): Json<RedactRequest>,
 ) -> Result<Json<Value>, MatrixError> {
-    with_transaction(&state, &identity, &txn_id, || async {
+    let transaction = ClientTransaction {
+        user_id: &identity.user_id,
+        device_id: &identity.device_id,
+        txn_id: &txn_id,
+    };
+    with_transaction(&state, &transaction, || async {
         // Inside the mint, so a replayed transaction spends nothing.
         limit_write(&state, Budget::Message, &identity.user_id)?;
         state
@@ -183,6 +189,7 @@ async fn redact_event(
                 state.key.pair(),
                 &event_id,
                 request.reason.as_deref(),
+                Some(&transaction),
             )
             .await
             .map_err(room_error)
@@ -469,8 +476,8 @@ async fn room_context(
 }
 
 /// `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`
-/// Replay a transaction if this device has already sent it, or run `mint` and
-/// record what it produced.
+/// Replay a transaction if this device has already sent it, or run `mint`,
+/// which records the transaction in its event's own batch.
 ///
 /// The check-then-record is not atomic, and deliberately so: the race it
 /// leaves open is two *concurrent* retries of the same transaction, which can
@@ -480,17 +487,19 @@ async fn room_context(
 /// case a durable read-then-write handles completely, including across a
 /// server restart, which an in-memory lock would not.
 ///
-/// Only success is recorded. A refused send must stay refusable: recording a
-/// failure would replay the *error* forever, and recording nothing means the
-/// retry gets a fresh chance, which is what a client expects of a 429 or an
-/// auth refusal that a later state change resolves.
-async fn with_transaction<F: std::future::Future<Output = Result<String, MatrixError>>>(
+/// Only an event that landed is recorded. A refused send must stay
+/// refusable: recording a failure would replay the *error* forever, and
+/// recording nothing means the retry gets a fresh chance, which is what a
+/// client expects of a 429 or an auth refusal that a later state change
+/// resolves. A send whose event landed and whose response is still an
+/// error -- a sync the full disk refused -- is replayed with its event,
+/// not sent again (#779).
+async fn with_transaction<F: Future<Output = Result<String, MatrixError>>>(
     state: &AppState,
-    identity: &crate::accounts::Identity,
-    txn_id: &str,
+    transaction: &ClientTransaction<'_>,
     mint: impl FnOnce() -> F,
 ) -> Result<Json<Value>, MatrixError> {
-    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
+    let key = transaction.key();
     let _turn = state.transactions.enter(&key).await;
     if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &key)
         && let Ok(event_id) = String::from_utf8(stored)
@@ -498,7 +507,7 @@ async fn with_transaction<F: std::future::Future<Output = Result<String, MatrixE
         return Ok(Json(json!({ "event_id": event_id })));
     }
     let event_id = mint().await?;
-    record_transaction(state, identity, txn_id, &event_id)
+    Ok(Json(json!({ "event_id": event_id })))
 }
 
 /// The budgets a `PUT /send` spends before anything else looks at it.
@@ -602,7 +611,12 @@ async fn send_event(
     {
         return Ok(response);
     }
-    let response = with_transaction(&state, &identity, &txn_id, || async {
+    let transaction = ClientTransaction {
+        user_id: &identity.user_id,
+        device_id: &identity.device_id,
+        txn_id: &txn_id,
+    };
+    let response = with_transaction(&state, &transaction, || async {
         state
             .rooms
             .send_sticky_checked(
@@ -612,6 +626,7 @@ async fn send_event(
                 &event_type,
                 &content,
                 query.sticky,
+                Some(&transaction),
             )
             .await
             .map_err(room_error)

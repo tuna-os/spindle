@@ -799,6 +799,7 @@ impl Rooms {
                 sender,
                 content: &body["content"],
                 json: body,
+                transaction: None,
             },
         )
     }
@@ -1145,6 +1146,7 @@ impl Rooms {
             &create_content,
             &create_id,
             &create_json,
+            None,
         )?;
 
         let mut creator_join = Value::Object(creator_profile.clone());
@@ -1244,7 +1246,7 @@ impl Rooms {
     ) -> Result<String, RoomError> {
         self.with_room(room_id, |rooms, log| {
             rooms.append_with(
-                log, room_id, sender, key, event_type, None, content, sticky_ms,
+                log, room_id, sender, key, event_type, None, content, sticky_ms, None,
             )
         })
     }
@@ -2364,6 +2366,7 @@ impl Rooms {
                 Some(state_key),
                 content,
                 sticky_ms,
+                None,
             )
         })
     }
@@ -5512,12 +5515,14 @@ impl Rooms {
             work(self, &mut log)
         };
         // The guard is gone by here, so the barrier below is not holding
-        // anyone up. Ordered before `?` on `done`: a failed `work` may still
+        // anyone up. Before `done` is looked at: a failed `work` may still
         // have journalled -- a partial append is exactly what must not be
         // left unsynced and then reported as an error.
-        if self.store.journalled() != before {
-            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
-        }
+        let synced = if self.store.journalled() == before {
+            Ok(())
+        } else {
+            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)
+        };
         // A write the store refused leaves this room's log ahead of it: the
         // entry is appended in memory before its batch is committed, and a
         // full disk refuses the batch. Kept, the entry is a head whose body
@@ -5526,6 +5531,11 @@ impl Rooms {
         // disk-full drill). The store is the record, so the room goes back
         // to it: dropped here, reloaded on the next ask.
         //
+        // Whatever the sync above did. Another writer's batch can move
+        // `journalled` while this one's is refused, and the sync then fails
+        // on the same full disk. Returning that error first kept the entry
+        // that was never stored (#780).
+        //
         // Only when the store has stopped taking writes. A refusal for any
         // other reason (a forbidden event, a contested key) is decided
         // before anything is appended, and evicting a healthy room under
@@ -5533,6 +5543,7 @@ impl Rooms {
         if done.is_err() && !self.store.accepts_writes() {
             self.evict(room_id, &room);
         }
+        synced?;
         done
     }
 
@@ -5980,7 +5991,7 @@ impl Rooms {
         content: &Value,
     ) -> Result<String, RoomError> {
         self.append_with(
-            log, room_id, sender, key, event_type, state_key, content, None,
+            log, room_id, sender, key, event_type, state_key, content, None, None,
         )
     }
 
@@ -5995,12 +6006,21 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
         sticky_ms: Option<u64>,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         let (event_id, json) = self.build_event(
             log, room_id, sender, key, event_type, state_key, content, sticky_ms,
         )?;
         self.commit_event(
-            log, room_id, sender, event_type, state_key, content, &event_id, &json,
+            log,
+            room_id,
+            sender,
+            event_type,
+            state_key,
+            content,
+            &event_id,
+            &json,
+            transaction,
         )
     }
 
@@ -6026,6 +6046,7 @@ impl Rooms {
         content: &Value,
         event_id: &str,
         json: &Value,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         let event_id = event_id.to_owned();
         self.check_policy_in(log, room_id, json)?;
@@ -6067,6 +6088,7 @@ impl Rooms {
                 sender,
                 content,
                 json: &json,
+                transaction,
             },
         )?;
         self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
@@ -6334,7 +6356,7 @@ impl Rooms {
         json: &Value,
         fan_out: bool,
     ) -> Result<(), RoomError> {
-        self.ingest_checked(log, room_id, event_id, json, fan_out, false)
+        self.ingest_checked(log, room_id, event_id, json, fan_out, false, None)
     }
 
     #[allow(
@@ -6350,6 +6372,7 @@ impl Rooms {
         json: &Value,
         fan_out: bool,
         live_policy: bool,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<(), RoomError> {
         // Redelivery is not an error: transactions retry, and the event
         // is already exactly where it would go. A redelivered event that
@@ -6462,6 +6485,7 @@ impl Rooms {
                 sender: &sender,
                 content: &content,
                 json,
+                transaction,
             },
         )?;
         self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
@@ -6746,6 +6770,11 @@ impl Rooms {
             event_body_key(room_id, event_id),
             serde_json::to_vec(input.json)?,
         )];
+        // The client's transaction, for the same reason: a retry finds it if
+        // and only if the event is there to be found (#779).
+        if let Some(transaction) = input.transaction {
+            extra.extend(transaction.rows(event_id));
+        }
         // A relation is indexed in the entry's own batch too, and for the same
         // reason: an index entry written separately can outlive a commit that
         // failed, leaving `/relations` pointing at an event the room does not
@@ -7192,6 +7221,45 @@ struct PersistInput<'a> {
     sender: &'a str,
     content: &'a Value,
     json: &'a Value,
+    /// The client transaction a local send runs under, if any.
+    transaction: Option<&'a ClientTransaction<'a>>,
+}
+
+/// The client transaction (`txnId`) a `PUT /send` or `PUT /redact` runs
+/// under.
+///
+/// Its rows are written in the event's own batch, so they land if and only
+/// if the event does (#779). Written after the event, they were lost
+/// whenever the event landed and a later write failed: the send answered
+/// 5xx for an event the room holds, and the client's retry with the same
+/// transaction ID sent it a second time.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientTransaction<'a> {
+    pub user_id: &'a str,
+    pub device_id: &'a str,
+    pub txn_id: &'a str,
+}
+
+impl ClientTransaction<'_> {
+    /// The transaction's key: what a retry looks up.
+    #[must_use]
+    pub fn key(&self) -> Vec<u8> {
+        spindle_core::keys::transaction(self.user_id, self.device_id, self.txn_id)
+    }
+
+    /// The rows that record `event_id` as this transaction's event. The
+    /// second is the inverse, so the event comes back to this device with
+    /// the transaction ID it chose: that is how a client matches the remote
+    /// echo to the local one it is still showing.
+    fn rows(&self, event_id: &str) -> [(Vec<u8>, Vec<u8>); 2] {
+        [
+            (self.key(), event_id.as_bytes().to_vec()),
+            (
+                spindle_core::keys::transaction_echo(self.user_id, event_id),
+                spindle_core::keys::transaction_echo_value(self.device_id, self.txn_id),
+            ),
+        ]
+    }
 }
 
 /// An event ID with its stored body — federation answers want both, and

@@ -761,30 +761,6 @@ pub(crate) fn room_error(error: crate::rooms::RoomError) -> MatrixError {
     }
 }
 
-/// Remember which event a client transaction minted, both ways round:
-/// the retry answers with it, and the event comes back to the device
-/// with the transaction ID it chose.
-pub(crate) fn record_transaction(
-    state: &AppState,
-    identity: &crate::accounts::Identity,
-    txn_id: &str,
-    event_id: &str,
-) -> Result<Json<Value>, MatrixError> {
-    let key = spindle_core::keys::transaction(&identity.user_id, &identity.device_id, txn_id);
-    spindle_store::Store::put(state.store.as_ref(), &key, event_id.as_bytes())
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    // The inverse row, so the event comes back to this device with the
-    // transaction ID it chose: that is how a client matches the remote
-    // echo to the local one it is still showing.
-    spindle_store::Store::put(
-        state.store.as_ref(),
-        &spindle_core::keys::transaction_echo(&identity.user_id, event_id),
-        &spindle_core::keys::transaction_echo_value(&identity.device_id, txn_id),
-    )
-    .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    Ok(Json(json!({ "event_id": event_id })))
-}
-
 /// Stamp `unsigned.transaction_id` on an event the reading device sent.
 ///
 /// The spec scopes it to the device: the same user on another device gets

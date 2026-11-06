@@ -1,5 +1,5 @@
 //! Prepare under the room guard, ask outside it, then recheck before commit.
-use super::{Ed25519KeyPair, RoomError, RoomLog, Rooms, StateKey, Value};
+use super::{ClientTransaction, Ed25519KeyPair, RoomError, RoomLog, Rooms, StateKey, Value};
 use crate::policy::{PolicyServer, STABLE_TYPE, UNSTABLE_TYPE};
 use std::sync::Arc;
 
@@ -94,7 +94,11 @@ impl Rooms {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the direct send and the approved one, each with the whole event"
+    )]
     async fn append_policy_checked(
         &self,
         room_id: &str,
@@ -104,6 +108,7 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
         sticky_ms: Option<u64>,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         if event_type == "m.room.member"
             && let Some(target) = state_key
@@ -134,7 +139,15 @@ impl Rooms {
             }
             rooms
                 .append_with(
-                    log, room_id, sender, key, event_type, state_key, &content, sticky_ms,
+                    log,
+                    room_id,
+                    sender,
+                    key,
+                    event_type,
+                    state_key,
+                    &content,
+                    sticky_ms,
+                    transaction,
                 )
                 .map(Some)
         })?;
@@ -192,6 +205,7 @@ impl Rooms {
                         &event["content"],
                         &event_id,
                         &event,
+                        transaction,
                     )
                     .map(Some)
             })?;
@@ -205,6 +219,8 @@ impl Rooms {
     }
 
     /// Send a timeline event with policy approval before persistence/publication.
+    /// `transaction` is the client's, for a `PUT /send`: its rows land in the
+    /// event's own batch.
     ///
     /// # Errors
     /// Returns authorization, policy, signing or storage errors.
@@ -217,9 +233,19 @@ impl Rooms {
         event_type: &str,
         content: &Value,
         sticky_ms: Option<u64>,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
-        self.append_policy_checked(room_id, sender, key, event_type, None, content, sticky_ms)
-            .await
+        self.append_policy_checked(
+            room_id,
+            sender,
+            key,
+            event_type,
+            None,
+            content,
+            sticky_ms,
+            transaction,
+        )
+        .await
     }
 
     /// Send with room policy approval.
@@ -234,7 +260,7 @@ impl Rooms {
         event_type: &str,
         content: &Value,
     ) -> Result<String, RoomError> {
-        self.send_sticky_checked(room_id, sender, key, event_type, content, None)
+        self.send_sticky_checked(room_id, sender, key, event_type, content, None, None)
             .await
     }
 
@@ -279,6 +305,7 @@ impl Rooms {
             Some(state_key),
             &content,
             sticky_ms,
+            None,
         )
         .await
     }
@@ -310,6 +337,7 @@ impl Rooms {
             "m.room.member",
             Some(target),
             &content,
+            None,
             None,
         )
         .await
@@ -363,6 +391,7 @@ impl Rooms {
     }
 
     /// Redact only after policy approval and durable event commit.
+    /// `transaction` is the client's, as for [`Self::send_sticky_checked`].
     ///
     /// # Errors
     /// Returns missing-event, authorization, policy, signing or storage errors.
@@ -373,6 +402,7 @@ impl Rooms {
         key: &Ed25519KeyPair,
         target: &str,
         reason: Option<&str>,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         let known = self.with_room_read(room_id, |_, log| {
             Ok(log.get(&super::EventId::new(target)).is_some())
@@ -393,6 +423,7 @@ impl Rooms {
                 None,
                 &content,
                 None,
+                transaction,
             )
             .await?;
         self.apply_redaction(room_id, target, &id)?;
@@ -413,7 +444,7 @@ impl Rooms {
             if log.get(&super::EventId::new(event_id)).is_some() {
                 return Ok(());
             }
-            rooms.ingest_checked(log, room_id, event_id, event, false, true)
+            rooms.ingest_checked(log, room_id, event_id, event, false, true, None)
         }) {
             Err(RoomError::UnknownRoom(_)) => self.receive_remote(room_id, event_id, event),
             result => result,
