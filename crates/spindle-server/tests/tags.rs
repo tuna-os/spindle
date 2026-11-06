@@ -213,6 +213,55 @@ async fn a_tag_appears_in_syncs_room_account_data() {
     assert_eq!(tag_event["content"]["tags"]["m.favourite"]["order"], 0.5);
 }
 
+/// matrix-rust-sdk's protected `test_room_account_data` sets a tag on a
+/// quiet room and waits three seconds for its sync to carry it (#488). A
+/// room's account data went out only with a room that had events or
+/// ephemeral news, so the long-poll slept through the tag.
+#[tokio::test]
+async fn a_tag_on_a_quiet_room_wakes_a_long_poll() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let (status, sync) = harness.get("/_matrix/client/v3/sync", &alice).await;
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let since = sync["next_batch"].as_str().unwrap().to_owned();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        tokio::spawn(async move {
+            harness
+                .get(
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=30000"),
+                    &alice,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (status, body) = harness
+        .request("PUT", &tag_path(&room, "u.custom_name"), &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, sync) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll slept through the tag")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let events = sync["rooms"]["join"][&room]["account_data"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the room is not in the answer: {sync}"));
+    let tag_event = events
+        .iter()
+        .find(|event| event["type"] == "m.tag")
+        .unwrap_or_else(|| panic!("no m.tag in {events:?}"));
+    assert!(
+        tag_event["content"]["tags"].get("u.custom_name").is_some(),
+        "{tag_event}"
+    );
+}
+
 #[tokio::test]
 async fn tags_are_per_room_and_per_user() {
     let harness = Harness::new();

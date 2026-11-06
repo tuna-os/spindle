@@ -1164,6 +1164,24 @@ pub fn account_data_stream_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
     key
 }
 
+/// The prefix every account-data stream mark of one user shares, global and
+/// per-room together: one scan answers which rooms' data moved.
+#[must_use]
+pub fn account_data_stream_user_prefix(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::AccountDataStream, user_id)
+}
+
+/// The room an [`account_data_stream`] key of `user_id` names, empty for
+/// the global kind. `None` unless the key belongs to that user.
+#[must_use]
+pub fn account_data_stream_room<'a>(user_id: &str, key: &'a [u8]) -> Option<&'a str> {
+    let prefix = account_data_stream_user_prefix(user_id);
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let (len, rest) = rest.split_first_chunk::<2>()?;
+    let room = rest.get(..usize::from(u16::from_be_bytes(*len)))?;
+    std::str::from_utf8(room).ok()
+}
+
 /// The prefix every account-data key for one user and one room shares.
 ///
 /// Pass an empty `room_id` for the global kind.

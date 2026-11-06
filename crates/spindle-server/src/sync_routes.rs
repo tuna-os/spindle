@@ -844,16 +844,13 @@ fn account_data_moved(
     since: u64,
     position: u64,
 ) -> Result<bool, MatrixError> {
-    for room_id in std::iter::once("").chain(scope.iter().copied()) {
-        if state
-            .account_data
-            .changed_between(&identity.user_id, room_id, since, position)
-            .map_err(|error| account_data_error(&error))?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let moved = state
+        .account_data
+        .rooms_changed_between(&identity.user_id, since, position)
+        .map_err(|error| account_data_error(&error))?;
+    Ok(moved
+        .iter()
+        .any(|room_id| room_id.is_empty() || scope.contains(room_id.as_str())))
 }
 
 /// The to-device extension: what is pending for this device, acknowledged
@@ -2090,11 +2087,9 @@ fn sync_join(
             .map_err(room_error)?;
         let badge = badge(state, identity, &room.room_id, &unread)?;
         // Sent in full on every sync, incremental ones included, rather than
-        // only when it changed. Account data has no stream position of its
-        // own -- the sync token counts room events, and a `PUT` to
-        // `/account_data` appends nothing -- so sending only the delta would
-        // need a second cursor. Until there is one, repeating it is the
-        // answer that cannot silently drop a change.
+        // only what changed: repeating it is the answer that cannot silently
+        // drop a change. A room whose only news is its account data has no
+        // events to bring it here, and `sync_quiet_rooms` adds it.
         let room_data = state
             .account_data
             .all(&identity.user_id, &room.room_id)
@@ -2184,27 +2179,52 @@ fn sync_join(
         join.insert(room.room_id, raw(&entry)?);
     }
 
-    sync_ephemeral_only(
+    // Rooms whose account data the user changed inside the window: only an
+    // incremental sync can leave a room out, an initial one sent them all.
+    let moved_account_data = since
+        .map(|since| {
+            state
+                .account_data
+                .rooms_changed_between(&identity.user_id, since, until)
+                .map_err(|error| account_data_error(&error))
+        })
+        .transpose()?;
+    sync_quiet_rooms(
         state,
         identity,
         filter,
         joined,
-        moved_receipts.as_ref(),
+        QuietNews {
+            receipts: moved_receipts.as_ref(),
+            account_data: moved_account_data.as_ref(),
+        },
         &mut join,
     )?;
     Ok(join)
 }
 
-/// A room where the only news is that someone is typing, or that a
-/// receipt moved, has no timeline events, so `Rooms::sync` leaves it out
-/// -- correctly, since it knows nothing about either. Adding it back here
-/// is what keeps both out of the log layer entirely.
-fn sync_ephemeral_only(
+/// What moved in an incremental sync's window that `Rooms::sync` does not
+/// see: receipts by room, and the rooms whose account data changed.
+#[derive(Clone, Copy)]
+struct QuietNews<'a> {
+    receipts: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    account_data: Option<&'a std::collections::HashSet<String>>,
+}
+
+/// A room where the only news is that someone is typing, that a receipt
+/// moved, or that the user changed its account data -- a tag, say -- has
+/// no timeline events, so `Rooms::sync` leaves it out, correctly, since it
+/// knows nothing about any of them. Adding it back here is what keeps all
+/// three out of the log layer. Without the account data, a long-poll slept
+/// through a tag on a quiet room, and matrix-rust-sdk's protected
+/// `test_room_account_data`, which waits three seconds for one, failed
+/// (#488).
+fn sync_quiet_rooms(
     state: &AppState,
     identity: &crate::accounts::Identity,
     filter: Option<&crate::filters::Filter>,
     joined: &[String],
-    moved_receipts: Option<&std::collections::HashMap<String, Vec<String>>>,
+    moved: QuietNews<'_>,
     join: &mut BTreeMap<String, Box<RawValue>>,
 ) -> Result<(), MatrixError> {
     for room_id in joined {
@@ -2213,7 +2233,7 @@ fn sync_ephemeral_only(
         }
         // An initial sync spoke about every room already; only an
         // incremental one has receipt-only rooms to add.
-        let receipts = match moved_receipts.and_then(|moved| moved.get(room_id)) {
+        let receipts = match moved.receipts.and_then(|moved| moved.get(room_id)) {
             Some(readers) => sync_receipts(state, identity, room_id, Some(readers), &[])?,
             None => None,
         };
@@ -2227,13 +2247,31 @@ fn sync_ephemeral_only(
             filter.and_then(|filter| filter.room.ephemeral.as_ref()),
             events,
         );
-        if events.is_empty() {
+        let room_data = if moved
+            .account_data
+            .is_some_and(|moved| moved.contains(room_id))
+        {
+            crate::filters::Filter::apply(
+                filter.and_then(|filter| filter.room.account_data.as_ref()),
+                state
+                    .account_data
+                    .all(&identity.user_id, room_id)
+                    .map_err(|error| account_data_error(&error))?,
+            )
+        } else {
+            Vec::new()
+        };
+        if events.is_empty() && room_data.is_empty() {
             continue;
         }
-        join.insert(
-            room_id.clone(),
-            raw(&json!({ "ephemeral": { "events": events } }))?,
-        );
+        let mut entry = serde_json::Map::new();
+        if !events.is_empty() {
+            entry.insert("ephemeral".to_owned(), json!({ "events": events }));
+        }
+        if !room_data.is_empty() {
+            entry.insert("account_data".to_owned(), json!({ "events": room_data }));
+        }
+        join.insert(room_id.clone(), raw(&entry)?);
     }
     Ok(())
 }
