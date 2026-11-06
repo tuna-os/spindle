@@ -30,7 +30,8 @@ edge and MatrixRTC (#38, #39). The per-account write budgets after them
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
 | `PUT /send/m.rtc.notification` (and the MSC4075 unstable name) | account | `[ratelimit] rings_per_minute`, 10 | every attempt, delayed or not, whether or not the room then refuses it |
 | `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
-| `POST /_spindle/rtc/livekit/sfu/get` (built-in LiveKit service) | user | 20 per 60 s | every request that carried a live OpenID token, before the membership check |
+| `POST /_spindle/rtc/livekit/sfu/get` and `.../get_token` (built-in LiveKit service), MSC4195's `get_token` | user | 20 per 60 s | every request that carried a live OpenID token or access token, before the membership check |
+| the same, with another server's OpenID token, and the MSC4195 federation `get_token` | that server | 60 per 60 s | every request that names the server, before this server asks it to confirm the token |
 
 The two mints are limited because they are not reads: an OpenID token is a
 durable row written on the caller's say-so, and both tokens exist to make
@@ -38,6 +39,12 @@ a third party — a JWT service, an SFU — do work. Minting is an HMAC here
 and a room on the SFU there, which is the asymmetry #38 names. A client
 mints one of each per call it joins, so twenty a minute is a busy user
 several times over and a loop within seconds.
+
+A token request with another server's OpenID token makes this server ask
+that server over federation before it knows who is asking. So the limit
+for those requests is per server, and it applies before the question.
+Requests that name one server use only that server's budget. A server
+that does not answer is also not asked again for thirty seconds.
 
 Both login keys are checked before the password is, so a caller over the
 limit does not get an Argon2 verification out of each attempt. Both are

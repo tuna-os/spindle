@@ -654,6 +654,49 @@ async fn delegation_is_held_then_released_by_sfu_events() {
     assert_eq!(body["held_delegations"], 0);
 }
 
+/// A Matrix 2.0 participant's `LiveKit` identity is a hash, and the SFU's
+/// webhook says nothing else about them: the hold records that identity
+/// from the member the delegation request names, and a webhook releases
+/// that participant's hold and no other's.
+#[tokio::test]
+async fn a_matrix_2_hold_is_released_by_its_hashed_identity() {
+    let harness = Harness::with(REMOTE);
+    let alice = harness.register("alice").await;
+    harness.make_admin(&alice);
+    let room = harness.create_room(&alice).await;
+    for (delay_id, member_id) in [("hold-a", "member-a"), ("hold-b", "member-b")] {
+        let (status, body) = harness
+            .post(
+                DELEGATE,
+                Some(&alice.access_token),
+                json!({
+                    "room_id": room,
+                    "slot_id": "m.call#ROOM",
+                    "member": { "id": member_id, "claimed_device_id": alice.device_id },
+                    "delay_id": delay_id,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let left = json!({ "event": "participant_left", "participant": {
+        "identity": lk_hash(&[&alice.user_id, &alice.device_id, "member-a"]),
+    } })
+    .to_string();
+    let (status, body) = harness
+        .webhook(
+            &webhook_authorization("APIkey", "not-the-signing-key", &left),
+            &left,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["released"], 1, "member-a's hold only: {body}");
+    let (_, body) = harness.get(ADMIN, Some(&alice.access_token)).await;
+    assert_eq!(body["held_delegations"], 1, "member-b's hold stays");
+}
+
 /// Unconfigured, the delegation probe is the 404 Element Call reads as
 /// "hold it yourself".
 #[tokio::test]

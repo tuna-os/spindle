@@ -875,6 +875,11 @@ struct DelegateRequest {
     room: String,
     #[serde(default)]
     delay_id: String,
+    /// The `MatrixRTC` member, as the Matrix 2.0 request names it: with
+    /// it, the hold records the participant's hashed `LiveKit` identity,
+    /// which is all the SFU webhook will say about them.
+    #[serde(default)]
+    member: Member,
 }
 
 async fn delegate_delayed_leave(State(state): State<AppState>, request: Request) -> Response {
@@ -909,9 +914,15 @@ async fn delegate_delayed_leave_builtin(
     } else {
         request.room_id.clone()
     };
+    let device_id = if request.member.claimed_device_id.is_empty() {
+        identity.device_id.as_str()
+    } else {
+        request.member.claimed_device_id.as_str()
+    };
     let record = json!({
         "user_id": identity.user_id,
-        "device_id": identity.device_id,
+        "device_id": device_id,
+        "identity": identity_for(&identity.user_id, device_id, &request.member.id),
         "room_id": room,
         "delay_id": request.delay_id,
     });
@@ -974,23 +985,25 @@ async fn sfu_webhook(
             .get("participant")
             .and_then(|participant| participant.get("identity"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        // The minter's identity is `{user_id}:{device_id}`, and the user
-        // ID itself holds a colon (`@local:server`), so the device comes
-        // off the end, not the front.
-        let Some((user_id, _)) = identity.rsplit_once(':') else {
-            continue;
-        };
-        released += release_holds_for(&state, user_id);
+            .unwrap_or_default();
+        released += release_holds_for(&state, identity);
     }
     Ok(Json(json!({ "released": released })))
 }
 
-/// Send every held delegated leave naming `user_id`, and forget the holds.
-/// A hold whose delay is already gone (fired, cancelled, unknown) still
-/// clears: holding nothing is not holding.
-fn release_holds_for(state: &AppState, user_id: &str) -> u64 {
+/// Send every held delegated leave the participant `identity` left behind,
+/// and forget the holds. A hold matches when it recorded that identity --
+/// the Matrix 2.0 hash, or `{user_id}:{device_id}` -- and, for the legacy
+/// identity, when it names the same user: the user ID holds a colon
+/// (`@local:server`), so the device comes off the end, and every hold of
+/// that user is released, as before holds recorded an identity. A hold
+/// whose delay is already gone (fired, cancelled, unknown) still clears:
+/// holding nothing is not holding.
+fn release_holds_for(state: &AppState, identity: &str) -> u64 {
+    if identity.is_empty() {
+        return 0;
+    }
+    let legacy_user = identity.rsplit_once(':').map(|(user_id, _)| user_id);
     let holds = state
         .store
         .scan_prefix(DELEGATION_PREFIX.as_bytes())
@@ -1001,7 +1014,10 @@ fn release_holds_for(state: &AppState, user_id: &str) -> u64 {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if value.get("user_id").and_then(Value::as_str) != Some(user_id) {
+        let recorded = value.get("identity").and_then(Value::as_str) == Some(identity);
+        let same_user =
+            legacy_user.is_some() && value.get("user_id").and_then(Value::as_str) == legacy_user;
+        if !recorded && !same_user {
             continue;
         }
         if let Some(delay_id) = value.get("delay_id").and_then(Value::as_str) {
