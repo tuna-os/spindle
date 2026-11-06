@@ -92,11 +92,24 @@ tests::timeline::test_permalink_timelines_redecrypt
 # Spindle at b6fba41 and 79f0025): 43 passed, 15 failed, 5 ignored in
 # both. The new pin exercises dehydrated-device recovery, X.509
 # cross-signing, declining an empty-room invite and the repaired
-# `/context` walk. All seven passed twice; the protected total is 43.
+# `/context` walk. All seven passed twice; the protected total was 43.
+#
+# Withdrawn: test_event_with_context (#705). It races the SDK, not the
+# server. matrix-rust-sdk sleeps a second before a /sync that follows the
+# last one within a second (`delay_sync`). Bob's long-poll returns the
+# invite well inside that second, so his client sleeps, and Spindle serves
+# his join, Alice's room-key share and her 21 sends in about 300 ms. The
+# /context lands before his next sync can bring the key. The test failed
+# that way on the 2026-11-03 nightly (pre-#760), on 8c11faa0 and on
+# 268a229d, and 11 of 25 times in a release-build loop at 048eec46 (6 of
+# 25 at 1d71004d). Behind a proxy adding about 40 ms a request it passed
+# 52 of 52, so the outcome is client timing, not a Spindle defect. The one
+# server-side cause found, a long-poll answering with nothing when another
+# user's news moved the stream, is fixed by the same change. Protecting
+# the test again needs a run that controls the race, not another pass.
 tests::e2ee::dehydrated_devices::test_dehydrated_device_direct_round_trip
 tests::e2ee::dehydrated_devices::test_dehydrated_device_start_via_recovery
 tests::e2ee::x509::test_user_is_not_verified_if_their_msk_is_not_signed
 tests::e2ee::x509::test_user_is_not_verified_if_we_dont_trust_their_cert
 tests::e2ee::x509::test_user_is_verified_if_their_msk_is_signed
 tests::room::test_empty_room_decline_invite
-tests::room::test_event_with_context
