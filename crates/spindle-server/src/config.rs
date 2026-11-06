@@ -706,10 +706,11 @@ pub struct AuthConfig {
     /// The built-in provider's issuer, when it should differ from the
     /// client base URL (#609) — e.g. `https://auth.example.org/` to keep
     /// the issuer a retired MAS used, so clients that stored it keep
-    /// working. An origin only: the provider's routes are served at the
-    /// root of whichever host reaches this process, so a path here would
-    /// advertise endpoints nothing serves. Absent, the issuer is the
-    /// client base URL, as before.
+    /// working. It may carry a path (`https://example.org/auth/`) for a
+    /// reverse proxy that publishes the provider under one: the provider's
+    /// routes answer with that path in front and without it (for a proxy
+    /// that strips it), and every page link and redirect carries it.
+    /// Absent, the issuer is the client base URL, as before.
     #[serde(default)]
     pub oidc_issuer: Option<String>,
 }
@@ -1954,7 +1955,8 @@ impl Config {
 
     /// The built-in provider's settings: never beside delegation, and
     /// `auth.oidc_issuer` meaningful only with the provider and an http(s)
-    /// origin with nothing after the host.
+    /// URL with no query, fragment or credentials, whose path (if any) is
+    /// one the server can tell apart from its own routes.
     fn validate_builtin_oidc(&self) -> Result<(), ConfigError> {
         // One identity authority is the point of both modes; a server
         // with two would mint accounts nobody can say who owns.
@@ -1986,21 +1988,67 @@ impl Config {
                 message: format!("{issuer:?} is not an http(s) URL"),
             });
         };
-        let host = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
         if host.is_empty()
-            || host.contains(['/', '?', '#', '@', ' ', '\\'])
+            || host.contains(['?', '#', '@', ' ', '\\'])
             || host.chars().any(char::is_control)
         {
             return Err(ConfigError::Invalid {
                 field: "auth.oidc_issuer",
                 message: format!(
-                    "{issuer:?} must be an origin such as \"https://auth.example.org/\" — \
-                     the provider's endpoints live at the root of the host, so a path, \
-                     query or credentials here would advertise URLs nothing serves"
+                    "{issuer:?} must be an http(s) URL such as \"https://auth.example.org/\" — \
+                     a query, fragment or credentials here would advertise URLs nothing serves"
                 ),
             });
         }
+        let path = path.trim_end_matches('/');
+        if !path.is_empty() {
+            let segments: Vec<&str> = path[1..].split('/').collect();
+            let plain = segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && *segment != "."
+                    && *segment != ".."
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            });
+            // The path is stripped from a request before routing; a first
+            // segment that is itself a route (or a `_matrix`-style prefix)
+            // would make a real request look like a prefixed one.
+            let first = segments.first().copied().unwrap_or_default();
+            let collides = first.starts_with(['_', '.'])
+                || ["account", "oauth2", "upstream", "health", "ready"].contains(&first);
+            if !plain || collides {
+                return Err(ConfigError::Invalid {
+                    field: "auth.oidc_issuer",
+                    message: format!(
+                        "{issuer:?} has a path the provider cannot be served under: use plain \
+                         segments (letters, digits, - . _ ~) whose first is not one of the \
+                         server's own routes, e.g. \"https://example.org/auth/\""
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The path of `auth.oidc_issuer`, without a trailing slash: `/auth`
+    /// for `https://example.org/auth/`, empty for an issuer at the root of
+    /// its host or none configured. Only the configured issuer counts: the
+    /// client base URL's path was never served as the provider's, and an
+    /// issuer that does not name one keeps the routes exactly where they were.
+    #[must_use]
+    pub fn oidc_issuer_path(&self) -> String {
+        let Some(issuer) = self.auth.oidc_issuer.as_deref() else {
+            return String::new();
+        };
+        let rest = issuer
+            .strip_prefix("https://")
+            .or_else(|| issuer.strip_prefix("http://"))
+            .unwrap_or(issuer);
+        rest.find('/').map_or_else(String::new, |at| {
+            rest[at..].trim_end_matches('/').to_owned()
+        })
     }
 
     /// The built-in provider's issuer without its trailing slash: the

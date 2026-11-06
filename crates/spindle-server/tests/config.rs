@@ -566,8 +566,32 @@ fn the_builtin_issuer_can_live_on_its_own_host() {
     }
 }
 
+/// #609: a reverse proxy may publish the provider under a path; the path
+/// is kept in the advertised base and is what the routes are served under.
 #[test]
-fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
+fn the_builtin_issuer_can_live_under_a_path() {
+    for issuer in ["https://example.org/auth/", "https://example.org/auth"] {
+        let config = parse(&format!(
+            "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\noidc_issuer = \"{issuer}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.oidc_issuer_base(), "https://example.org/auth");
+        assert_eq!(config.oidc_issuer_path(), "/auth");
+    }
+    let config = parse(
+        "[server]\nname = \"example.org\"\npublic_base_url = \"https://example.org/matrix\"\n\
+         [auth]\nbuiltin_oidc = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.oidc_issuer_path(),
+        "",
+        "no configured issuer, no path: the routes stay where they were"
+    );
+}
+
+#[test]
+fn a_builtin_issuer_must_be_a_servable_url_of_an_enabled_provider() {
     for (auth, why) in [
         (
             "oidc_issuer = \"https://auth.example.org/\"\n",
@@ -578,8 +602,16 @@ fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
             "not a URL",
         ),
         (
-            "builtin_oidc = true\noidc_issuer = \"https://example.org/auth/\"\n",
-            "a path",
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/account/\"\n",
+            "a path that is one of the provider's own routes",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/_matrix/\"\n",
+            "a path inside the Matrix API",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/a/../b\"\n",
+            "a dot segment",
         ),
         (
             "builtin_oidc = true\noidc_issuer = \"https://example.org/?x=1\"\n",

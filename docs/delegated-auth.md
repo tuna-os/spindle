@@ -188,8 +188,8 @@ public_base_url = "https://matrix.example.org"
 
 [auth]
 builtin_oidc = true
-# Optional (#609): an issuer on a host of its own. Omitted, the issuer is
-# the client base URL above.
+# Optional (#609): an issuer on a host of its own, or under a path.
+# Omitted, the issuer is the client base URL above.
 # oidc_issuer = "https://auth.example.org/"
 ```
 
@@ -203,9 +203,13 @@ the clients already know. This covers the discovery document,
 `/_matrix/client/v1/auth_metadata` and its MSC2965 unstable alias, the
 `/.well-known/matrix/client` authentication block, and each endpoint.
 
-The value must be an origin. Spindle serves the provider routes at the root
-of each host that gets to it, so a path would advertise URLs that nothing
-serves. The server does not start with a path.
+The value can have a path, for example `https://example.org/auth/`. Use
+this when a reverse proxy publishes the provider under that path. The
+proxy can keep the path or remove it: Spindle answers on both. The links,
+forms and redirects of the pages keep the path. The first segment of the
+path cannot be a route of the server (`account`, `oauth2`, `upstream`,
+or a segment that starts with `_` or `.`). A query, a fragment or
+credentials stop the server at startup.
 
 With that, Spindle itself serves the small provider surface those
 clients need — discovery (`/.well-known/openid-configuration`, relayed
