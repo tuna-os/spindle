@@ -610,6 +610,29 @@ impl Harness {
         state_key: &str,
         content: &Value,
     ) -> Value {
+        self.stale_state_at(
+            peer,
+            room,
+            stale,
+            event_type,
+            state_key,
+            content,
+            now_millis(),
+        )
+    }
+
+    /// [`Self::stale_state`] with an explicit `origin_server_ts`.
+    #[allow(clippy::too_many_arguments, reason = "one event, in one place")]
+    fn stale_state_at(
+        &self,
+        peer: &Peer,
+        room: &str,
+        stale: &str,
+        event_type: &str,
+        state_key: &str,
+        content: &Value,
+        origin_server_ts: u64,
+    ) -> Value {
         peer.event(federation_auth::with_auth_events(
             &self.store,
             json!({
@@ -618,12 +641,22 @@ impl Harness {
                 "sender": peer.user(),
                 "room_id": room,
                 "content": content,
-                "origin_server_ts": now_millis(),
+                "origin_server_ts": origin_server_ts,
                 "depth": 11,
                 "prev_events": [stale],
                 "auth_events": [],
             }),
         ))
+    }
+
+    /// A timestamp one millisecond after `event_id`'s, as federation
+    /// serves it: for a peer event that state resolution must order after
+    /// ours. `now_millis()` read after our write can return the same
+    /// millisecond, and then the resolver orders the two by event ID,
+    /// which is random (#777).
+    async fn just_after(&self, peer: &Peer, event_id: &str) -> u64 {
+        let event = self.federation_event(peer, event_id).await;
+        event["origin_server_ts"].as_u64().unwrap() + 1
     }
 
     /// A message PDU from the peer that names `stale` as its only parent.
@@ -948,10 +981,10 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
 /// reads, so here the resolver's choice decides who may write to the room
 /// at all. Both changes come from users at power 100 and neither cites the
 /// other, so state resolution orders them by `origin_server_ts` and applies
-/// the later one last: the peer's, signed after our write. Those are the
-/// power levels the room now enforces, and both the client's view and
-/// federation's must say so, or the two servers' disagreement (#16) would
-/// be joined by a disagreement inside this one.
+/// the later one last: the peer's, stamped one millisecond after ours.
+/// Those are the power levels the room now enforces, and both the client's
+/// view and federation's must say so, or the two servers' disagreement
+/// (#16) would be joined by a disagreement inside this one.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
@@ -983,13 +1016,14 @@ async fn a_fork_on_the_power_levels_is_resolved_and_decides_who_may_write() {
         .await;
     assert_eq!(status, StatusCode::OK);
     // Theirs, from the same fork point, leaves charlie at zero.
-    let pdu = harness.stale_state(
+    let pdu = harness.stale_state_at(
         &peer,
         &room,
         &fork_point,
         "m.room.power_levels",
         "",
         &levels(0),
+        harness.just_after(&peer, &ours).await,
     );
     let theirs = injected_id(&harness.inject(&peer, "fork_pl", pdu).await);
 
@@ -1059,13 +1093,13 @@ async fn a_fork_on_the_power_levels_is_resolved_and_decides_who_may_write() {
 /// Both branches move one user's membership: SPEC §9.2 case 3 on the slot
 /// #16's scope names alongside power levels.
 ///
-/// We kick charlie; the peer, from the same fork point, bans them. Both are
-/// power events from equal-power senders, so resolution applies the later
-/// one, the peer's ban, last -- and the assertion that matters is that the
-/// room *enforces* the membership it holds: a banned user cannot be
-/// re-invited, so the invite that a kick would have allowed is refused.
-/// A room that read one membership and enforced another would disagree
-/// with itself.
+/// We kick charlie; the peer, from the same fork point, bans them one
+/// millisecond later. Both are power events from equal-power senders, so
+/// resolution applies the later one, the peer's ban, last -- and the
+/// assertion that matters is that the room *enforces* the membership it
+/// holds: a banned user cannot be re-invited, so the invite that a kick
+/// would have allowed is refused. A room that read one membership and
+/// enforced another would disagree with itself.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
@@ -1094,14 +1128,16 @@ async fn a_fork_on_one_membership_is_resolved_and_is_what_is_enforced() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let ours = harness.head_event(&room, &alice).await;
     // Theirs, from the fork point: a ban.
-    let pdu = harness.stale_state(
+    let pdu = harness.stale_state_at(
         &peer,
         &room,
         &fork_point,
         "m.room.member",
         "@charlie:example.org",
         &json!({ "membership": "ban" }),
+        harness.just_after(&peer, &ours).await,
     );
     let theirs = injected_id(&harness.inject(&peer, "fork_member", pdu).await);
 
