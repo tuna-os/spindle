@@ -70,9 +70,11 @@ and it works unmodified — Spindle serves ordinary rooms of room versions 1 to
 CI gate fails if a config field exists in the code and not in that file.
 
 **Other commands:** `promote-admin` (mints the first admin offline),
-`set-password-hash` (imports Argon2 hashes, e.g. from MAS),
+`set-password-hash` (imports Argon2 or bcrypt hashes),
 `issue-reset-link` (a password-reset link that needs no mail),
 `backup` / `restore` / `verify-media`, `migrate`, `gc` (frees unused state).
+`import-mas` moves MAS accounts to the built-in provider (build with
+`--features mas-import`).
 See
 [docs/lifecycle.md](docs/lifecycle.md).
 

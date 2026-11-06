@@ -108,27 +108,30 @@ spindle set-password-hash <config> <localpart> < hash
 spindle set-password-hash <config> < hashes
 ```
 
-Stores Argon2 hashes in PHC form that another system made (#611). This is
-usually the `user_passwords.hashed_password` of a Matrix Authentication
-Service. Those users then sign in to Spindle with the passwords they
-already have. The hashes come from stdin, never the command line, so they
-do not show in a process listing or shell history.
+Stores password hashes that another system made (#611): Argon2 in PHC
+form, or bcrypt. This is usually the `user_passwords.hashed_password` of
+a Matrix Authentication Service. Those users then sign in to Spindle with
+the passwords they already have. The hashes come from stdin, never the
+command line, so they do not show in a process listing or shell history.
 
 With a localpart,
 stdin is the hash of that one account. Without one, each line is
 `<localpart> <hash>` (`@user:server` works too, and the command does not read
 blank lines and `#` comments).
 
-The command validates each hash before it writes it. It must be
+The command validates each hash before it writes it. An Argon2 hash must be
 `argon2id`, `argon2i` or `argon2d`, version 16 or 19, with exactly the
 `m`/`t`/`p` parameters. `m` is 256 MiB at most, and `t` and `p` are 16 at
-most. The command refuses all other hashes (bcrypt, pbkdf2, a keyed
+most. A bcrypt hash must be `$2a$`, `$2b$` or `$2y$`, with a cost of 14 at
+most. The command refuses all other hashes (pbkdf2, a keyed
 `keyid=`/`data=` hash). If this server cannot verify a stored hash,
 nobody can enter that account.
 
 A hash made with a pepper that the string does *not* record (the
-per-scheme `secret` of MAS) looks ordinary. The command accepts it, but it
-never verifies. Check your MAS `passwords.schemes` before the import.
+per-scheme `secret` of MAS) looks ordinary. This command accepts it, but
+it never verifies. For MAS, use `spindle import-mas` instead: it reads the
+schemes from the MAS configuration and stores each secret with its hash
+([delegated-auth.md](delegated-auth.md#moving-from-mas-to-the-built-in-provider-797)).
 
 The
 accounts must already exist (the Synapse importer makes them). The command

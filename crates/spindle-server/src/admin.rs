@@ -896,7 +896,7 @@ struct SetPasswordHash {
 
 /// `POST /users/{userId}/password_hash` (#611)
 ///
-/// Store an Argon2 PHC hash computed elsewhere — a Matrix Authentication
+/// Store an Argon2 PHC or bcrypt hash computed elsewhere — a Matrix Authentication
 /// Service's `user_passwords.hashed_password`, typically — so its user
 /// signs in here with the password they already have. The hash is
 /// validated (`accounts::validate_password_hash`) and refused with

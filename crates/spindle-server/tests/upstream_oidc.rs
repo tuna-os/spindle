@@ -308,14 +308,17 @@ struct Instance {
     name: String,
     client: reqwest::Client,
     idp: Arc<Idp>,
+    store: Arc<FjallStore>,
+    config: spindle_server::Config,
 }
 
 impl Instance {
     async fn start() -> Instance {
-        Self::start_with(false).await
+        Self::start_with(false, "").await
     }
 
-    async fn start_with(rate_limited: bool) -> Instance {
+    /// `extra` is appended to the configuration: more providers.
+    async fn start_with(rate_limited: bool, extra: &str) -> Instance {
         let idp = start_idp().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -331,16 +334,17 @@ impl Instance {
         };
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\npublic_base_url = \"http://{name}\"\n\
-             [ratelimit]\nenabled = {rate_limited}\n[auth]\nbuiltin_oidc = true\n{}{}{}",
+             [ratelimit]\nenabled = {rate_limited}\n[auth]\nbuiltin_oidc = true\n{}{}{}{}",
             provider("mock", ""),
             provider("trusting", "link_existing_by_email = true\n"),
             provider(
                 "info",
                 "token_endpoint_auth_method = \"client_secret_post\"\nfetch_userinfo = true\n"
             ),
+            extra.replace("{issuer}", &idp.issuer),
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let app = spindle_server::app(config.clone(), Arc::clone(&store)).expect("the app builds");
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -352,6 +356,8 @@ impl Instance {
                 .build()
                 .unwrap(),
             idp,
+            store,
+            config,
         }
     }
 
@@ -915,7 +921,7 @@ async fn userinfo_fills_in_what_the_id_token_leaves_out() {
 /// spend the per-source login budget.
 #[tokio::test]
 async fn starting_flows_is_free_and_failed_callbacks_are_counted() {
-    let server = Instance::start_with(true).await;
+    let server = Instance::start_with(true, "").await;
     let mut redirect_uri = String::new();
     for attempt in 0..40 {
         let page = Browser::default()
@@ -940,4 +946,71 @@ async fn starting_flows_is_free_and_failed_callbacks_are_counted() {
         "{statuses:?}"
     );
     assert_eq!(statuses[30], 429, "the 31st failure in a minute is refused");
+}
+
+/// #797: a link `spindle import-mas` carried over from MAS's
+/// `upstream_oauth_links` signs its identity in to the account MAS had
+/// linked, which the name alone could not reach.
+#[tokio::test]
+async fn a_link_imported_from_mas_signs_in_to_the_account_mas_linked() {
+    use spindle_server::import::mas;
+    // The provider's id is the ULID MAS shows for the UUID it stores.
+    const MAS_PROVIDER: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
+    const ULID: &str = "01H455VB4PEX5VSKNK084SN02Q";
+    let server = Instance::start_with(
+        false,
+        &format!(
+            "[[auth.upstream_oidc]]\nid = \"{ULID}\"\nname = \"Company SSO\"\n\
+             issuer = \"{{issuer}}\"\nclient_id = \"{CLIENT_ID}\"\n\
+             client_secret = \"{CLIENT_SECRET}\"\n"
+        ),
+    )
+    .await;
+    // The account as MAS provisioned it under delegation.
+    spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name)
+        .register("olivia", "provisioned by MAS, never used")
+        .unwrap();
+    let start = format!("/upstream/authorize/{ULID}");
+    let olivia = || plain(person("mas-subject-7", "olivia"));
+
+    // Before the import the identity is a stranger: the name is taken, and
+    // a name never hands over an existing account.
+    let mut browser = Browser::default();
+    let (_, page) = sign_in(&server, &mut browser, &start, olivia()).await;
+    assert_eq!(page.status, 409, "{}", page.body);
+    assert!(!browser.signed_in());
+
+    let snapshot = mas::Snapshot {
+        users: vec![mas::User {
+            id: "u-olivia".to_owned(),
+            username: "olivia".to_owned(),
+            ..mas::User::default()
+        }],
+        providers: vec![mas::Provider {
+            id: MAS_PROVIDER.to_owned(),
+            issuer: Some(server.idp.issuer.clone()),
+        }],
+        links: vec![mas::Link {
+            provider_id: MAS_PROVIDER.to_owned(),
+            subject: "mas-subject-7".to_owned(),
+            user_id: Some("u-olivia".to_owned()),
+        }],
+    };
+    let report = mas::apply(
+        server.store.as_ref(),
+        &server.config,
+        &snapshot,
+        &mas::Schemes::default(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.links.imported, 1, "{report:?}");
+    assert!(report.refused.is_empty(), "{report:?}");
+
+    let mut browser = Browser::default();
+    let (_, page) = sign_in(&server, &mut browser, &start, olivia()).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert!(browser.signed_in());
+    let home = browser.get(&server, &server.url("/account/")).await;
+    assert!(home.body.contains(&server.user("olivia")), "{}", home.body);
 }

@@ -14,6 +14,12 @@ repository = "https://github.com/tuna-os/spindle"
 
 [workspace.dependencies]
 argon2 = "0.6"
+# Verifying passwords imported from MAS (#797): bcrypt is what Synapse wrote
+# and what MAS keeps for the users syn2mas moved, and MAS's
+# `unicode_normalization` option hashes the NFKC form of the password. The
+# same bcrypt crate MAS verifies with.
+bcrypt = "0.19"
+unicode-normalization = "0.1"
 axum = "0.8"
 form_urlencoded = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "stream"] }

@@ -289,16 +289,30 @@ pub(crate) fn addresses_of(
 
 /// Who an address belongs to, if anyone.
 pub(crate) fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixError> {
-    Ok(
-        ReadView::get(state.store.as_ref(), &keys::email_owner(address))
-            .map_err(|e| storage(&e))?
-            .and_then(|raw| String::from_utf8(raw).ok()),
-    )
+    owner_in(state.store.as_ref(), address)
+}
+
+/// [`owner_of`] against a store directly, for the offline MAS importer.
+pub(crate) fn owner_in(
+    store: &(impl ReadView + ?Sized),
+    address: &str,
+) -> Result<Option<String>, MatrixError> {
+    Ok(ReadView::get(store, &keys::email_owner(address))
+        .map_err(|e| storage(&e))?
+        .and_then(|raw| String::from_utf8(raw).ok()))
 }
 
 pub(crate) fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
-    state
-        .store
+    bind_in(state.store.as_ref(), localpart, address)
+}
+
+/// [`bind`] against a store directly, for the offline MAS importer.
+pub(crate) fn bind_in(
+    store: &(impl Store + ?Sized),
+    localpart: &str,
+    address: &str,
+) -> Result<(), MatrixError> {
+    store
         .commit(
             &[
                 (keys::email_owner(address), localpart.as_bytes().to_vec()),
