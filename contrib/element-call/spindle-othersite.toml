@@ -26,7 +26,7 @@ enabled = false
 
 [appservices]
 # lk-jwt-service runs as an appservice from 0.7.0 on, with the tokens in
-# upstream's backend/app-service-othersite.yaml (mounted by docker-compose-spindle.yml).
+# upstream's backend/app-service-othersite.yaml (mounted by docker-compose-spindle-othersite.yml).
 registrations = ["/cfg/app-service.yaml"]
 
 [registration]

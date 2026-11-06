@@ -279,24 +279,47 @@ and `sticky_events.rs`.
 
 ## Running Element Call's own suite
 
-`contrib/element-call/run.sh` stands up Element Call's two-homeserver
-Playwright stack (LiveKit, lk-jwt-service, Element Web, nginx, all
-upstream's and pinned) with Spindle in both of Synapse's seats, and runs
-their specs against it. `docker-compose-spindle.yml` is the whole
-override; `spindle.toml` and `spindle-othersite.toml` stand in for
-`backend/playwright_homeserver*.yaml`. Results go through
-`scripts/element-call-check.py` against `contrib/element-call/allowlist.txt`,
-the same ratchet shape as Complement's. The `element-call-e2e` job in
-`.github/workflows/compliance.yml` runs it nightly and on demand.
+`contrib/element-call/run.sh` starts Element Call's Playwright stack with
+two homeservers. LiveKit, lk-jwt-service, Element Web and nginx are
+upstream's, at a pinned revision. Spindle takes the first homeserver
+seat: `docker-compose-spindle.yml` puts it there, with `spindle.toml` in
+place of upstream's `backend/playwright_homeserver.yaml`. The script then
+runs upstream's specs against the stack. `scripts/element-call-check.py`
+compares the results with `contrib/element-call/allowlist.txt`, as the
+Complement check does with its allowlist. The `element-call-e2e` job in
+`.github/workflows/compliance.yml` runs the suite nightly and on demand.
 
-Beside upstream's specs run this server's own, in
-`contrib/element-call/specs/` (copied into the checkout as
-`playwright/spindle/`, driven through upstream's fixtures unchanged): a
-five-party call with joins, a clean leave, a rejoin, simultaneous
-arrivals and departures and a participant killed mid-call; a homeserver
-restart mid-call in both membership modes, after which the call must
-still be up and a crash must still expire; a ring the caller abandons;
-and a call across the rig's two Spindles in both modes.
+`SPINDLE_PEER` selects the server in the second seat:
+
+- `spindle`, the default: a second Spindle, from
+  `docker-compose-spindle-othersite.yml` and `spindle-othersite.toml`.
+- `synapse`: upstream's Synapse, with no change.
+  `docker-compose-dead-peers.yml` adds three more Spindles for the last
+  ring test below. This variant has its own allowlist,
+  `allowlist-synapse-peer.txt`. The `element-call-synapse-peer` job runs
+  it nightly, on demand, and on pull requests that change federation or
+  MatrixRTC code.
+
+The rig also runs specs of this server, from `contrib/element-call/specs/`.
+The script copies them into the checkout as `playwright/spindle/`. They
+use upstream's fixtures with no change. With two Spindles they run:
+
+- a five-party call with joins, a clean leave, a rejoin, and a
+  participant that stops mid-call;
+- a homeserver restart mid-call in both membership modes. The call must
+  stay up, and a crash must still expire;
+- a ring that the caller abandons;
+- a call across the two Spindles in both membership modes.
+
+With Spindle and Synapse they run:
+
+- a call in each direction, in both membership modes.
+- a DM call in each direction. The ring must get to the callee in 15
+  seconds, and then the call must connect.
+- the same ring from Spindle, while the DM also holds users of three
+  servers that do not answer. Each request to these servers runs into
+  its timeout. Before #794, the outbox sent to one destination at a time,
+  and this ring did not arrive.
 
 ## Calls with no SFU
 

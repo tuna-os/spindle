@@ -1,0 +1,6 @@
+# Element Call specs Spindle must pass with upstream's Synapse in the second
+# seat (#795): the ratchet of the Spindle-to-Synapse variant of the rig,
+# `SPINDLE_PEER=synapse contrib/element-call/run.sh`, enforced by
+# scripts/element-call-check.py --allowlist the way allowlist.txt is for
+# the two-Spindle rig. Same format and the same rule: an entry names the
+# run that saw it pass.

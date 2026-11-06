@@ -34,13 +34,16 @@ artefact still tell the truth about the code":
 ## 2. The ratchets, nightly
 
 Three external suites run against a fresh build every night from
-`compliance.yml`, and each has an allowlist that may only grow:
+`compliance.yml`. Element Call's suite runs twice: against two Spindles,
+and against one Spindle and upstream's Synapse (`SPINDLE_PEER=synapse`).
+Each run has an allowlist that may only grow:
 
 | Suite | Pin | Allowlist | Check |
 |---|---|---|---|
 | Complement | `scripts/complement.sh` | `complement/allowlist.txt` | `scripts/complement-check.py` |
 | matrix-rust-sdk integration tests | `contrib/rust-sdk/run.sh` | `contrib/rust-sdk/allowlist.txt` | `scripts/rust-sdk-check.py` |
 | Element Call Playwright | `contrib/element-call/run.sh` | `contrib/element-call/allowlist.txt` | `scripts/element-call-check.py` |
+| Element Call Playwright, Synapse peer | `contrib/element-call/run.sh` | `contrib/element-call/allowlist-synapse-peer.txt` | `scripts/element-call-check.py` |
 
 A test that passes and is not listed is printed as a **candidate**. Promoting
 it is a reviewed commit that names the run it passed in, never automatic —
