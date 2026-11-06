@@ -574,7 +574,7 @@ async fn federation_public_rooms(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_origin(&state, &headers, "GET", &uri, None).await?;
-    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/federation/v1/publicRooms`
@@ -597,7 +597,6 @@ async fn federation_public_rooms_filtered(
         serde_json::from_value(body).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     directory_page(
         &state,
-        "",
         filter.limit,
         filter.since.as_deref(),
         filter.filter.generic_search_term.as_deref(),

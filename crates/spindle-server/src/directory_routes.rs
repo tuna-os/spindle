@@ -341,7 +341,7 @@ async fn public_rooms(
     axum::extract::Query(query): axum::extract::Query<PublicRoomsQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(query.server.as_ref(), &state.config.server.name)?;
-    directory_page(&state, "", query.limit, query.since.as_deref(), None, &[])
+    directory_page(&state, query.limit, query.since.as_deref(), None, &[])
 }
 
 /// `POST /_matrix/client/v3/publicRooms`
@@ -351,13 +351,12 @@ async fn public_rooms(
 /// attributable.
 async fn public_rooms_filtered(
     State(state): State<AppState>,
-    Authenticated(identity): Authenticated,
+    Authenticated(_identity): Authenticated,
     Json(request): Json<PublicRoomsRequest>,
 ) -> Result<Json<Value>, MatrixError> {
     refuse_remote_directory(request.server.as_ref(), &state.config.server.name)?;
     directory_page(
         &state,
-        &identity.user_id,
         request.limit,
         request.since.as_deref(),
         request.filter.generic_search_term.as_deref(),

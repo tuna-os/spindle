@@ -233,6 +233,16 @@ pub struct Rooms {
     /// stored-body read and a JSON parse per member, per ask. The root is
     /// the answer's identity, so a hit is provably current.
     member_ids: Mutex<HashMap<String, MemberIds>>,
+    /// The erased local users, keyed by the erasure generation it was read
+    /// at ([`crate::accounts::Accounts::erasure_generation`]).
+    ///
+    /// Every client read asks "is this sender erased?" of every event it
+    /// serves once any account on the server has been erased, and a
+    /// migrated Synapse server has erased accounts from the start. Asked of
+    /// the account record, that was a point read and a decode per event;
+    /// the set changes only when an erasure flag does, which bumps the
+    /// generation, so a hit is provably current for one marker read.
+    erased: Mutex<erasure::ErasedCache>,
     /// Each room's version, read once from its create event.
     ///
     /// Unlike every other cache here this one is keyed by room alone, with
@@ -534,6 +544,7 @@ impl Rooms {
             receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
+            erased: Mutex::new(erasure::ErasedCache::default()),
             destinations: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             state_heads: Mutex::new(HashMap::new()),
@@ -1652,7 +1663,7 @@ impl Rooms {
             .iter()
             .any(|event| event.get("state_key").is_some());
         let current = state_after || !state_in_window;
-        if state_block == StateBlock::Deferred && current && !self.erasure_active()? {
+        if state_block == StateBlock::Deferred && current {
             // Nothing to do: the caller serves the cached render.
             return Ok((Vec::new(), true));
         }
@@ -2728,6 +2739,7 @@ impl Rooms {
         let prefix =
             spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Relation, room_id);
         let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        let erased = self.erased_users()?;
 
         // root event id -> (latest reply's li, viewer replied in it)
         let mut roots: HashMap<String, (i64, bool)> = HashMap::new();
@@ -2750,10 +2762,9 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let reply = if self.erasure_active()? {
-                self.prune_erased_event(viewer, room_id, reply)?
-            } else {
-                reply
+            let reply = match &erased {
+                Some(erased) => self.prune_erased_with(erased, viewer, room_id, reply)?,
+                None => reply,
             };
             let Some((_, root)) = relates_to(&reply["content"]) else {
                 continue;
@@ -3543,7 +3554,7 @@ impl Rooms {
                 .collect())
         })?;
         let watermark = self.purge_watermark(room_id)?;
-        let erasure_active = self.erasure_active()?;
+        let erased = self.erased_users()?;
         let mut hits = Vec::new();
         for (li, event_id) in candidates {
             if hits.len() == limit {
@@ -3559,10 +3570,9 @@ impl Rooms {
                 Err(error) => return Err(error),
             };
             let json = stamp(json, &event_id);
-            let json = if erasure_active {
-                self.prune_erased_event(user_id, room_id, json)?
-            } else {
-                json
+            let json = match &erased {
+                Some(erased) => self.prune_erased_with(erased, user_id, room_id, json)?,
+                None => json,
             };
             if matches(&json) {
                 hits.push(TimelineEvent { event_id, li, json });
@@ -4039,18 +4049,15 @@ impl Rooms {
         }
 
         let mut left = self.left_rooms(user_id, since, range)?;
-        if self.erasure_active()? {
+        // The timeline only: Synapse's `filter_events_for_client` sees the
+        // timeline, never the state block, and pruning state would serve a
+        // later joiner an erased user's `m.room.encryption` as `{}`.
+        if let Some(erased) = self.erased_users()? {
             for room in rooms.iter_mut().chain(left.iter_mut()) {
-                room.events = self.prune_erased_events(
-                    user_id,
-                    &room.room_id,
-                    std::mem::take(&mut room.events),
-                )?;
-                room.state = self.prune_erased_events(
-                    user_id,
-                    &room.room_id,
-                    std::mem::take(&mut room.state),
-                )?;
+                room.events = std::mem::take(&mut room.events)
+                    .into_iter()
+                    .map(|event| self.prune_erased_with(&erased, user_id, &room.room_id, event))
+                    .collect::<Result<_, _>>()?;
             }
         }
 
@@ -4688,6 +4695,13 @@ impl Rooms {
     ) -> Result<Option<Value>, RoomError> {
         let prefix = spindle_core::keys::relation_prefix(room_id, target);
         let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        // Bundling runs per served event and most events have no children:
+        // an empty scan must not pay the erasure marker read.
+        let erased = if rows.is_empty() {
+            None
+        } else {
+            self.erased_users()?
+        };
 
         let mut latest_edit: Option<Value> = None;
         let mut annotations: Vec<(String, String, u64)> = Vec::new();
@@ -4707,10 +4721,9 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let event = if self.erasure_active()? {
-                self.prune_erased_event(viewer, room_id, event)?
-            } else {
-                event
+            let event = match &erased {
+                Some(erased) => self.prune_erased_with(erased, viewer, room_id, event)?,
+                None => event,
             };
             // Redacted: the relation is gone from the content, so it is gone
             // from the aggregate.
