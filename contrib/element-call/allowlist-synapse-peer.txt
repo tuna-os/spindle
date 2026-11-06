@@ -4,3 +4,19 @@
 # scripts/element-call-check.py --allowlist the way allowlist.txt is for
 # the two-Spindle rig. Same format and the same rule: an entry names the
 # run that saw it pass.
+#
+# Recorded on the pull request that added the variant (workflow run
+# 42311534388, element-call pin 9f7c35c, Synapse develop at upstream's
+# digest, chromium): seven of seven, none on a retry. The call in both
+# directions and both membership modes, the DM ring in both directions,
+# and the ring from Spindle with three silent servers in the DM. That
+# last test failed on the server before #794 (workflow run 42303689449,
+# the same tree with #794 reverted), on all three attempts, while the
+# ring without them passed.
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Spindle, callee on Synapse (2_0)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Spindle, callee on Synapse (compat)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Synapse, callee on Spindle (2_0)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Synapse, callee on Spindle (compat)
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Spindle rings Synapse in time and connects
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Spindle rings Synapse in time with three dead servers in the room
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Synapse rings Spindle in time and connects
