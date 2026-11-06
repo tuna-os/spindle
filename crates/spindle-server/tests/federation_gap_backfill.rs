@@ -310,6 +310,7 @@ impl Peer {
 struct Setup {
     backfill: bool,
     per_room: usize,
+    per_origin: usize,
     idle_ms: u64,
 }
 
@@ -318,6 +319,7 @@ impl Default for Setup {
         Self {
             backfill: true,
             per_room: 10,
+            per_origin: 30,
             idle_ms: 50,
         }
     }
@@ -334,8 +336,9 @@ async fn serve(
         "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
          [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n\
          gap_backfill = {}\ngap_backfill_interval_ms = 5\ngap_backfill_idle_ms = {}\n\
-         gap_backfill_retry_ms = 50\ngap_acceptances_per_room = {}\n",
-        setup.backfill, setup.idle_ms, setup.per_room
+         gap_backfill_retry_ms = 50\ngap_acceptances_per_room = {}\n\
+         gap_acceptances_per_origin = {}\n",
+        setup.backfill, setup.idle_ms, setup.per_room, setup.per_origin
     ))
     .unwrap();
     let app =
@@ -1302,33 +1305,203 @@ async fn participating_servers_are_ranked_by_joined_members() {
     assert_eq!(ranked, vec!["z.example", "m.example", "a.example"]);
 }
 
-/// The amplification guard: a room gets only so many gap acceptances per
-/// window, and the rest are refused as they were before gap acceptance.
+/// #620: recovery, gap acceptance and backfill ask for the ranking per
+/// received PDU or chunk, so it is read from the membership index -- one
+/// point read per member, no event body parsed -- once per state: ten
+/// asks of an unchanged room cost at most one read per member between
+/// them, where each used to read every member event. And it is never
+/// stale: a kick that changes which server has the most members joined
+/// changes the next answer.
 #[tokio::test]
-async fn gap_acceptances_are_capped_per_room() {
-    let harness = Harness::new(Setup {
+async fn participating_servers_are_read_once_per_state_and_never_stale() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = ServerKey::load_or_create(store.as_ref()).unwrap();
+    let room = Rooms::new(Arc::clone(&store), "example.org")
+        .create(
+            ALICE,
+            key.pair(),
+            None,
+            None,
+            Some("public_chat"),
+            &[],
+            &[],
+            Some("10"),
+            None,
+            None,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+    // many.example: three joined. few.example: two joined. gone.example:
+    // two joined, both left.
+    let mut members = 0_u64;
+    for (domain, joined, leave) in [
+        ("many.example", 3, false),
+        ("few.example", 2, false),
+        ("gone.example", 2, true),
+    ] {
+        let remote = Rooms::new(Arc::clone(&store), domain);
+        let document = ruma::signatures::Ed25519KeyPair::generate();
+        let pair = ruma::signatures::Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap();
+        for index in 0..joined {
+            let user = format!("@user{index}:{domain}");
+            remote
+                .set_membership(&room, &user, &user, "join", None, &pair)
+                .unwrap();
+            if leave {
+                remote
+                    .set_membership(&room, &user, &user, "leave", None, &pair)
+                    .unwrap();
+            }
+            members += 1;
+        }
+    }
+    let rooms = Rooms::new(Arc::clone(&store), "example.org");
+    // Load the room first, so the count is the ranking and not the room's
+    // first read from disk.
+    rooms.state(&room).unwrap();
+    let before = store.reads();
+    for _ in 0..10 {
+        assert_eq!(
+            rooms.participating_servers(&room).unwrap(),
+            vec!["many.example", "few.example"]
+        );
+    }
+    let reads = store.reads() - before;
+    assert!(
+        reads <= members,
+        "ten rankings of an unchanged room cost {reads} reads; the budget is one per \
+         remote member ({members}) between them"
+    );
+    for index in 0..2 {
+        rooms
+            .set_membership(
+                &room,
+                ALICE,
+                &format!("@user{index}:many.example"),
+                "leave",
+                None,
+                key.pair(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        rooms.participating_servers(&room).unwrap(),
+        vec!["few.example", "many.example"]
+    );
+}
+
+/// The amplification guard (#620): a room, and an origin, get only so many
+/// gap acceptances per window, and the rest are refused as they were
+/// before gap acceptance, counted under the cap that refused them.
+#[tokio::test]
+async fn gap_acceptances_are_capped_per_room_and_per_origin() {
+    for (per_room, per_origin, capped) in [
+        (2, 30, GapResult::CappedRoom),
+        (10, 2, GapResult::CappedOrigin),
+    ] {
+        let harness = Harness::new(Setup {
+            backfill: false,
+            per_room,
+            per_origin,
+            ..Setup::default()
+        })
+        .await;
+        let bob = harness.user("bob");
+        let bob_join = harness.head.clone();
+        harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[]));
+        let pushed: Vec<(String, Value)> = (0..4)
+            .map(|index| {
+                let hidden =
+                    harness.message(&bob, &bob_join, &harness.head, &format!("hidden {index}"));
+                harness.message(&bob, &bob_join, &hidden, &format!("pushed {index}"))
+            })
+            .collect();
+        for event in &pushed {
+            harness.push(&[event]).await;
+        }
+        assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 2);
+        assert_eq!(harness.metrics.gap_count(capped), 2, "{capped:?}");
+        assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 2);
+        assert_eq!(harness.gaps().len(), 2);
+    }
+}
+
+/// #620: a gap's backfill asks only servers in the room right now. The
+/// server that sent the gap event and served its state is the first one
+/// asked -- unless every user of it has left since, when it would answer
+/// 403 "Host not in room". With no server left in the room the gap waits
+/// for one rather than asking a departed server.
+#[tokio::test]
+async fn a_gap_is_not_backfilled_from_a_server_that_left_the_room() {
+    let mut harness = Harness::new(Setup {
         backfill: false,
-        per_room: 2,
         ..Setup::default()
     })
     .await;
+    let history = harness.history(20);
     let bob = harness.user("bob");
-    let bob_join = harness.head.clone();
-    harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[]));
-    let pushed: Vec<(String, Value)> = (0..4)
-        .map(|index| {
-            let hidden =
-                harness.message(&bob, &bob_join, &harness.head, &format!("hidden {index}"));
-            harness.message(&bob, &bob_join, &hidden, &format!("pushed {index}"))
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    accept_gap(&harness, &latest).await;
+    let leave = |user: &str, member: &(String, Value), parent: &(String, Value)| {
+        harness.event(
+            user,
+            "m.room.member",
+            Some(user),
+            &json!({"membership":"leave"}),
+            parent.1["depth"].as_u64().unwrap() + 1,
+            &[harness.edge(parent)],
+            &[
+                &harness.held_state("m.room.create", ""),
+                &harness.held_state("m.room.power_levels", ""),
+                member,
+            ],
+        )
+    };
+    let carol_leaves = leave(&carol, &history.carol_join, &latest);
+    let bob_leaves = leave(&bob, &history.bob_join, &carol_leaves);
+    let response = harness.push(&[&carol_leaves, &bob_leaves]).await;
+    assert_eq!(
+        response["pdus"],
+        json!({carol_leaves.0.clone(): {}, bob_leaves.0.clone(): {}}),
+        "{response}"
+    );
+    assert!(
+        harness
+            .rooms()
+            .participating_servers(&harness.room)
+            .unwrap()
+            .is_empty()
+    );
+
+    harness.restart(Setup::default()).await;
+    // With nobody to ask, the loop backs the gap off as it does when every
+    // peer is cooling down: counted as rate-limited, not as a failure.
+    harness
+        .until(30, "the loop tries the gap", |harness| {
+            harness
+                .metrics
+                .backfill_chunk_count(BackfillChunk::RateLimited)
+                >= 1
+                || harness.peer.calls("backfill") > 0
         })
-        .collect();
-    for event in &pushed {
-        harness.push(&[event]).await;
-    }
-    assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 2);
-    assert_eq!(harness.metrics.gap_count(GapResult::CappedRoom), 2);
-    assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 2);
-    assert_eq!(harness.gaps().len(), 2);
+        .await;
+    assert_eq!(
+        harness.peer.calls("backfill"),
+        0,
+        "a departed server was asked"
+    );
+    assert_eq!(
+        harness.gaps().len(),
+        1,
+        "the gap waits for a server in the room"
+    );
 }
 
 /// A client paging back into a room with an open gap wakes an idle

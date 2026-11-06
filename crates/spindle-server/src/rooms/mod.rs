@@ -262,6 +262,11 @@ pub struct Rooms {
     /// root, and a busy room recomputes only when who-is-in-it actually
     /// moves.
     destinations: Mutex<HashMap<String, Destinations>>,
+    /// The remote servers with joined members, most-joined first, keyed by
+    /// the state root they were read from, for the same reason as
+    /// `destinations`: a point read per member, asked per received PDU
+    /// that needs recovery ([`Self::participating_servers`]).
+    participants: Mutex<HashMap<String, Destinations>>,
     room_versions: Mutex<HashMap<String, RoomVersionId>>,
     /// The forward extremities of each state-DAG room's state DAG
     /// (MSC4242): the accepted state events no later accepted state event
@@ -535,6 +540,7 @@ impl Rooms {
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
             destinations: Mutex::new(HashMap::new()),
+            participants: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             state_heads: Mutex::new(HashMap::new()),
             auth_graphs: Mutex::new(HashMap::new()),

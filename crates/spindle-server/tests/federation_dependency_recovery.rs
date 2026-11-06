@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
 use spindle_core::Pdu;
-use spindle_server::{rooms::Rooms, signing::ServerKey};
+use spindle_server::{
+    rooms::{PartialState, Rooms},
+    signing::ServerKey,
+};
 use spindle_store::{FjallStore, RoomStore};
 use tempfile::TempDir;
 
@@ -194,6 +197,17 @@ impl Harness {
     }
 
     async fn build(version: u8, with_relay: bool) -> Self {
+        Self::build_with(version, with_relay, |_, _| {}).await
+    }
+
+    /// [`Self::build`], with `seat` run on the store and the room after the
+    /// room is created and before bob joins and the app opens it: what
+    /// else the room holds, and what this server recorded about it.
+    async fn build_with(
+        version: u8,
+        with_relay: bool,
+        seat: impl FnOnce(&Arc<FjallStore>, &str),
+    ) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let key = ServerKey::load_or_create(store.as_ref()).unwrap();
@@ -224,6 +238,7 @@ impl Harness {
         } else {
             None
         };
+        seat(&store, &room);
         let remote = Rooms::new(Arc::clone(&store), peer.name.clone());
         let bob = format!("@bob:{}", peer.name);
         let joined = remote
@@ -526,4 +541,92 @@ async fn recovery_for_a_relayed_event_asks_the_origin_that_relayed_it() {
     };
     assert!(asked(relay));
     assert!(!asked(&harness.peer));
+}
+
+/// Whether `peer` was asked for missing events.
+fn asked_for_missing(peer: &Peer) -> bool {
+    peer.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call == "missing")
+}
+
+/// #620: when the origin cannot serve an event's history, recovery turns
+/// to a server with members joined to the room -- never to one whose users
+/// all left, though it has the most member events, nor to one with only an
+/// invited user, though both could answer.
+#[tokio::test]
+async fn recovery_falls_back_to_a_joined_server_never_a_departed_or_invited_one() {
+    let departed = Peer::new().await;
+    let invited = Peer::new().await;
+    let joined = Peer::new().await;
+    let harness = Harness::build_with(11, false, |store, room| {
+        for (peer, users, leave) in [(&departed, 3, true), (&joined, 1, false)] {
+            let rooms = Rooms::new(Arc::clone(store), peer.name.clone());
+            for index in 0..users {
+                let user = format!("@user{index}:{}", peer.name);
+                rooms
+                    .set_membership(room, &user, &user, "join", None, peer.key.pair())
+                    .unwrap();
+                if leave {
+                    rooms
+                        .set_membership(room, &user, &user, "leave", None, peer.key.pair())
+                        .unwrap();
+                }
+            }
+        }
+        let key = ServerKey::load_or_create(store.as_ref()).unwrap();
+        let guest = format!("@guest:{}", invited.name);
+        Rooms::new(Arc::clone(store), "example.org")
+            .set_membership(room, ALICE, &guest, "invite", None, key.pair())
+            .unwrap();
+    })
+    .await;
+    let first = harness.message(&harness.head, "first");
+    let latest = harness.message(&first, "latest");
+    for peer in [&departed, &invited, &joined] {
+        *peer.window.lock().unwrap() = vec![first.1.clone()];
+    }
+    let response = harness.push(&latest).await;
+    assert_eq!(response["pdus"][&latest.0], json!({}), "{response}");
+    assert!(harness.held(&first.0) && harness.held(&latest.0));
+    assert!(
+        asked_for_missing(&harness.peer),
+        "the origin is asked first"
+    );
+    assert!(asked_for_missing(&joined));
+    assert!(!asked_for_missing(&departed), "a departed server was asked");
+    assert!(!asked_for_missing(&invited), "an invited server was asked");
+}
+
+/// #620: a partial-state room (MSC3706) holds few member events, so the
+/// server the join went through is named only by the resident's
+/// `servers_in_room` -- and it is where recovery turns when the origin
+/// cannot answer, as it was before servers were ranked by joined members.
+#[tokio::test]
+async fn recovery_in_a_partial_state_room_falls_back_to_the_resident() {
+    let resident = Peer::new().await;
+    let harness = Harness::build_with(11, false, |store, room| {
+        let record = PartialState {
+            room_id: room.to_owned(),
+            join_event_id: "$join".to_owned(),
+            via: resident.name.clone(),
+            servers_in_room: vec!["example.org".to_owned(), resident.name.clone()],
+        };
+        spindle_store::Store::put(
+            store.as_ref(),
+            &spindle_core::keys::partial_state_room(room),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    })
+    .await;
+    let first = harness.message(&harness.head, "first");
+    let latest = harness.message(&first, "latest");
+    *resident.window.lock().unwrap() = vec![first.1.clone()];
+    let response = harness.push(&latest).await;
+    assert_eq!(response["pdus"][&latest.0], json!({}), "{response}");
+    assert!(harness.held(&first.0) && harness.held(&latest.0));
+    assert!(asked_for_missing(&harness.peer) && asked_for_missing(&resident));
 }
