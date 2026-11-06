@@ -499,10 +499,24 @@ pub(crate) fn record_invite(
         state.rooms.wake_sync_waiters();
         return Ok(());
     }
-    let invite_state: Vec<Value> = body["invite_room_state"]
+    // The invite itself goes in, in place of any copy the inviter sent: a
+    // client renders an invite from the user's own `invite` membership,
+    // and Synapse leaves it out of `invite_room_state` because its own
+    // /sync adds it on the way out. This server serves the stored list as
+    // it is, so without it an invite from Synapse was never listed (#795).
+    let mut invite_state: Vec<Value> = body["invite_room_state"]
         .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| !(event["type"] == "m.room.member" && event["state_key"] == target))
         .cloned()
-        .unwrap_or_default();
+        .collect();
+    invite_state.push(json!({
+        "type": "m.room.member",
+        "state_key": target,
+        "sender": signed["sender"],
+        "content": signed["content"],
+    }));
     state
         .rooms
         .record_pending_invite(target, room_id, origin, event_id, &invite_state)
