@@ -319,6 +319,10 @@ pub struct Metrics {
     http_latency: Family,
     http_requests: RwLock<HashMap<String, AtomicU64>>,
     federation_queue: RwLock<Vec<(String, u64)>>,
+    /// Destinations the outbox is backing off from: `[short, long]`.
+    destinations_backing_off: [AtomicU64; 2],
+    /// Queued PDUs dropped for destinations catching up (#801).
+    catch_up_dropped: AtomicU64,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
     /// Inbound PDUs by what became of them ([`PduOutcome`]): the
@@ -418,6 +422,8 @@ impl Default for Metrics {
             http_latency: Family::default(),
             http_requests: RwLock::default(),
             federation_queue: RwLock::default(),
+            destinations_backing_off: Default::default(),
+            catch_up_dropped: AtomicU64::new(0),
             sync_subscribers: AtomicU64::new(0),
             sync_lag: Family::default(),
             pdu_outcomes: Default::default(),
@@ -755,6 +761,34 @@ impl Metrics {
     #[must_use]
     pub fn outbound_txns(&self, result: TxnResult) -> u64 {
         self.outbound_txns[result.index()].load(Ordering::Relaxed)
+    }
+
+    /// Set how many destinations the outbox is backing off from: `short`
+    /// still in the first minutes of failing, `long` past them and being
+    /// tried at most as often as it has been down (#801).
+    pub fn set_destinations_backing_off(&self, short: u64, long: u64) {
+        self.destinations_backing_off[0].store(short, Ordering::Relaxed);
+        self.destinations_backing_off[1].store(long, Ordering::Relaxed);
+    }
+
+    /// Destinations backing off, `(short, long)`, for tests.
+    #[must_use]
+    pub fn destinations_backing_off(&self) -> (u64, u64) {
+        (
+            self.destinations_backing_off[0].load(Ordering::Relaxed),
+            self.destinations_backing_off[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Count `dropped` queued PDUs a catching-up destination will not get.
+    pub fn record_catch_up_dropped(&self, dropped: u64) {
+        self.catch_up_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Queued PDUs dropped by catch-up, for tests.
+    #[must_use]
+    pub fn catch_up_dropped(&self) -> u64 {
+        self.catch_up_dropped.load(Ordering::Relaxed)
     }
 
     /// The warm-up has `pending` rooms left to load.
@@ -1195,6 +1229,26 @@ impl Metrics {
                 );
             }
         }
+        out.push_str(
+            "# HELP spindle_federation_destinations_backing_off Destinations whose last \
+             delivery failed, by how long they have been failing.\n\
+             # TYPE spindle_federation_destinations_backing_off gauge\n",
+        );
+        for (index, backoff) in ["short", "long"].iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_federation_destinations_backing_off{{backoff=\"{backoff}\"}} {}",
+                self.destinations_backing_off[index].load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_catch_up_dropped_total Queued events dropped for \
+             destinations down long enough to catch up instead.\n\
+             # TYPE spindle_federation_catch_up_dropped_total counter\n\
+             spindle_federation_catch_up_dropped_total {}",
+            self.catch_up_dropped.load(Ordering::Relaxed)
+        );
     }
 
     fn render_sync(&self, out: &mut String) {

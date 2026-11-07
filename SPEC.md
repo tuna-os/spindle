@@ -821,11 +821,13 @@ about it is non-standard, and no peer needs to know Spindle exists.
 
 One ordered queue per destination, drained by a dedicated task: up to 50 PDUs
 and 100 EDUs per transaction, one transaction in flight per destination as the
-spec requires. Exponential backoff with jitter on failure; destinations are
-marked down after a threshold and probed. On recovery, catch-up walks the
-`stream` index forward from the destination's last acknowledged position — a
-sequential scan, not a graph traversal, which is precisely the operation that
-makes federation catch-up expensive on DAG servers.
+spec requires. Exponential backoff on failure, capped at about a minute
+while the outage is young; after ten minutes each wait is as long as the
+outage so far, up to a day, and a request from the destination ends it. The
+backoff is stored, so a restart resumes it. On recovery from a long outage,
+catch-up sends the newest events of each room rather than the backlog, and
+the peer fetches the gap through `prev_events`; to-device messages and
+device-list updates are never dropped (#801).
 
 Hub fan-out in class H broadcasts to all participant destinations in parallel
 from the room's executor, with the per-destination queues absorbing slow peers.

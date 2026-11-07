@@ -113,6 +113,8 @@ account can make the server *hold*.
 | Peer key-document validity | 7 days regardless of what the peer claims | `federation::MAX_KEY_VALIDITY` | refetch |
 | Ephemeral EDUs (typing, presence) waiting per federation destination | 100 | `Federation::queue_edu` | oldest dropped; held in memory only, and dropped with a transaction that fails |
 | Readers' receipts waiting per federation destination | 1,000 | `federation::MAX_PENDING_RECEIPTS` | a new reader's receipt is not queued; a waiting reader's is replaced |
+| PDUs queued for a destination down for ten minutes or more | the newest 10 of each room | `federation::retry::CATCH_UP_PER_ROOM`; the ten minutes are 600× `[federation] retry_base_ms` | older ones dropped (`spindle_federation_catch_up_dropped_total`); the peer fetches them through `prev_events` if it wants them. A peer with `[federation] peers.max_backoff_ms` keeps its whole queue |
+| Wait between delivery attempts to a failing destination | 64× `retry_base_ms` (about a minute) for the first ten minutes, then as long as the outage so far, up to 24 h | `federation::retry::MAX_BACKOFF`, `[federation] peers.max_backoff_ms` | a request from the destination ends the wait; kept in the store, so a restart does not retry every dead server at once |
 | Durable EDUs (to-device, device-list, cross-signing) per outbound transaction | 50 of the spec's 100 | `federation::edu_outbox::PER_TRANSACTION` | the rest wait, in order, for the next transaction; ephemeral EDUs fill the remaining slots |
 | Push notifications waiting per gateway URL | 10,000 | `push::QUEUE_CAP` | oldest dropped, with its stored row; each is stored until its gateway answers, so a restart resumes them |
 | Password hashes (login, registration, password change), for the whole process | 2 at once; 32 more wait | `[limits] password_hashes_at_once`, `password_hashes_waiting` | 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, at once, when the queue is full. Each hash at once keeps a 19 MiB workspace for reuse (#571). |
@@ -138,7 +140,7 @@ change and not a design discussion.
 | Room tags per room per user | `PUT /tags/{tag}` | per-user-per-room count |
 | Invites outstanding per sender | `POST /invite` (budgeted: `invites_per_issuer`) | per-user count of pending invites |
 | Events per room, and rooms joined per user | `PUT /send`, `POST /join` (budgeted: `messages`, `joins_local`, `joins_remote`) | none: a room's history is the product, and the budgets are the bound |
-| To-device messages, device-list and cross-signing updates owed to an unreachable server | `PUT /sendToDevice` to its users; key changes while sharing a room with it | per-destination count. Like the PDU outbox, these rows (`Keyspace::EduOutbox`) are kept until the peer acknowledges them, because dropping one is an undecryptable message later (#739) |
+| To-device messages, device-list and cross-signing updates owed to an unreachable server | `PUT /sendToDevice` to its users; key changes while sharing a room with it | per-destination count. These rows (`Keyspace::EduOutbox`) are kept until the peer acknowledges them, because dropping one is an undecryptable message later (#739). The PDU outbox is cut for a long-dead peer; these are not (#801) |
 
 
 

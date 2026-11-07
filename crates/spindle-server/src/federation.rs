@@ -24,6 +24,7 @@ use crate::signing::ServerKey;
 
 mod edu_outbox;
 mod keyring;
+mod retry;
 mod srv;
 pub use keyring::{PeerKeys, signing_key_ids};
 use srv::Destination;
@@ -147,17 +148,18 @@ pub struct Federation {
     /// started, as the outbox loop reports it: what the admin API's
     /// `federation/destinations` shows (Synapse's `destinations` table).
     delivery: std::sync::Mutex<HashMap<String, DeliveryHealth>>,
-    /// Destinations an administrator asked to retry now
-    /// (`reset_connection`); the outbox loop drops their backoff on its
-    /// next pass.
+    /// Destinations to retry now: an administrator asked
+    /// (`reset_connection`), or the destination sent us a request. The
+    /// outbox loop ends their wait on its next pass.
     delivery_resets: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// How delivery to one destination stands, in the terms of Synapse's
 /// `destinations` table so the admin API can report it in that shape.
 ///
-/// Process-local: a restart forgets a destination's failures and retries
-/// it at once, which is what the outbox loop does anyway.
+/// Restored from the outbox's stored backoff at startup, so a destination
+/// failing before a restart is reported, and waited on, as failing after
+/// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeliveryHealth {
     /// When the last failed attempt was made, in ms; 0 while healthy.
@@ -908,8 +910,9 @@ impl Federation {
     }
 
     /// Clear `destination`'s backoff so the outbox tries it on its next
-    /// pass: Synapse's admin `reset_connection`. Returns whether this
-    /// server had any record of the destination.
+    /// pass: Synapse's admin `reset_connection`, and what a request from the
+    /// destination does ([`Self::heard_from`]). Returns whether this server
+    /// had any record of the destination.
     pub fn reset_delivery(&self, destination: &str) -> bool {
         let known = {
             let mut delivery = self
@@ -931,8 +934,42 @@ impl Federation {
         known
     }
 
-    /// The destinations whose backoff an administrator cleared since the
-    /// last call.
+    /// Note that `origin` sent an authenticated request: if the outbox is
+    /// backing off from it, the wait is over -- a server that talks to us
+    /// is up. Synapse resets its retry timings on any inbound request for
+    /// the same reason. A lookup per request; the reset only while a wait
+    /// is running, so a chatty peer resets at most once per failure.
+    fn heard_from(&self, origin: &str) {
+        let backing_off = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(origin)
+            .is_some_and(|health| health.retry_interval > 0);
+        if backing_off {
+            self.reset_delivery(origin);
+        }
+    }
+
+    /// Put back how delivery to `destination` stood before a restart.
+    fn restore_delivery(&self, destination: &str, entry: &retry::Backoff) {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                destination.to_owned(),
+                DeliveryHealth {
+                    retry_last_ts: entry.last,
+                    retry_interval: entry.interval,
+                    failure_ts: entry.since,
+                    last_successful_stream_ordering: None,
+                    unreachable: entry.unreachable,
+                },
+            );
+    }
+
+    /// The destinations whose backoff was cleared since the last call: by
+    /// an administrator, or by a request from the destination itself.
     fn take_delivery_resets(&self) -> Vec<String> {
         self.delivery_resets
             .lock()
@@ -1051,6 +1088,7 @@ impl Federation {
         );
         ruma::signatures::verify_json(&key_map, &object)
             .map_err(|error| FederationError::Unauthorized(format!("bad signature: {error}")))?;
+        self.heard_from(&parsed.origin);
         Ok(parsed.origin)
     }
 
@@ -2817,6 +2855,11 @@ struct Delivered {
 /// delete re-sends, and the transaction ID being derived from the rows it
 /// carries lets the peer's replay table absorb the duplicate.
 ///
+/// A destination that fails is backed off, the wait growing with the
+/// outage up to a day and ending early when it sends us a request; one
+/// back from a long outage is caught up rather than replayed. Both survive
+/// a restart: see [`retry`].
+///
 /// Destinations are sent to concurrently, at most one transaction each and
 /// [`MAX_IN_FLIGHT`] in all. They used to be sent one after another, so a
 /// pass waited out the 30 s timeout of every unreachable server before the
@@ -2836,7 +2879,17 @@ pub async fn drain_outbox(
     federation: Weak<Federation>,
     retry_base: Duration,
 ) {
-    let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
+    // Where the last process left off with each failing destination.
+    let mut backoff = {
+        let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
+            return;
+        };
+        let stored = retry::load(&store);
+        for (destination, entry) in &stored {
+            federation.restore_delivery(destination, entry);
+        }
+        stored
+    };
     let mut in_flight: tokio::task::JoinSet<Delivered> = tokio::task::JoinSet::new();
     let mut busy: HashMap<tokio::task::Id, String> = HashMap::new();
     let poll = retry_base
@@ -2892,9 +2945,7 @@ pub async fn drain_outbox(
             let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return;
             };
-            for destination in federation.take_delivery_resets() {
-                backoff.remove(&destination);
-            }
+            take_resets(&store, &federation, &mut backoff, retry_base);
             let retrying_in_flight = busy
                 .values()
                 .filter(|destination| backoff.contains_key(*destination))
@@ -2917,6 +2968,37 @@ pub async fn drain_outbox(
             busy.insert(handle.id(), name);
         }
     }
+}
+
+/// End the wait of every destination reset since the last pass -- by an
+/// administrator or by a request from it -- and count who is still
+/// backing off.
+fn take_resets(
+    store: &FjallStore,
+    federation: &Federation,
+    backoff: &mut HashMap<String, retry::Backoff>,
+    retry_base: Duration,
+) {
+    for destination in federation.take_delivery_resets() {
+        match backoff.get(&destination).and_then(retry::Backoff::reset) {
+            Some(entry) => {
+                retry::save(store, &destination, &entry);
+                backoff.insert(destination, entry);
+            }
+            None => {
+                if backoff.remove(&destination).is_some() {
+                    retry::forget(store, &destination);
+                }
+            }
+        }
+    }
+    let long = backoff
+        .values()
+        .filter(|entry| retry::is_long(entry, retry_base))
+        .count();
+    federation
+        .metrics()
+        .set_destinations_backing_off((backoff.len() - long) as u64, long as u64);
 }
 
 /// One transaction's delivery, run as its own task.
@@ -2962,7 +3044,7 @@ async fn send_transaction(
 fn settle(
     store: &Weak<FjallStore>,
     federation: &Weak<Federation>,
-    backoff: &mut HashMap<String, (u32, Instant)>,
+    backoff: &mut HashMap<String, retry::Backoff>,
     retry_base: Duration,
     delivered: Delivered,
 ) -> bool {
@@ -2981,7 +3063,9 @@ fn settle(
             for key in &keys {
                 let _ = Store::delete(store.as_ref(), key);
             }
-            backoff.remove(&destination);
+            if backoff.remove(&destination).is_some() {
+                retry::forget(&store, &destination);
+            }
             if let Some(federation) = federation.upgrade() {
                 federation
                     .durable_edus
@@ -2997,17 +3081,34 @@ fn settle(
         }
         Err(error) => {
             tracing::debug!("outbox to {destination}: {error}");
-            let failures = backoff.get(&destination).map_or(0, |(count, _)| *count) + 1;
-            let Some(federation) = federation.upgrade() else {
+            let (Some(store), Some(federation)) = (store.upgrade(), federation.upgrade()) else {
                 return false;
             };
-            let delay = backoff_delay(
+            let patient = federation.peer_max_backoff(&destination);
+            let entry = retry::Backoff::after_failure(
+                backoff.get(&destination),
+                now_millis(),
                 retry_base,
-                failures,
-                federation.peer_max_backoff(&destination),
+                patient,
+                unreachable,
             );
-            federation.record_delivery_failure(&destination, delay, unreachable);
-            backoff.insert(destination, (failures, Instant::now() + delay));
+            federation.record_delivery_failure(
+                &destination,
+                Duration::from_millis(entry.interval),
+                unreachable,
+            );
+            retry::save(&store, &destination, &entry);
+            // Cut the queue as soon as the outage is long, not only at the
+            // next attempt a day away: the rows stop piling up meanwhile.
+            if entry.long && patient.is_none() {
+                retry::cut(
+                    &store,
+                    federation.metrics(),
+                    &destination,
+                    retry::queued(&store, &destination),
+                );
+            }
+            backoff.insert(destination, entry);
         }
     }
     true
@@ -3022,36 +3123,18 @@ struct Slots {
     retry_free: usize,
 }
 
-/// How long to wait before the next attempt at a destination that has
-/// failed `failures` times in a row.
-///
-/// Doubling from the base, capped at 64× -- about a minute at the default
-/// base -- so an unreachable peer is retried often enough that its return
-/// is noticed within a minute. A peer the operator has marked patient
-/// (`[federation] peers` with `max_backoff_ms`) keeps doubling up to its
-/// own cap instead: a homeserver on a phone, or a gateway on a venue
-/// uplink, is expected to be dark for hours, and one connection attempt an
-/// hour is the whole cost of waiting for it. Nothing is dropped in either
-/// case; the rows wait in the outbox until the peer acknowledges them.
-fn backoff_delay(retry_base: Duration, failures: u32, patient: Option<Duration>) -> Duration {
-    match patient {
-        Some(cap) => retry_base
-            .saturating_mul(2_u32.saturating_pow(failures.min(30)))
-            .min(cap),
-        None => retry_base * 2_u32.saturating_pow(failures.min(6)),
-    }
-}
-
 /// One pass's transactions: destinations owed one, not in flight and not
 /// backing off, within `slots` -- those that answered last time first, then
 /// those due a retry -- each request signed and ready. Every read of the
 /// store and every take from the EDU queue happens here, under the strong
 /// references the caller holds for exactly this long; nothing here awaits.
-/// A destination left out keeps its ephemeral EDUs for a later pass.
+/// A destination left out keeps its ephemeral EDUs for a later pass; one
+/// back from a long outage is cut to what a catch-up sends first
+/// ([`retry::catch_up`]).
 fn plan_transactions(
     store: &FjallStore,
     federation: &Federation,
-    backoff: &HashMap<String, (u32, Instant)>,
+    backoff: &HashMap<String, retry::Backoff>,
     slots: &Slots,
 ) -> Vec<OutboundTransaction> {
     let Ok(rows) = ReadView::scan_prefix(store, &keys::federation_outbox_all()) else {
@@ -3076,24 +3159,11 @@ fn plan_transactions(
     {
         by_destination.entry(destination).or_default();
     }
-    // The pass already holds the whole picture, so the gauge is set
-    // from it rather than counted separately — a second traversal
-    // could disagree with the one that actually delivers.
-    federation.metrics().set_federation_queue(
-        &by_destination
-            .iter()
-            .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
-            .collect::<Vec<_>>(),
-    );
-    let now = Instant::now();
+    let now = now_millis();
     let (healthy, due): (Vec<&String>, Vec<&String>) = by_destination
         .keys()
         .filter(|destination| !slots.busy.contains(*destination))
-        .filter(|destination| {
-            backoff
-                .get(*destination)
-                .is_none_or(|(_, until)| *until <= now)
-        })
+        .filter(|destination| backoff.get(*destination).is_none_or(|entry| entry.due(now)))
         .partition(|destination| !backoff.contains_key(*destination));
     let healthy_taken = healthy.len().min(slots.free);
     let retry_taken = due
@@ -3106,6 +3176,20 @@ fn plan_transactions(
         .chain(due.into_iter().take(retry_taken))
         .cloned()
         .collect();
+    for destination in &chosen {
+        if backoff.get(destination).is_some_and(|entry| entry.long)
+            && federation.peer_max_backoff(destination).is_none()
+            && let Some(rows) = by_destination.get_mut(destination)
+        {
+            *rows = retry::cut(
+                store,
+                federation.metrics(),
+                destination,
+                std::mem::take(rows),
+            );
+        }
+    }
+    set_queue_gauge(federation, &by_destination);
     let mut transactions = Vec::new();
     for (destination, rows) in by_destination {
         if !chosen.contains(&destination) {
@@ -3157,6 +3241,19 @@ fn plan_transactions(
         });
     }
     transactions
+}
+
+/// Set the queue depth gauge from a pass's rows. The pass already holds
+/// the whole picture, so the gauge is set from it rather than counted
+/// separately — a second traversal could disagree with the one that
+/// actually delivers.
+fn set_queue_gauge(federation: &Federation, by_destination: &BTreeMap<String, Vec<OutboxRow>>) {
+    federation.metrics().set_federation_queue(
+        &by_destination
+            .iter()
+            .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// The ID of a transaction carrying the PDU outbox rows `pdus` and the
@@ -3631,29 +3728,6 @@ mod header_tests {
         ] {
             assert!(parse_x_matrix(broken).is_err(), "{broken}");
         }
-    }
-}
-
-#[cfg(test)]
-mod backoff_tests {
-    use super::*;
-
-    #[test]
-    fn an_ordinary_peer_is_retried_within_a_minute_and_a_patient_one_within_its_cap() {
-        let base = Duration::from_secs(1);
-        assert_eq!(backoff_delay(base, 1, None), Duration::from_secs(2));
-        assert_eq!(backoff_delay(base, 6, None), Duration::from_secs(64));
-        // The ordinary cap holds however long the peer stays dark.
-        assert_eq!(backoff_delay(base, 40, None), Duration::from_secs(64));
-        let hour = Duration::from_secs(3600);
-        assert_eq!(backoff_delay(base, 6, Some(hour)), Duration::from_secs(64));
-        assert_eq!(
-            backoff_delay(base, 11, Some(hour)),
-            Duration::from_secs(2048)
-        );
-        assert_eq!(backoff_delay(base, 12, Some(hour)), hour);
-        // Past the cap, the cap; and a huge failure count cannot overflow.
-        assert_eq!(backoff_delay(base, u32::MAX, Some(hour)), hour);
     }
 }
 

@@ -523,6 +523,17 @@ pub enum Keyspace {
     /// match the digest takes it instead. One that does not match is
     /// ignored and overwritten by the next resolution.
     CurrentState = 0x64,
+    /// `destination` -> how the federation outbox stands with a server
+    /// whose last delivery failed: the failures in a row, when they began,
+    /// when the next attempt is due, and whether it is catching up (#801).
+    ///
+    /// Kept so a restart resumes each dead server's backoff rather than
+    /// retrying thousands of them at once and starting every one's
+    /// schedule over -- Synapse's `destinations` table, for the same
+    /// reason. Written at each failed attempt and each reset, deleted on
+    /// the first acknowledged transaction; a healthy destination has no
+    /// row.
+    DestinationRetry = 0x65,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -1608,6 +1619,28 @@ pub fn edu_outbox_parts(key: &[u8]) -> Option<(String, u64)> {
     let destination = String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()?;
     let seq = u64::from_be_bytes(rest.get(2 + len..)?.try_into().ok()?);
     Some((destination, seq))
+}
+
+/// `destination` key for [`Keyspace::DestinationRetry`]: the name is the
+/// whole rest of the key, as nothing sorts under it.
+#[must_use]
+pub fn destination_retry(destination: &str) -> Vec<u8> {
+    let mut key = destination_retry_all();
+    key.extend_from_slice(destination.as_bytes());
+    key
+}
+
+/// The scan prefix covering every [`Keyspace::DestinationRetry`] row.
+#[must_use]
+pub fn destination_retry_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::DestinationRetry as u8]
+}
+
+/// The destination a [`destination_retry`] key names.
+#[must_use]
+pub fn destination_retry_name(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(destination_retry_all().as_slice())?;
+    String::from_utf8(rest.to_vec()).ok()
 }
 
 /// `seq` key for [`Keyspace::PushPending`].
