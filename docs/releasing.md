@@ -40,15 +40,19 @@ Either way the run then:
   `.sha256` beside it;
 - builds the runtime image (the `Dockerfile` at the root) for `amd64` and
   `arm64` and publishes a manifest at `ghcr.io/tuna-os/spindle:<tag>`;
+- uses the cargo features in `FEATURES` of `release.yml` for the
+  tarballs and the image. Today, that is `mas-import` (#802);
+- stops if `spindle import-mas` does not print its usage. The MAS
+  cutover in [delegated-auth.md](delegated-auth.md) needs this command;
 - writes an SBOM for each tarball (SPDX, from `Cargo.lock`, so it names
   every crate the build pinned) and attests it to the tarball;
 - signs a provenance attestation for each tarball and each image, through
   Sigstore, tied to the workflow's own identity; the image attestations
   are pushed to the registry beside the images;
 - creates the GitHub release with the tarballs, the checksums, the SBOMs
-  and notes that say what the tag is, followed by the titles of the pull
-  requests merged since the previous tag, marked a prerelease for every
-  `v0.*` tag.
+  and notes that say what the tag is and give the image digest, followed
+  by the titles of the pull requests merged since the previous tag,
+  marked a prerelease for every `v0.*` tag.
 
 The crate version in `Cargo.toml` is not the release version and is not
 bumped by a release; the tag is the name, and the binary carries the

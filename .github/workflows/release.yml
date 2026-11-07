@@ -6,7 +6,8 @@ name: Release
 # attestation pushed beside it. The attestations are what let somebody
 # check that an artifact really came from this workflow on this commit
 # (`gh attestation verify`, see docs/releasing.md) rather than trusting
-# the file name; the SBOM says what is inside it.
+# the file name; the SBOM says what is inside it. Both the tarballs and
+# the image carry the offline importers in FEATURES below.
 # ROADMAP.md is the contract for what a tag means; v0.0.x is a prerelease
 # that promises nothing, and this workflow marks every v0.* tag as one.
 #
@@ -50,6 +51,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo features of every release artifact, tarball and image alike. The
+  # Dockerfile's FEATURES default is the same value, so a local build of
+  # the image matches the published one.
+  #
+  # `mas-import` is `spindle import-mas` (#802), the MAS-to-built-in
+  # cutover. The importer opens the store, so it must be the same build as
+  # the server: in the release itself, not in a variant image that an
+  # operator must match by tag. It adds only a pure-Rust PostgreSQL client
+  # (no C build) that runs in that offline command and nowhere in the
+  # server. `synapse-import` stays out: it compiles SQLite from C and
+  # changes code in the server's room and media paths.
+  FEATURES: mas-import
 
 jobs:
   cut:
@@ -117,7 +130,13 @@ jobs:
         with:
           toolchain: 1.90.0
       - name: Build
-        run: cargo build --release -p spindle-server --bin spindle --locked
+        run: cargo build --release -p spindle-server --bin spindle --locked --features "$FEATURES"
+      # The importer is in the tarball (#802): without the feature the
+      # command prints a rebuild hint and not this usage line.
+      - name: Check the importer is in the binary
+        run: |
+          usage=$(target/release/spindle import-mas 2>&1 || true)
+          grep -q 'usage: spindle import-mas' <<<"$usage"
       - name: Package
         run: |
           name="spindle-${TAG}-${TARGET}"
@@ -188,7 +207,10 @@ jobs:
         id: push
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${ARCH}"
-          docker build -t "$image" .
+          docker build --build-arg FEATURES="$FEATURES" -t "$image" .
+          # The importer is in the image (#802), checked before the push.
+          usage=$(docker run --rm "$image" import-mas 2>&1 || true)
+          grep -q 'usage: spindle import-mas' <<<"$usage"
           docker push "$image"
           # The digest is the subject of the attestation: a tag can be moved,
           # a digest cannot.
@@ -229,19 +251,25 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Join the per-architecture images under the tag
+        id: manifest
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           docker manifest create "$image:${TAG}" \
             "$image:${TAG}-amd64" "$image:${TAG}-arm64"
-          docker manifest push "$image:${TAG}"
+          # The digest goes into the notes, so a deployment can pin it.
+          digest=$(docker manifest push "$image:${TAG}")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Write the notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           {
             echo "Built from \`${SHA}\`."
             echo
-            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}\` (amd64, arm64)."
+            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}@${DIGEST}\` (amd64, arm64)."
+            echo
+            echo "The tarballs and the image include \`spindle import-mas\`, the MAS importer (docs/delegated-auth.md)."
             echo
             echo "Every tarball and both images carry a Sigstore-signed provenance attestation, and each tarball an SBOM (\`.spdx.json\`) attested to it. To check one came from this workflow on this commit:"
             echo

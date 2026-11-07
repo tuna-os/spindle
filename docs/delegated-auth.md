@@ -439,12 +439,26 @@ old configuration with `[auth.delegated]` and start Spindle. MAS then
 signs users in as before. The accounts, addresses and links that the
 import wrote stay in the store, and delegation does not use them.
 
-The importer is only in builds with the `mas-import` feature, as
-`synapse-import` is for Synapse. The release binary and image do not have
-it. Use `cargo build --features mas-import`, or
-`docker build --build-arg FEATURES=mas-import .` for an image. The
-importer connects to PostgreSQL without TLS. Use a private network or a
-port forward.
+The release binaries and the release image
+`ghcr.io/tuna-os/spindle:<tag>` (amd64 and arm64) have the importer.
+Use the same tag as the server, because the importer opens the store of
+that server. In a container, stop the server and run the command in the
+same image, with the same volume and configuration:
+
+```console
+$ docker run --rm -e SPINDLE_MAS_DB_PASSWORD \
+    -v spindle-data:/var/lib/spindle \
+    -v ./spindle.toml:/etc/spindle/spindle.toml:ro \
+    -v ./mas-config.yaml:/etc/mas/config.yaml:ro \
+    ghcr.io/tuna-os/spindle:<tag> import-mas /etc/spindle/spindle.toml \
+    --mas-database "host=mas-db user=mas dbname=mas" \
+    --mas-config /etc/mas/config.yaml --dry-run
+```
+
+A build from source needs the `mas-import` feature:
+`cargo build --features mas-import`. The `Dockerfile` sets it by
+default. The importer connects to PostgreSQL without TLS. Use a private
+network or a port forward.
 
 For one account, `spindle set-password-hash` and
 `POST /_spindle/admin/v1/users/{user_id}/password_hash` store a hash
