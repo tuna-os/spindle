@@ -1056,7 +1056,7 @@ async fn sfu_webhook(
             .and_then(|participant| participant.get("identity"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        released += release_holds_for(&state, identity);
+        released += release_holds_for(&state, identity).await;
     }
     if released > 0 {
         tracing::info!(released, "the SFU webhook released held delayed leaves");
@@ -1072,7 +1072,7 @@ async fn sfu_webhook(
 /// that user is released, as before holds recorded an identity. A hold
 /// whose delay is already gone (fired, cancelled, unknown) still clears:
 /// holding nothing is not holding.
-fn release_holds_for(state: &AppState, identity: &str) -> u64 {
+async fn release_holds_for(state: &AppState, identity: &str) -> u64 {
     if identity.is_empty() {
         return 0;
     }
@@ -1093,10 +1093,17 @@ fn release_holds_for(state: &AppState, identity: &str) -> u64 {
         if !recorded && !same_user {
             continue;
         }
-        if let Some(delay_id) = value.get("delay_id").and_then(Value::as_str) {
-            let _ = state
+        // `Send` takes the delay off the schedule and hands the event back;
+        // sending it is the caller's part, the same send the delayed-events
+        // route makes. Dropping it would erase the leave instead of sending
+        // it, and the participant would stay in the call for good.
+        if let Some(delay_id) = value.get("delay_id").and_then(Value::as_str)
+            && let Ok(Some(event)) = state
                 .delayed
-                .act_by_id(delay_id, crate::delayed::Action::Send);
+                .act_by_id(delay_id, crate::delayed::Action::Send)
+            && let Err(error) = crate::delayed_routes::send_delayed_now(state, &event).await
+        {
+            tracing::warn!(%delay_id, errcode = error.errcode, "a released delayed leave was not sent: {}", error.error);
         }
         let _ = state.store.delete(&key);
         released += 1;

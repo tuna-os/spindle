@@ -22,10 +22,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use hmac::{KeyInit as _, Mac as _};
-use mock_sfu::{MockSfu, base64_standard, lk_hash};
+use mock_sfu::{MockSfu, lk_hash, webhook_authorization};
 use serde_json::{Value, json};
-use sha2::Digest as _;
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -915,41 +913,4 @@ fn base64url_decode(text: &str) -> Vec<u8> {
         out.extend_from_slice(&bytes[1..chunk.len()]);
     }
     out
-}
-
-/// The `Authorization` `LiveKit` sends with a webhook: an HS256 JWT under
-/// the API secret, issued by the API key, carrying the body's SHA-256 in
-/// padded standard base64 (`sha256`) -- built here from `LiveKit`'s
-/// documented format, not from the server's verifier.
-fn webhook_authorization(key: &str, secret: &str, body: &str) -> String {
-    let base64url = |bytes: &[u8]| {
-        base64_standard(bytes, false)
-            .replace('+', "-")
-            .replace('/', "_")
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let claims = json!({
-        "iss": key,
-        "nbf": now,
-        "exp": now + 300,
-        "sha256": base64_standard(&sha2::Sha256::digest(body.as_bytes()), true),
-    });
-    let signing_input = format!(
-        "{}.{}",
-        base64url(
-            json!({ "alg": "HS256", "typ": "JWT" })
-                .to_string()
-                .as_bytes()
-        ),
-        base64url(claims.to_string().as_bytes())
-    );
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(signing_input.as_bytes());
-    format!(
-        "{signing_input}.{}",
-        base64url(&mac.finalize().into_bytes())
-    )
 }

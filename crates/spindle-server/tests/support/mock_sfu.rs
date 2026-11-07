@@ -114,3 +114,41 @@ pub fn base64_standard(bytes: &[u8], pad: bool) -> String {
     }
     out
 }
+
+/// The `Authorization` `LiveKit` sends with a webhook: an HS256 JWT under
+/// the API secret, issued by the API key, carrying the body's SHA-256 in
+/// padded standard base64 (`sha256`) -- built here from `LiveKit`'s
+/// documented format, not from the server's verifier.
+pub fn webhook_authorization(key: &str, secret: &str, body: &str) -> String {
+    let base64url = |bytes: &[u8]| {
+        base64_standard(bytes, false)
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = json!({
+        "iss": key,
+        "nbf": now,
+        "exp": now + 300,
+        "sha256": base64_standard(&<sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()), true),
+    });
+    let signing_input = format!(
+        "{}.{}",
+        base64url(
+            json!({ "alg": "HS256", "typ": "JWT" })
+                .to_string()
+                .as_bytes()
+        ),
+        base64url(claims.to_string().as_bytes())
+    );
+    let mut mac =
+        <hmac::Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
+    hmac::Mac::update(&mut mac, signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        base64url(&hmac::Mac::finalize(mac).into_bytes())
+    )
+}

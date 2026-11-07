@@ -18,3 +18,25 @@ spa-call-sticky.spec.ts :: One to One call using matrix rtc 2.0 aka sticky event
 spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash EC
 spindle/federated-call.spec.ts :: Federated call between two Spindles (2_0)
 spindle/federated-call.spec.ts :: Federated call between two Spindles (compat)
+#
+# Recorded on the full builtin run (workflow run 42315846545, element-call
+# pin 9f7c35c, chromium): eighteen of twenty-two. The SFU webhook reached
+# both Spindles signed and released holds. Of the four that failed, three
+# (five-party-churn, and both restart-mid-call cases) are a crashed
+# participant that never expired: the release took the delayed leave off
+# the schedule and dropped it instead of sending it, fixed after that run.
+# The fourth, errors.spec.ts "call creation is restricted", intercepts
+# lk-jwt-service's own URL (matrix-rtc.m.localhost/livekit/jwt/sfu/get), so
+# it cannot apply to a transport at another address.
+access.spec.ts :: As a guest, create a call, share link and other join
+access.spec.ts :: Sign up a new account, then login, then logout
+errors.spec.ts :: Should automatically retry non fatal JWT errors
+errors.spec.ts :: Should show error screen if fails to get JWT token
+landing.spec.ts :: Landing page
+landing.spec.ts :: has title
+reconnect.spec.ts :: can only interact with header and footer while reconnecting
+sfu-reconnect-bug.spec.ts :: When creator left, avoid reconnect to the same SFU
+spindle/ring-abandon.spec.ts :: Caller abandons a ringing DM call and the callee stops ringing
+widget/voice-call-dm.spec.ts :: Decline a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new voice call in DM as widget

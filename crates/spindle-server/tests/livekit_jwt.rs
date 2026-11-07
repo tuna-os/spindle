@@ -510,6 +510,48 @@ async fn a_delayed_leave_handed_to_the_transport_is_held() {
         1,
         "the leave is held for the webhook to release"
     );
+
+    // The participant drops off the SFU: the webhook releases the hold,
+    // and the held event is *sent* -- not merely taken off the schedule.
+    let left = json!({ "event": "participant_left", "participant": {
+        "identity": format!("{}:{}", alice.user_id, alice.device_id),
+    } })
+    .to_string();
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_spindle/rtc/livekit/sfu/webhook")
+                .header(
+                    "authorization",
+                    mock_sfu::webhook_authorization("APIkey", "not-the-signing-key", &left),
+                )
+                .body(Body::from(left))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["released"], 1, "{body}");
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=5"
+                ))
+                .header("authorization", format!("Bearer {}", alice.access_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["content"]["body"] == "x"),
+        "the released delayed event reached the room: {body}"
+    );
 }
 
 /// The signature is bound to the secret: a token the SFU would honour is
