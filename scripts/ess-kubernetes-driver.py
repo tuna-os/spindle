@@ -37,6 +37,7 @@ ROLES = {
 }
 REQUIRED_ROLES = ROLES
 FENCE_ORDER = ("mas", "sliding-sync", "federation-sender", "synapse")
+POST_SWITCH_RESTORE_ORDER = ("mas",)
 WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 
 
@@ -367,6 +368,17 @@ class Driver:
                     "requires": "unexpired migration validation and quiesced source",
                 }
             )
+        for role in POST_SWITCH_RESTORE_ORDER:
+            workload = next(item for item in discovery["workloads"] if item["role"] == role)
+            if workload["replicas"]:
+                mutations.append(
+                    {
+                        "action": "scale",
+                        "resource": workload["ref"],
+                        "replicas": workload["replicas"],
+                        "requires": "all ingress routes switched to Spindle",
+                    }
+                )
         return {"api_version": 1, "read_only": True, "discovery": discovery, "mutations": mutations}
 
     def _new_state(self, discovery: dict[str, Any]) -> dict[str, Any]:
@@ -452,7 +464,7 @@ class Driver:
     def quiesce(self) -> dict[str, Any]:
         discovery = self.discover()
         state = self.state(discovery)
-        if state["phase"] in ("switching", "target-written"):
+        if state["phase"] in ("switching", "routes-switched", "target-written"):
             raise Blocked(f"cannot quiesce checkpoint in phase {state['phase']}")
         for role in FENCE_ORDER:
             saved = next(item for item in state["snapshot"]["workloads"] if item["role"] == role)
@@ -470,11 +482,11 @@ class Driver:
             self.sleep(self.interval)
         raise Blocked("PostgreSQL sessions did not drain")
 
-    def verify_quiesced(self, state: dict[str, Any] | None = None) -> None:
-        state = state or self.state()
-        for saved in state["snapshot"]["workloads"]:
-            if not saved["writer"]:
-                continue
+    def _verify_workloads_fenced(
+        self, state: dict[str, Any], roles: tuple[str, ...]
+    ) -> None:
+        for role in roles:
+            saved = next(item for item in state["snapshot"]["workloads"] if item["role"] == role)
             current = self.kube.get(saved["kind"].lower(), saved["name"], self.namespace)
             self._assert_identity(current, saved)
             if current.get("spec", {}).get("replicas", 1) != 0:
@@ -482,6 +494,10 @@ class Driver:
             status = current.get("status", {})
             if status.get("replicas", 0) or status.get("readyReplicas", 0):
                 raise Blocked(f"{saved['ref']} still has running pods")
+
+    def verify_quiesced(self, state: dict[str, Any] | None = None) -> None:
+        state = state or self.state()
+        self._verify_workloads_fenced(state, FENCE_ORDER)
         sessions = self.kube.postgres_sessions(self.topology["postgres"])
         if sessions:
             raise Blocked(f"PostgreSQL still has {sessions} relevant sessions")
@@ -504,18 +520,45 @@ class Driver:
 
     def switch(self, validation_path: Path) -> dict[str, Any]:
         state = self.state()
-        evidence = self.verify_validation(validation_path)
-        self.verify_quiesced(state)
-        # Once an ingress mutation begins, a request may reach Spindle before
-        # any observer can prove whether it wrote. Close ordinary rollback
-        # *before* that first mutation; guessing "probably no writes" is how a
-        # split-brain recovery loses events.
-        state["validation"] = evidence
-        state["target_writes_observed"] = True
-        state["phase"] = "switching"
-        self._save(state)
-        for saved in state["snapshot"]["routes"]:
-            self._set_route(state, saved, saved["target_service"], f"switch:{saved['ref']}:{saved['path']}")
+        phase = state["phase"]
+        if phase == "source-sealed":
+            evidence = self.verify_validation(validation_path)
+            self.verify_quiesced(state)
+            # Once an ingress mutation begins, a request may reach Spindle before
+            # any observer can prove whether it wrote. Close ordinary rollback
+            # *before* that first mutation; guessing "probably no writes" is how a
+            # split-brain recovery loses events.
+            state["validation"] = evidence
+            state["target_writes_observed"] = True
+            state["phase"] = "switching"
+            self._save(state)
+        elif phase == "switching":
+            # MAS is still fenced in this phase, so a retry can and must prove
+            # the complete source seal again before touching another route.
+            self.verify_quiesced(state)
+        elif phase not in ("routes-switched", "target-written"):
+            raise Blocked(f"cannot switch checkpoint in phase {phase}")
+
+        if state["phase"] == "switching":
+            for saved in state["snapshot"]["routes"]:
+                self._set_route(
+                    state,
+                    saved,
+                    saved["target_service"],
+                    f"switch:{saved['ref']}:{saved['path']}",
+                )
+            # Record the traffic boundary before reviving MAS. If this process
+            # stops after MAS reaches its old replica count, the retry must not
+            # require the MAS database to be idle again.
+            state["phase"] = "routes-switched"
+            self._save(state)
+
+        source_roles = tuple(role for role in FENCE_ORDER if role not in POST_SWITCH_RESTORE_ORDER)
+        self._verify_workloads_fenced(state, source_roles)
+
+        for role in POST_SWITCH_RESTORE_ORDER:
+            saved = next(item for item in state["snapshot"]["workloads"] if item["role"] == role)
+            self._scale(state, saved, saved["replicas"], f"post-switch:{saved['ref']}")
         state["phase"] = "target-written"
         self._save(state)
         return state
