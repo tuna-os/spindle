@@ -809,22 +809,72 @@ fn signature_refusal(
 /// server: `verify` gets the keys of each server that the room version
 /// requires.
 ///
-/// A dependency recovery is waited for until `deadline` at most (#808); see
-/// [`SEND_BUDGET`].
+/// A PDU whose dependencies are being recovered comes back as
+/// [`Received::Recovering`], so the caller can judge the PDUs of other
+/// rooms before it waits for the verdict (#808).
 pub(super) async fn receive(
     state: &AppState,
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
-    deadline: tokio::time::Instant,
-) -> (String, Result<(), String>) {
+) -> Received {
     let relayed = pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
         .is_some_and(|(_, domain)| domain != origin);
-    let (id, outcome, result) = Box::pin(judge(state, origin, origin_keys, pdu, deadline)).await;
-    state.metrics.record_pdu(outcome, relayed);
-    (id, result)
+    match Box::pin(judge(state, origin, origin_keys, pdu)).await {
+        Judged::Settled(id, outcome, result) => {
+            state.metrics.record_pdu(outcome, relayed);
+            Received::Settled(id, result)
+        }
+        Judged::Recovering(id, verdict) => Received::Recovering {
+            id,
+            relayed,
+            verdict,
+        },
+    }
+}
+
+/// What [`receive`] came to for one PDU.
+pub(super) enum Received {
+    /// The PDU's ID and its answer.
+    Settled(String, Result<(), String>),
+    /// The PDU's dependencies are being recovered, and the verdict of the
+    /// recovery is its answer.
+    Recovering {
+        id: String,
+        relayed: bool,
+        verdict: watch::Receiver<Option<Verdict>>,
+    },
+}
+
+impl Received {
+    /// The PDU's ID and its answer: for a recovery in flight, its verdict,
+    /// waited for until `deadline` at most (see [`SEND_BUDGET`]).
+    pub(super) async fn answer(
+        self,
+        state: &AppState,
+        deadline: tokio::time::Instant,
+    ) -> (String, Result<(), String>) {
+        match self {
+            Self::Settled(id, result) => (id, result),
+            Self::Recovering {
+                id,
+                relayed,
+                verdict,
+            } => {
+                let (outcome, result) = wait_for_verdict(verdict, deadline).await;
+                state.metrics.record_pdu(outcome, relayed);
+                (id, result)
+            }
+        }
+    }
+}
+
+/// What [`judge`] came to: a verdict, or a recovery in flight.
+enum Judged {
+    Settled(String, PduOutcome, Result<(), String>),
+    Recovering(String, watch::Receiver<Option<Verdict>>),
 }
 
 /// The version to judge an event for a room this server does not hold
@@ -864,10 +914,9 @@ async fn judge(
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
-    deadline: tokio::time::Instant,
-) -> (String, PduOutcome, Result<(), String>) {
+) -> Judged {
     let Some(room_id) = pdu["room_id"].as_str() else {
-        return (
+        return Judged::Settled(
             "$malformed".to_owned(),
             PduOutcome::Refused,
             Err("no room_id".to_owned()),
@@ -884,7 +933,7 @@ async fn judge(
         Err(RoomError::UnknownRoom(_)) => match unheld_room_version(state, room_id, pdu) {
             Some(version) => version,
             None => {
-                return (
+                return Judged::Settled(
                     "$unknown-room".to_owned(),
                     PduOutcome::Refused,
                     Err(format!("unknown room: this server does not hold {room_id}")),
@@ -894,7 +943,7 @@ async fn judge(
         Err(_) => super::room_version_of(state, pdu),
     };
     if let Err(refusal) = server_acl_admits(state, room_id, origin) {
-        return (
+        return Judged::Settled(
             pdu_id_or_malformed(&version, pdu),
             PduOutcome::Refused,
             Err(refusal),
@@ -909,7 +958,7 @@ async fn judge(
     let mut event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,
         Err(error) => {
-            return (
+            return Judged::Settled(
                 pdu_id_or_malformed(&version, pdu),
                 PduOutcome::Refused,
                 Err(error),
@@ -918,7 +967,7 @@ async fn judge(
     };
     if let Err(error) = state.rooms.authorize_policy(room_id, &mut event.body).await {
         if !matches!(error, RoomError::Forbidden(_) | RoomError::Policy(_)) {
-            return (event.id, PduOutcome::Refused, Err(error.to_string()));
+            return Judged::Settled(event.id, PduOutcome::Refused, Err(error.to_string()));
         }
         // Ordinary auth is still checked before the event is soft-failed.
         tracing::debug!(
@@ -928,21 +977,21 @@ async fn judge(
         );
     }
     let error = match state.rooms.receive_live(room_id, &event.id, &event.body) {
-        Ok(()) => return (event.id, PduOutcome::Accepted, Ok(())),
+        Ok(()) => return Judged::Settled(event.id, PduOutcome::Accepted, Ok(())),
         Err(error) => error,
     };
     // A rejection is already a verdict. Recovery fills an absent dependency;
     // it must not reconsider a stored historical or native rejection.
     if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
-        return (event.id, classify(&error), Err(error.to_string()));
+        return Judged::Settled(event.id, classify(&error), Err(error.to_string()));
     }
     let Some(missing) = missing_dependencies(state, room_id, &event.body) else {
-        return (event.id, PduOutcome::Refused, Err(error.to_string()));
+        return Judged::Settled(event.id, PduOutcome::Refused, Err(error.to_string()));
     };
     // Recovery asks a participating peer about a room we hold; no unsigned
     // third-party name can trigger an arbitrary dependency fetch.
     if !state.rooms.server_in_room(room_id, origin).unwrap_or(false) {
-        return (
+        return Judged::Settled(
             event.id,
             PduOutcome::RefusedMissingDeps,
             Err(error.to_string()),
@@ -951,14 +1000,14 @@ async fn judge(
     // Before the room's turn: a PDU whose dependency failed a moment ago is
     // refused at once, not after the recovery in flight ahead of it.
     if let Some((outcome, result)) = failed_recently(state, room_id, &missing) {
-        return (event.id, outcome, result);
+        return Judged::Settled(event.id, outcome, result);
     }
 
     // The recovery runs as its own task, so a sending server that gives up
-    // on the transaction does not cancel it halfway, and this request stops
-    // waiting for it at the deadline (#808). It holds the room's turn for
-    // as long as it runs. A blocking-pool task rather than a spawned one:
-    // it ingests what it fetched and resolves state over it, which on a
+    // on the transaction does not cancel it halfway, and `/send` stops
+    // waiting for it at its budget (#808). It holds the room's turn for as
+    // long as it runs. A blocking-pool task rather than a spawned one: it
+    // ingests what it fetched and resolves state over it, which on a
     // worker held that worker for as long (#614).
     let id = event.id.clone();
     let verdict = match state.recovery.admit(room_id, &id) {
@@ -966,7 +1015,7 @@ async fn judge(
             state
                 .metrics
                 .record_recovery_admission(RecoveryAdmission::Busy);
-            return (
+            return Judged::Settled(
                 id,
                 PduOutcome::RefusedMissingDeps,
                 Err(format!(
@@ -1003,8 +1052,7 @@ async fn judge(
             verdict
         }
     };
-    let (outcome, result) = wait_for_verdict(verdict, deadline).await;
-    (id, outcome, result)
+    Judged::Recovering(id, verdict)
 }
 
 /// The verdict of a recovery in flight, or [`PduOutcome::Pending`] if it is
