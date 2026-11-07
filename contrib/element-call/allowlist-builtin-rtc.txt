@@ -40,3 +40,12 @@ spindle/ring-abandon.spec.ts :: Caller abandons a ringing DM call and the callee
 widget/voice-call-dm.spec.ts :: Decline a new video call in DM as widget
 widget/voice-call-dm.spec.ts :: Start a new video call in DM as widget
 widget/voice-call-dm.spec.ts :: Start a new voice call in DM as widget
+#
+# Recorded on workflow run 42322109762 (element-call pin 9f7c35c,
+# chromium), with the release sending the held leave: twenty-one of
+# twenty-two. A crashed participant now expires through the SFU webhook,
+# in the churn call and after a homeserver restart in both membership
+# modes. Only the lk-jwt-service-specific errors.spec.ts case remains out.
+spindle/five-party-churn.spec.ts :: Five-party call with participants joining, leaving, rejoining and dying throughout
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (state events)
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (sticky events)
