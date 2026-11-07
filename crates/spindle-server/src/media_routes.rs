@@ -230,7 +230,7 @@ async fn download_media(
     AccountAuthenticated(_identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
 }
 
 /// The same, with a filename the client would like the browser to use.
@@ -248,7 +248,7 @@ async fn download_media_named(
         String,
     )>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
 }
 
 /// `GET /_matrix/media/v3/download/{server_name}/{media_id}`, and the
@@ -260,11 +260,16 @@ async fn download_media_named(
 /// token bound alongside it. This is what clients that predate MSC3916, or
 /// that gate on a spec version this server does not claim, ask for; without
 /// it every avatar and thumbnail in those clients is a 404.
+///
+/// Frozen as Synapse freezes it: remote media is served only once this
+/// server has cached it, and is never fetched on an unauthenticated
+/// request. A fetch there would let anyone with no account make this
+/// server download, and keep, whatever a peer of their choosing serves.
 async fn download_media_legacy(
     State(state): State<AppState>,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::CachedOnly).await
 }
 
 /// The same, with a filename the client would like the browser to use.
@@ -279,7 +284,50 @@ async fn download_media_legacy_named(
         String,
     )>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::CachedOnly).await
+}
+
+/// What a media route may do about remote media this server holds no copy
+/// of.
+#[derive(Debug, Clone, Copy)]
+enum Remote {
+    /// Fetch it over federation and cache it: the authenticated routes.
+    Fetch,
+    /// Answer from the cache alone: the frozen unauthenticated routes. An
+    /// uncached item is the plain `M_NOT_FOUND` an unknown local ID gets,
+    /// with nothing about any peer in it.
+    CachedOnly,
+}
+
+/// The local store ID that `server_name`/`media_id` is served from: the ID
+/// itself for this server's media, the cache ID for a peer's.
+async fn stored_media_id(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+    remote: Remote,
+) -> Result<String, MatrixError> {
+    if state.media.is_ours(server_name) {
+        return Ok(media_id.to_owned());
+    }
+    match remote {
+        Remote::Fetch => cached_remote_media(state, server_name, media_id).await,
+        Remote::CachedOnly => {
+            let cache_id = crate::media::Media::remote_id(server_name, media_id);
+            let cached = state
+                .media
+                .record(&cache_id)
+                .map_err(|error| media_error(&error))?
+                .is_some();
+            if cached {
+                Ok(cache_id)
+            } else {
+                Err(media_error(&crate::media::MediaError::Unknown(
+                    media_id.to_owned(),
+                )))
+            }
+        }
+    }
 }
 
 /// Serves the bytes for a media URI the caller holds, local or federated.
@@ -292,16 +340,12 @@ async fn serve_media(
     state: &AppState,
     server_name: &str,
     media_id: &str,
+    remote: Remote,
 ) -> Result<axum::response::Response, MatrixError> {
-    let media_id = if state.media.is_ours(server_name) {
-        media_id.to_owned()
-    } else {
-        cached_remote_media(state, server_name, media_id).await?
-    };
-    let media_id = media_id.as_str();
+    let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     let (record, bytes) = state
         .media
-        .bytes(media_id)
+        .bytes(&media_id)
         .await
         .map_err(|error| media_error(&error))?;
 
@@ -508,21 +552,22 @@ async fn thumbnail_media(
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_thumbnail(&state, &server_name, &media_id, query).await
+    serve_thumbnail(&state, &server_name, &media_id, query, Remote::Fetch).await
 }
 
 /// `GET /_matrix/media/v3/thumbnail/{server_name}/{media_id}`.
 ///
 /// The frozen unauthenticated twin of the route above, served as a pure
-/// capability URL for the same reason [`download_media_legacy`] gives.
-/// This is the endpoint clients fetch avatars and thumbnails from until
-/// they move to authenticated media.
+/// capability URL for the same reason [`download_media_legacy`] gives, and
+/// frozen the same way: remote media only from the cache. This is the
+/// endpoint clients fetch avatars and thumbnails from until they move to
+/// authenticated media.
 async fn thumbnail_media_legacy(
     State(state): State<AppState>,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_thumbnail(&state, &server_name, &media_id, query).await
+    serve_thumbnail(&state, &server_name, &media_id, query, Remote::CachedOnly).await
 }
 
 async fn serve_thumbnail(
@@ -530,12 +575,9 @@ async fn serve_thumbnail(
     server_name: &str,
     media_id: &str,
     query: ThumbnailQuery,
+    remote: Remote,
 ) -> Result<axum::response::Response, MatrixError> {
-    let media_id = if state.media.is_ours(server_name) {
-        media_id.to_owned()
-    } else {
-        cached_remote_media(state, server_name, media_id).await?
-    };
+    let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     if query.width == 0 || query.height == 0 {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,

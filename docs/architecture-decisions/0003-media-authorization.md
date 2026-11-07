@@ -77,3 +77,13 @@ bytes from the same content-addressed store. It binds no token next to
 the URI. This extends decision 1. The IDs hold 128 random bits, so the
 URI itself stays the authorization. The `download_needs_a_token` pin
 still guards the authenticated routes.
+
+These endpoints are frozen as Synapse freezes them. They serve local
+media, and remote media that this server has in its cache. They never
+fetch remote media. A fetch there would let a caller with no account
+make this server download and keep the files of any peer. For remote
+media that is not in the cache, the answer is a plain `M_NOT_FOUND`
+that gives no detail about the peer. An authenticated download puts the
+file in the cache, and after that the frozen endpoints serve it.
+`the_legacy_routes_serve_cached_remote_media_and_never_fetch_it` in
+`tests/federation_media.rs` holds this.
