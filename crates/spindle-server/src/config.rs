@@ -611,7 +611,18 @@ pub struct LivekitConfig {
     /// `LiveKit`'s API key, the `iss` of every token minted.
     pub key: String,
     /// `LiveKit`'s API secret, the HMAC key every token is signed with.
+    ///
+    /// Set this or [`Self::secret_file`], not both. After loading it holds
+    /// the secret either way, so the minter and the supervised sidecar's
+    /// generated config read one value.
+    #[serde(default)]
     pub secret: String,
+    /// A file holding the API secret (trailing newline ignored), so the
+    /// secret can be mounted rather than written into the config, as
+    /// `lk-jwt-service` reads `LIVEKIT_SECRET_FROM_FILE`. Read once, at
+    /// startup.
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
     /// The supervised-sidecar model: the operator-supplied path to the
     /// `livekit-server` binary this server starts, watches and restarts.
     ///
@@ -654,6 +665,40 @@ impl LivekitConfig {
             "local"
         } else {
             "remote"
+        }
+    }
+
+    /// Take the secret from [`Self::secret_file`] when that is the key set,
+    /// so that everything after loading reads [`Self::secret`]. Exactly one
+    /// of the two keys is set; an error names the file, never a secret.
+    fn read_secret_file(&mut self) -> Result<(), ConfigError> {
+        match (&self.secret_file, self.secret.is_empty()) {
+            (None, false) => Ok(()),
+            (Some(_), false) | (None, true) => Err(ConfigError::Invalid {
+                field: "rtc.livekit",
+                message: "set exactly one of secret and secret_file: LiveKit's API \
+                          secret, inline or in a file"
+                    .to_owned(),
+            }),
+            (Some(path), true) => {
+                let text = std::fs::read_to_string(path).map_err(|error| ConfigError::Invalid {
+                    field: "rtc.livekit.secret_file",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+                let secret = text.trim_end_matches(['\r', '\n']);
+                if secret.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        field: "rtc.livekit.secret_file",
+                        message: format!(
+                            "{} is empty, and a token signed with an empty secret \
+                             admits nobody",
+                            path.display()
+                        ),
+                    });
+                }
+                secret.clone_into(&mut self.secret);
+                Ok(())
+            }
         }
     }
 }
@@ -1674,12 +1719,16 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if the document does not parse or a field is
-    /// unusable.
+    /// Returns [`ConfigError`] if the document does not parse, a field is
+    /// unusable, or a secret file it names (`rtc.livekit.secret_file`)
+    /// cannot be read.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|error| ConfigError::Syntax {
+        let mut config: Self = toml::from_str(text).map_err(|error| ConfigError::Syntax {
             message: error.to_string(),
         })?;
+        if let Some(livekit) = &mut config.rtc.livekit {
+            livekit.read_secret_file()?;
+        }
         config.validate()?;
         config.validate_media()?;
         config.federation.hub.validate()?;

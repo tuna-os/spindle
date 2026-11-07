@@ -60,6 +60,7 @@ public_base_url = "https://matrix.example.org"
 url = "wss://livekit.example.org"
 key = "APIxxxxxxxx"
 secret = "..."          # the SFU's matching API secret
+# secret_file = "/run/secrets/livekit-secret"   # instead of secret
 # token_ttl_seconds = 900
 ```
 
@@ -97,6 +98,17 @@ client that needs that gets it by setting `3600` here, on purpose.
 The secret is LiveKit's and is shared with nothing else. It is not this
 server's signing key and is not derived from it; the two rotate apart,
 and a leak of one is not a leak of the other. It is never logged.
+
+To keep the secret out of `spindle.toml`, put it in a file and set
+`secret_file` to its path instead of `secret`. For example, use a
+Compose or Kubernetes secret. This is how `lk-jwt-service` reads
+`LIVEKIT_SECRET_FROM_FILE`. Set exactly one of the two keys.
+
+The server reads the file once, at startup, and ignores the trailing
+newline. If the file is missing or empty, or if both keys or neither key
+is set, the server does not start, and the error names `rtc.livekit`.
+To use a new secret, restart the server. With a supervised SFU, the
+generated `livekit.yaml` gets the secret from the file.
 
 ## Option B: lk-jwt-service beside the server
 

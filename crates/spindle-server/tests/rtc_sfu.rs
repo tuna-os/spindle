@@ -678,6 +678,30 @@ fn sidecar_config_defaults_under_storage() {
     );
 }
 
+/// A secret read from `secret_file` is the one the generated sidecar
+/// config gives the SFU: the minter and the SFU hold the same key (#803).
+#[test]
+fn sidecar_config_carries_a_secret_read_from_a_file() {
+    let dir = TempDir::new().unwrap();
+    let secret = dir.path().join("livekit-secret");
+    std::fs::write(&secret, "mounted-secret\n").unwrap();
+    let config = spindle_server::Config::parse(&format!(
+        "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n\
+         [rtc.livekit]\nurl = \"wss://127.0.0.1:7880\"\nkey = \"APIkey\"\nsecret_file = \"{}\"\n\
+         binary = \"/bin/true\"\n",
+        dir.path().display(),
+        secret.display(),
+    ))
+    .unwrap();
+
+    let path = spindle_server::livekit::SfuSupervisor::generate_config_for(&config).unwrap();
+    let rendered = std::fs::read_to_string(path).unwrap();
+    assert!(
+        rendered.contains("  APIkey: mounted-secret\n"),
+        "{rendered}"
+    );
+}
+
 /// The supervised binary is pinned at ESS parity, and the new fields are
 /// refused empty at startup rather than found during a call.
 #[test]
