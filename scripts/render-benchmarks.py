@@ -148,7 +148,7 @@ def render(document: dict, repository: str) -> str:
         f"runner <code>{html.escape(document.get('runner','?'))}</code></p>"
     )
     add(
-        "<p class=\"note\">Generated from Criterion output on every push to "
+        "<p class=\"note\">Generated from Criterion output weekly from "
         "<code>main</code>. <strong>Ratios are the result; wall times are context.</strong> "
         "Absolute times do not survive a change of runner, and a shared CI runner is both "
         "slower and noisier than a workstation by an amount that varies run to run. "

@@ -5,11 +5,11 @@ only reports its wins is not evidence (#34).
 
 ## Where the current numbers are
 
-**Published automatically on every push to `main`:**
+**Published automatically every week from `main` (and on demand):**
 <https://tuna-os.github.io/spindle/> — with
 [`latest.json`](https://tuna-os.github.io/spindle/latest.json) as the raw data
-and a per-commit copy kept beside it, so a regression can be traced to the push
-that caused it.
+and a per-commit copy kept beside it, so a regression can be traced to the run
+that caught it.
 
 **The tables in this document are dated snapshots, not the live figures.** They
 are here because the analysis around them needs something concrete to point at,

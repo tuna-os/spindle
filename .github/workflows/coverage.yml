@@ -3,12 +3,10 @@ name: Coverage
 # What the test suite reaches, measured rather than assumed. Not a gate
 # yet: the first runs establish the number, and a floor belongs in this
 # file once there is one to hold (ROADMAP.md, the v0.1.0 table, says
-# evidence before promises). On main and weekly, because instrumented
-# builds cost a full rebuild and a pull request already runs the suite.
+# evidence before promises). Weekly, because instrumented builds cost a full
+# rebuild and a pull request already runs the suite.
 
 on:
-  push:
-    branches: [main]
   schedule:
     - cron: '41 4 * * 1'
   workflow_dispatch:

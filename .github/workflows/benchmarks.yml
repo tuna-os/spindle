@@ -1,12 +1,14 @@
 name: Benchmarks
 
-# Published on every push to main, so the numbers in the open are the numbers
-# from the code on main rather than whatever was hand-copied into a document
-# the last time somebody remembered. A figure typed into prose is a claim with
-# nothing holding it to the code.
+# Published weekly from main (and on demand), so the numbers in the open are the
+# numbers from the code on main rather than whatever was hand-copied into a
+# document the last time somebody remembered. A figure typed into prose is a
+# claim with nothing holding it to the code. Not on every push: a full
+# `cargo bench` over the workspace cost about 15 job-minutes per merge, and the
+# page is a trend line, not a gate.
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'
   workflow_dispatch:
 
 # Read-only by default. Only the deploy job can write Pages (#521): the
@@ -54,9 +56,8 @@ jobs:
           python3 scripts/render-benchmarks.py site/latest.json site/index.html \
             --repository "${GITHUB_REPOSITORY}"
 
-      # The coverage dashboard rides along on the same site: one push to main
-      # republishes both, so neither can describe a different commit than the
-      # other.
+      # The coverage dashboard rides along on the same site: one run republishes
+      # both, so neither can describe a different commit than the other.
       - name: Render the dashboard
         run: python3 scripts/coverage-dashboard.py --html site/dashboard.html
 
