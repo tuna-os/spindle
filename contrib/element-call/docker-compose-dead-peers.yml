@@ -1,0 +1,57 @@
+# The Spindle-to-Synapse variant of the rig (#795): run.sh adds this file
+# when SPINDLE_PEER is `synapse`. The second seat keeps upstream's real
+# Synapse, unmodified, so a call crosses federation between Spindle and
+# the server most of its users' peers run.
+#
+# The three services here are the servers a deployed room also names:
+# homeservers that were in the room once and no longer answer. Each is a
+# Spindle with its own name and its own TLS listener on 8448 (upstream's
+# dev certificate covers *.m.localhost), so Spindle and Synapse federate
+# with it while it is up. synapse-peer-ring.spec.ts joins a user from each
+# to a DM and then pauses the containers: the name still resolves and the
+# kernel still accepts the TCP connection, but nothing answers. A request
+# to it therefore runs into its timeout, which is what a dead server looks
+# like on the internet. A stopped container would answer with NXDOMAIN or
+# a refused connection at once, and that does not hold anything up.
+#
+# Their client APIs are published on 127.0.0.1:28101-28103 so the spec can
+# register and join their users without a browser.
+x-dead-peer: &dead-peer
+  image: ${SPINDLE_IMAGE:-complement-spindle:latest}
+  pull_policy: never
+  entrypoint: ["/usr/local/bin/spindle-element-call-entrypoint.sh"]
+  volumes:
+    - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
+    - ${SPINDLE_CONTRIB:-.}/dead-peer.toml:/cfg/spindle.toml.in:ro,Z
+    - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z
+    - ./backend/dev_tls_m.localhost.crt:/cfg/tls.crt:ro,Z
+    - ./backend/dev_tls_m.localhost.key:/cfg/tls.key:ro,Z
+
+services:
+  dead-peer-1:
+    <<: *dead-peer
+    environment:
+      - SPINDLE_SERVER_NAME=dead1.m.localhost:8448
+    ports:
+      - "127.0.0.1:28101:8008"
+    networks:
+      ecbackend:
+        aliases: [dead1.m.localhost]
+  dead-peer-2:
+    <<: *dead-peer
+    environment:
+      - SPINDLE_SERVER_NAME=dead2.m.localhost:8448
+    ports:
+      - "127.0.0.1:28102:8008"
+    networks:
+      ecbackend:
+        aliases: [dead2.m.localhost]
+  dead-peer-3:
+    <<: *dead-peer
+    environment:
+      - SPINDLE_SERVER_NAME=dead3.m.localhost:8448
+    ports:
+      - "127.0.0.1:28103:8008"
+    networks:
+      ecbackend:
+        aliases: [dead3.m.localhost]

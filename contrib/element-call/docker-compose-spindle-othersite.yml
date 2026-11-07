@@ -1,0 +1,18 @@
+# Spindle in Element Call's second homeserver seat
+# (synapse.othersite.m.localhost), so the rig federates two Spindles (#269).
+# run.sh adds this after docker-compose-spindle.yml unless SPINDLE_PEER is
+# `synapse`. nginx proxies the second site to homeserver-1:18008, and this
+# Spindle loads the appservice registration upstream gives the second
+# Synapse, for the same reasons docker-compose-spindle.yml gives.
+services:
+  synapse-1:
+    image: ${SPINDLE_IMAGE:-complement-spindle:latest}
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/spindle-element-call-entrypoint.sh"]
+    environment:
+      - SPINDLE_LOG=${SPINDLE_LOG:-info}
+    volumes:
+      - ${SPINDLE_CONTRIB:-.}/entrypoint.sh:/usr/local/bin/spindle-element-call-entrypoint.sh:ro,Z
+      - ${SPINDLE_CONTRIB:-.}/spindle-othersite.toml:/cfg/spindle.toml:ro,Z
+      - ./backend/app-service-othersite.yaml:/cfg/app-service.yaml:ro,Z
+      - ./backend/dev_tls_local-ca.crt:/cfg/dev-ca.crt:ro,Z

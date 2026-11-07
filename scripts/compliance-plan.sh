@@ -5,6 +5,11 @@
 #   code=true|false   false only when every changed path is prose, so a
 #                     docs-only change does not build the server five times
 #   rotation=[...]    which of the heavy rigs run in this run
+#   federation_rtc=true|false
+#                     whether the Spindle-to-Synapse Element Call rig runs:
+#                     on a pull request that touches federation or
+#                     MatrixRTC code (FEDERATION_RTC below), nightly and on
+#                     dispatch
 #
 # The heavy rigs (ROTATING below) each build a tree of their own and take
 # a quarter of an hour; they are coverage of the same server, not of
@@ -24,6 +29,18 @@ set -euo pipefail
 
 ROTATING=(rust-sdk-suite element-call-e2e mesh-seam)
 
+# The code a call between Spindle and Synapse goes through (#795): the
+# outbox and the federation client, the inbound transaction path, the
+# MatrixRTC transport and delayed events -- and the rig itself.
+FEDERATION_RTC=(
+  'crates/spindle-server/src/federation*'
+  'crates/spindle-server/src/inbound*'
+  'crates/spindle-server/src/rtc*'
+  'crates/spindle-server/src/livekit*'
+  'crates/spindle-server/src/delayed*'
+  'contrib/element-call/*'
+)
+
 # True when there is at least one path and every one is prose. An empty
 # or unreadable list is not "docs only": when in doubt, run everything.
 docs_only() {
@@ -37,6 +54,20 @@ docs_only() {
     esac
   done
   $any
+}
+
+# True when any path matches FEDERATION_RTC. A truncated list may hide
+# one, so it counts as a match.
+touches_federation_rtc() {
+  local path pattern
+  while IFS= read -r path; do
+    [[ $path == '(truncated)' ]] && return 0
+    for pattern in "${FEDERATION_RTC[@]}"; do
+      # shellcheck disable=SC2053 # the pattern is a glob on purpose
+      [[ $path == $pattern ]] && return 0
+    done
+  done
+  return 1
 }
 
 changed() {
@@ -67,10 +98,18 @@ json() {
 
 code=true
 rotation='[]'
+federation_rtc=false
 case $EVENT in
   pull_request | push)
-    if files=$(changed) && docs_only <<<"$files"; then
-      code=false
+    if files=$(changed); then
+      if docs_only <<<"$files"; then
+        code=false
+      fi
+      if [[ $EVENT == pull_request ]] && touches_federation_rtc <<<"$files"; then
+        federation_rtc=true
+      fi
+    elif [[ $EVENT == pull_request ]]; then
+      federation_rtc=true
     fi
     if [[ $EVENT == push && $code == true ]]; then
       n=${#ROTATING[@]}
@@ -86,10 +125,12 @@ case $EVENT in
     ;;
   *)
     rotation=$(json "${ROTATING[@]}")
+    federation_rtc=true
     ;;
 esac
 
 {
   echo "code=$code"
   echo "rotation=$rotation"
+  echo "federation_rtc=$federation_rtc"
 } >>"${GITHUB_OUTPUT:-/dev/stdout}"
