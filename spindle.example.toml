@@ -451,9 +451,10 @@ registrations = []
 # ]
 
 # The built-in LiveKit JWT service (#38, MSC4195) — off unless the
-# `[rtc.livekit]` section below is set, with all three of url, key and
-# secret. The header is commented out with the rest for that reason: a
-# section that is present but empty is a misconfiguration, not "off".
+# `[rtc.livekit]` section below is set, with url, key, and one of secret
+# and secret_file. The header is commented out with the rest for that
+# reason: a section that is present but empty is a misconfiguration, not
+# "off".
 # See docs/matrix-rtc.md for the deployment end to end.
 # [rtc.livekit]
 #
@@ -477,7 +478,11 @@ registrations = []
 # shared with the SFU and nothing else: it is not this server's signing
 # key, and it is never logged.
 # key = "APIxxxxxxxx"
-# secret = "..."
+# secret_file = "/run/secrets/livekit-secret"   # or secret = "..."
+#
+# Set exactly one of secret and secret_file. The file is read once at
+# startup and its trailing newline is ignored; a missing or empty file
+# stops the server. Restart to use a rotated secret.
 #
 # How long a minted token admits its holder, in seconds. Fifteen minutes by
 # default: enough to join and ride out a reconnect, short enough that a

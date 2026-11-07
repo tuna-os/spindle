@@ -16,10 +16,12 @@
 # it. The tag stays for the reader and for Dependabot, which rewrites the
 # tag and the digest together. complement/Dockerfile pins the same two.
 FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
-# Extra cargo features, empty for the release image. The Synapse migration
-# rehearsal image passes FEATURES=synapse-import; an image for a MAS
-# cutover (`spindle import-mas`), FEATURES=mas-import.
-ARG FEATURES=""
+# Extra cargo features. The default is the release image's set, so that a
+# local `docker build .` makes the image release.yml publishes (its
+# FEATURES env passes the same value): `mas-import`, for `spindle
+# import-mas` (#802). The Synapse migration rehearsal image passes
+# FEATURES=synapse-import instead.
+ARG FEATURES="mas-import"
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p spindle-server --bin spindle --locked \

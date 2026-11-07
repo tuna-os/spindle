@@ -62,8 +62,10 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 # server binary nor the hot CI gate should pay a C compile for it.
 synapse-import = ["dep:postgres", "dep:rusqlite"]
 # `spindle import-mas` (#797): reads a MAS PostgreSQL database. Off by
-# default for the same reason: a one-shot migration, and no reason for the
-# server binary to link a PostgreSQL client.
+# default, so the hot CI gate and a development build do not compile a
+# PostgreSQL client for a one-shot migration. The release builds turn it
+# on (FEATURES in .github/workflows/release.yml and the Dockerfile, #802):
+# the importer must be the same build as the server whose store it opens.
 mas-import = ["dep:postgres"]
 # Enable the production-corpus replay harness.
 corpus-replay = []

@@ -529,6 +529,86 @@ async fn the_window_is_the_one_the_operator_set() {
     assert!(exp <= now_secs() + 60, "no token outlives its window");
 }
 
+/// The secret can be mounted rather than written into the config (#803):
+/// `secret_file` is read at startup, its trailing newline dropped, and the
+/// tokens are signed with what it holds, as `lk-jwt-service`'s
+/// `LIVEKIT_SECRET_FROM_FILE` signs them.
+#[tokio::test]
+async fn the_secret_can_come_from_a_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("livekit-secret");
+    std::fs::write(&path, "from-a-file\n").unwrap();
+    let harness = Harness::with(&format!(
+        "[rtc.livekit]\nurl = \"wss://sfu.example.org\"\nkey = \"APIkey\"\nsecret_file = \"{}\"\n",
+        path.display()
+    ));
+    let alice = harness.register("alice").await;
+    let room = harness.create_room(&alice).await;
+    let openid = harness.openid_token(&alice).await;
+
+    let (status, body) = harness.sfu_get(&room, openid, &alice.device_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jwt = body["jwt"].as_str().unwrap();
+    assert!(
+        decode_jwt(jwt, "from-a-file").signed,
+        "signed with the file's secret"
+    );
+    assert!(
+        !decode_jwt(jwt, "from-a-file\n").signed,
+        "the trailing newline is not part of the secret"
+    );
+}
+
+/// One way to give the secret, and a file that holds one: each mistake
+/// stops the server at startup, names `rtc.livekit`, and never prints a
+/// secret.
+#[test]
+fn the_secret_is_given_exactly_one_way() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("livekit-secret");
+    std::fs::write(&file, "in-the-file\n").unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, "\n").unwrap();
+    let missing = dir.path().join("missing");
+    let refused = |keys: &str| match spindle_server::Config::parse(&format!(
+        "[server]\nname = \"example.org\"\n[rtc.livekit]\nurl = \"wss://sfu.example.org\"\n\
+         key = \"k\"\n{keys}"
+    )) {
+        Ok(_) => panic!("should have been refused:\n{keys}"),
+        Err(error) => error.to_string(),
+    };
+
+    let both = refused(&format!(
+        "secret = \"inline-secret\"\nsecret_file = \"{}\"\n",
+        file.display()
+    ));
+    assert!(both.starts_with("rtc.livekit"), "{both}");
+    assert!(both.contains("secret_file"), "{both}");
+    assert!(
+        !both.contains("inline-secret") && !both.contains("in-the-file"),
+        "{both}"
+    );
+
+    let neither = refused("");
+    assert!(neither.starts_with("rtc.livekit"), "{neither}");
+    assert!(neither.contains("secret_file"), "{neither}");
+
+    let unreadable = refused(&format!("secret_file = \"{}\"\n", missing.display()));
+    assert!(
+        unreadable.starts_with("rtc.livekit.secret_file"),
+        "{unreadable}"
+    );
+    assert!(
+        unreadable.contains(&missing.display().to_string()),
+        "the error names the file: {unreadable}"
+    );
+
+    let blank = refused(&format!("secret_file = \"{}\"\n", empty.display()));
+    assert!(blank.starts_with("rtc.livekit.secret_file"), "{blank}");
+    assert!(blank.contains("empty"), "{blank}");
+}
+
 /// The request's shape is the external service's: a missing device is a
 /// missing parameter, because the identity is user *and* device.
 #[tokio::test]
