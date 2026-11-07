@@ -26,6 +26,7 @@ unicode-normalization.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 form_urlencoded.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustls.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
