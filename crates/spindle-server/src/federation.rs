@@ -67,6 +67,15 @@ const KEY_DOCUMENT_MAX_BYTES: usize = 256 * 1024;
 /// How long one key fetch, direct or notary, may take.
 const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a remote server has to confirm an `OpenID` token. A client is
+/// waiting to join a call on the other end, and a server that takes longer
+/// than this to say who its own user is will not have answered in time to
+/// be useful anyway.
+const OPENID_USERINFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most of a `userinfo` answer read: it is `{"sub": "@user:server"}`.
+const OPENID_USERINFO_MAX_BYTES: usize = 4 * 1024;
+
 /// How long a server's `.well-known/matrix/server` answer is used when the
 /// response does not say (SPEC: server discovery, step 3: "24 hours is
 /// recommended"), and the bounds a `Cache-Control: max-age` is held to.
@@ -2291,6 +2300,61 @@ impl Federation {
             )));
         }
         Ok(body)
+    }
+
+    /// Redeem another server's `OpenID` token at that server: `GET
+    /// /_matrix/federation/v1/openid/userinfo`, the call `lk-jwt-service`
+    /// makes, and the user ID it names (unchecked: the caller decides what
+    /// it must match).
+    ///
+    /// Unsigned, as the spec has it: the token is the credential and the
+    /// endpoint is public. Addressed like every other request, so the
+    /// server name is held to the same grammar, delegation and address
+    /// rules as an `X-Matrix` origin's -- the name arrives in a request
+    /// body from anyone, and must not become a way to make this server
+    /// fetch an inward address. Bounded in time and size for the same
+    /// reason: a client waits on this.
+    ///
+    /// # Errors
+    ///
+    /// [`FederationError::Answered`] when the server answered and refused
+    /// the token; [`FederationError::Refused`] when it could not be asked,
+    /// did not answer in time, or answered with something unreadable.
+    pub async fn remote_openid_userinfo(
+        &self,
+        destination: &str,
+        access_token: &str,
+    ) -> Result<String, FederationError> {
+        let encoded: String = form_urlencoded::byte_serialize(access_token.as_bytes()).collect();
+        let uri = format!("/_matrix/federation/v1/openid/userinfo?access_token={encoded}");
+        let response = self
+            .request(reqwest::Method::GET, destination, &uri)
+            .await?
+            .timeout(OPENID_USERINFO_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("openid/userinfo: {error}")))?;
+        let status = response.status();
+        let bytes = read_bounded(response, OPENID_USERINFO_MAX_BYTES, "openid/userinfo").await?;
+        if status.is_client_error() {
+            return Err(FederationError::Answered {
+                status: status.as_u16(),
+                body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            });
+        }
+        if !status.is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination} answered openid/userinfo with {status}"
+            )));
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|body| body["sub"].as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                FederationError::Refused(format!(
+                    "{destination} answered openid/userinfo without a sub"
+                ))
+            })
     }
 
     /// Send the signed join back — the client half of `send_join`.

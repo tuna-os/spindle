@@ -1,0 +1,51 @@
+# Element Call specs Spindle must pass with its built-in LiveKit minter in
+# place of upstream's lk-jwt-service (#796): run.sh with SPINDLE_RTC=builtin,
+# checked by scripts/element-call-check.py like allowlist.txt.
+#
+# The same rules as allowlist.txt: one `<spec file> :: <test title>` per
+# line, promoted by review, and nothing claimed that has not been seen to
+# pass -- every entry names the run that recorded it.
+#
+# Recorded on the first builtin run (workflow run 42295629126, element-call
+# pin 9f7c35c, chromium): six of the seven specs it ran. The call across the
+# two Spindles passes in both membership modes with each Spindle minting
+# for the other's user (subscribe-only) and creating its own rooms on an
+# SFU with `auto_create: false`. five-party-churn failed there: Element Call
+# handed its hour-long leave to the transport and the minter refused it.
+create-call.spec.ts :: BugFix: When unmuting in lobby, you had to click twice to unmute in call
+create-call.spec.ts :: Start a new call then leave and show the feedback screen
+spa-call-sticky.spec.ts :: One to One call using matrix rtc 2.0 aka sticky events
+spa-call-sticky.spec.ts :: One to One rejoin after improper leave does not crash EC
+spindle/federated-call.spec.ts :: Federated call between two Spindles (2_0)
+spindle/federated-call.spec.ts :: Federated call between two Spindles (compat)
+#
+# Recorded on the full builtin run (workflow run 42315846545, element-call
+# pin 9f7c35c, chromium): eighteen of twenty-two. The SFU webhook reached
+# both Spindles signed and released holds. Of the four that failed, three
+# (five-party-churn, and both restart-mid-call cases) are a crashed
+# participant that never expired: the release took the delayed leave off
+# the schedule and dropped it instead of sending it, fixed after that run.
+# The fourth, errors.spec.ts "call creation is restricted", intercepts
+# lk-jwt-service's own URL (matrix-rtc.m.localhost/livekit/jwt/sfu/get), so
+# it cannot apply to a transport at another address.
+access.spec.ts :: As a guest, create a call, share link and other join
+access.spec.ts :: Sign up a new account, then login, then logout
+errors.spec.ts :: Should automatically retry non fatal JWT errors
+errors.spec.ts :: Should show error screen if fails to get JWT token
+landing.spec.ts :: Landing page
+landing.spec.ts :: has title
+reconnect.spec.ts :: can only interact with header and footer while reconnecting
+sfu-reconnect-bug.spec.ts :: When creator left, avoid reconnect to the same SFU
+spindle/ring-abandon.spec.ts :: Caller abandons a ringing DM call and the callee stops ringing
+widget/voice-call-dm.spec.ts :: Decline a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new video call in DM as widget
+widget/voice-call-dm.spec.ts :: Start a new voice call in DM as widget
+#
+# Recorded on workflow run 42322109762 (element-call pin 9f7c35c,
+# chromium), with the release sending the held leave: twenty-one of
+# twenty-two. A crashed participant now expires through the SFU webhook,
+# in the churn call and after a homeserver restart in both membership
+# modes. Only the lk-jwt-service-specific errors.spec.ts case remains out.
+spindle/five-party-churn.spec.ts :: Five-party call with participants joining, leaving, rejoining and dying throughout
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (state events)
+spindle/restart-mid-call.spec.ts :: Call survives a homeserver restart and a later crash still expires (sticky events)

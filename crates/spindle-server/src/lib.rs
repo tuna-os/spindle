@@ -159,6 +159,10 @@ pub struct AppState {
     /// and restarted. Present in every state — the remote model and the
     /// unconfigured server simply report through it rather than spawn.
     pub sfu: Arc<livekit::SfuSupervisor>,
+    /// The built-in `LiveKit` minter's process state: its client for the
+    /// SFU's room API, and the servers recently unreachable when asked to
+    /// confirm an `OpenID` token.
+    pub minter: Arc<livekit::Minter>,
     /// MSC3995 hub mode's process state (#22): who answered the capability
     /// probe, how far each hubbed room's attestations have gone, counters.
     #[cfg(feature = "hub-mode")]
@@ -543,6 +547,7 @@ fn app_state_with(
         metrics,
         mailer,
         sfu: livekit::SfuSupervisor::new(config_for_sfu, store_for_sfu),
+        minter: livekit::Minter::new(),
         #[cfg(feature = "hub-mode")]
         hub: Arc::new(hub::Hub::new()),
     };

@@ -22,6 +22,16 @@ on:
           Empty runs the default subset in contrib/element-call/run.sh.
         required: false
         default: ""
+      element_call_rtc:
+        description: >-
+          Who mints SFU tokens for Spindle in the element-call-e2e and
+          element-call-synapse-peer jobs: both runs each once with
+          upstream's lk-jwt-service and once with Spindle's built-in
+          minter (contrib/element-call/run.sh, SPINDLE_RTC).
+        required: false
+        type: choice
+        options: [both, lk-jwt-service, builtin]
+        default: both
 
 permissions:
   contents: read
@@ -788,11 +798,20 @@ jobs:
   # recorded run is what fills it in. Until an entry is protected the check
   # cannot fail on a spec, only on the stack not coming up -- which is a
   # finding worth a red run, so it is not continue-on-error.
+  #
+  # Twice, by who mints the SFU tokens: upstream's lk-jwt-service, as in
+  # Element Call's own rig, and Spindle's built-in minter in its place
+  # (#796), each against its own allowlist. A push to main, where this
+  # job is one rig of a rotation, runs the first only.
   element-call-e2e:
     needs: plan
     if: contains(fromJSON(needs.plan.outputs.rotation), 'element-call-e2e')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        rtc: ${{ fromJSON((inputs.element_call_rtc == 'builtin' && '["builtin"]') || (inputs.element_call_rtc == 'lk-jwt-service' && '["lk-jwt-service"]') || (github.event_name == 'push' && '["lk-jwt-service"]') || '["lk-jwt-service","builtin"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -818,12 +837,13 @@ jobs:
           SPINDLE_IMAGE: complement-spindle:latest
           ELEMENT_CALL_SRC: tmp/element-call
           ELEMENT_CALL_SPECS: ${{ inputs.element_call_specs }}
+          SPINDLE_RTC: ${{ matrix.rtc }}
         run: contrib/element-call/run.sh tmp/element-call-results/results.json
       - name: Keep the report and the server logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: element-call-e2e
+          name: element-call-e2e-${{ matrix.rtc }}
           path: |
             tmp/element-call-results/
             tmp/element-call/playwright-report/
@@ -836,12 +856,18 @@ jobs:
   # answering -- the call reilly.asia could not ring on 2026-11-06. On pull
   # requests that touch federation or MatrixRTC code (the plan job decides),
   # nightly and on demand. Its ratchet is
-  # contrib/element-call/allowlist-synapse-peer.txt.
+  # contrib/element-call/allowlist-synapse-peer.txt. Nightly and on demand
+  # it runs a second time with Spindle's built-in minter in the first seat
+  # (#796), against allowlist-builtin-rtc-synapse-peer.txt.
   element-call-synapse-peer:
     needs: plan
     if: needs.plan.outputs.federation_rtc == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rtc: ${{ fromJSON((inputs.element_call_rtc == 'builtin' && '["builtin"]') || (inputs.element_call_rtc == 'lk-jwt-service' && '["lk-jwt-service"]') || (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && '["lk-jwt-service"]') || '["lk-jwt-service","builtin"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -866,13 +892,14 @@ jobs:
         env:
           SPINDLE_IMAGE: complement-spindle:latest
           SPINDLE_PEER: synapse
+          SPINDLE_RTC: ${{ matrix.rtc }}
           ELEMENT_CALL_SRC: tmp/element-call
         run: contrib/element-call/run.sh tmp/element-call-results/results.json
       - name: Keep the report and the server logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: element-call-synapse-peer
+          name: element-call-synapse-peer-${{ matrix.rtc }}
           path: |
             tmp/element-call-results/
             tmp/element-call/playwright-report/

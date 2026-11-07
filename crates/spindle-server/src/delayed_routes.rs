@@ -241,7 +241,7 @@ fn record_cancel(state: &AppState, event: &crate::delayed::DelayedEvent) {
 /// A send that is refused leaves the delay scheduled and answers with the
 /// refusal, as MSC4140 asks: whatever refused it may have changed by its
 /// deadline, and the client may retry until then.
-async fn send_delayed_now(
+pub(crate) async fn send_delayed_now(
     state: &AppState,
     event: &crate::delayed::DelayedEvent,
 ) -> Result<(), MatrixError> {

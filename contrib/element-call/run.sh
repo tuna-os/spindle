@@ -18,6 +18,11 @@
 #   ELEMENT_CALL_SPECS  spec files to run, relative to the checkout's
 #                       playwright/ (default: the variant's subset below)
 #   ELEMENT_CALL_PROJECT  playwright project (default: chromium)
+#   SPINDLE_RTC         who mints the SFU tokens: lk-jwt-service (default),
+#                       upstream's services beside each homeserver, as in
+#                       Element Call's own rig; or builtin, each Spindle's
+#                       own minter (#796), checked against
+#                       allowlist-builtin-rtc.txt
 #
 # Needs docker with compose, node at the checkout's .node-version and
 # corepack for pnpm -- the same things upstream's own CI needs.
@@ -98,9 +103,52 @@ echo "element-call: $(git rev-parse HEAD) with $SPINDLE_IMAGE in the first seat 
 rm -rf playwright/spindle
 cp -r "$contrib/specs" playwright/spindle
 
+# Who mints. With the built-in minter, nginx must also reach the homeservers'
+# `/_spindle/rtc/livekit` (the advertised transport, and the SFU webhook) and
+# each Spindle's SFU must send its webhooks there. Those are lines of
+# upstream's config, so they are rewritten from the pinned files into a
+# directory of their own rather than forked, and the rewrite is checked to
+# have happened: a pattern that stops matching after a pin bump fails here,
+# not as a call that never connects. With SPINDLE_PEER=synapse only the
+# first seat is Spindle: the second keeps upstream's Synapse, lk-jwt-service
+# and SFU config, and the run is checked against its own allowlist.
+minter=()
+case "${SPINDLE_RTC:-lk-jwt-service}" in
+    lk-jwt-service) ;;
+    builtin)
+        generated=backend/spindle-builtin-rtc
+        rm -rf "$generated"
+        mkdir -p "$generated"
+        sed -E 's#\^\(/_matrix\|/_synapse/client\)#^(/_matrix|/_synapse/client|/_spindle/rtc/livekit)#' \
+            backend/dev_nginx.conf > "$generated/dev_nginx.conf"
+        sed 's#https://matrix-rtc.m.localhost/livekit/jwt/sfu_webhook#https://synapse.m.localhost/_spindle/rtc/livekit/sfu/webhook#' \
+            backend/dev_livekit.yaml > "$generated/dev_livekit.yaml"
+        sed 's#https://matrix-rtc.othersite.m.localhost/livekit/jwt/sfu_webhook#https://synapse.othersite.m.localhost/_spindle/rtc/livekit/sfu/webhook#' \
+            backend/dev_livekit-othersite.yaml > "$generated/dev_livekit-othersite.yaml"
+        [[ $(grep -c '/_spindle/rtc/livekit' "$generated/dev_nginx.conf") -eq 2 ]] \
+            || { echo "element-call: dev_nginx.conf no longer has the two homeserver locations" >&2; exit 1; }
+        grep -q 'synapse.m.localhost/_spindle/rtc/livekit/sfu/webhook' "$generated/dev_livekit.yaml" \
+            || { echo "element-call: dev_livekit.yaml no longer names lk-jwt-service's webhook" >&2; exit 1; }
+        grep -q 'synapse.othersite.m.localhost/_spindle/rtc/livekit/sfu/webhook' "$generated/dev_livekit-othersite.yaml" \
+            || { echo "element-call: dev_livekit-othersite.yaml no longer names lk-jwt-service's webhook" >&2; exit 1; }
+        minter=(-f "$contrib/docker-compose-builtin-rtc.yml")
+        if [[ ${SPINDLE_PEER:-spindle} == spindle ]]; then
+            minter+=(-f "$contrib/docker-compose-builtin-rtc-othersite.yml")
+            allowlist=allowlist-builtin-rtc.txt
+        else
+            allowlist=allowlist-builtin-rtc-synapse-peer.txt
+        fi
+        ;;
+    *)
+        echo "element-call: SPINDLE_RTC is lk-jwt-service or builtin, not ${SPINDLE_RTC}" >&2
+        exit 2
+        ;;
+esac
+echo "element-call: SFU tokens minted by ${SPINDLE_RTC:-lk-jwt-service} in the first seat"
+
 # Upstream's stack, with the overrides last so they win.
 compose=(docker compose -f docker-compose-dev.yml -f docker-compose-playwright.yml \
-    -f "$contrib/docker-compose-spindle.yml" -f "$contrib/$second_seat")
+    -f "$contrib/docker-compose-spindle.yml" -f "$contrib/$second_seat" "${minter[@]}")
 logged=(synapse synapse-1)
 dead_peers=()
 if [[ ${SPINDLE_PEER:-spindle} == synapse ]]; then

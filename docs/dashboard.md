@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**305 routes implemented; 0 known gaps in scope.**
+**306 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -150,7 +150,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v1/appservice/fed_proxy`
 - `POST /_matrix/client/v1/appservice/{appservice_id}/ping`
 
-### VoIP & MatrixRTC — 11 implemented, 0 planned
+### VoIP & MatrixRTC — 12 implemented, 0 planned
 
 - `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `POST/GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}`
@@ -161,6 +161,7 @@ neither implemented nor counted.
 - `POST /_matrix/client/v3/user/{user_id}/openid/request_token`
 - `GET /_matrix/client/v3/voip/turnServer`
 - `GET /_matrix/federation/v1/openid/userinfo`
+- `POST /_spindle/rtc/livekit/get_token`
 - `POST /_spindle/rtc/livekit/sfu/get`
 - `POST /_spindle/rtc/livekit/sfu/webhook`
 

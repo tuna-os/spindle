@@ -48,6 +48,7 @@ pub const MOUNTED: &[&str] = &[
     "/_matrix/client/v3/user/{user_id}/openid/request_token",
     "/_matrix/federation/v1/openid/userinfo",
     "/_spindle/rtc/livekit/sfu/get",
+    "/_spindle/rtc/livekit/get_token",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
     "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",

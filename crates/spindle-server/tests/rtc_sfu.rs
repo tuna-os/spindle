@@ -15,15 +15,21 @@
 //! keys and never beside the operator's files; and the supervised binary
 //! is pinned at v1.13.5.
 
+#[path = "support/mock_sfu.rs"]
+mod mock_sfu;
+
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use mock_sfu::{MockSfu, lk_hash, webhook_authorization};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+// Both SFU addresses below are swapped for the harness's stand-in SFU,
+// which answers the room API the minter creates rooms through.
 const REMOTE: &str = r#"
 [rtc.livekit]
 url = "wss://sfu.example.org"
@@ -52,6 +58,7 @@ struct Harness {
     _dir: TempDir,
     store: Arc<FjallStore>,
     app: axum::Router,
+    sfu: MockSfu,
 }
 
 struct Session {
@@ -68,15 +75,20 @@ impl Harness {
 
     fn rebuild_in(dir: TempDir, rtc: &str) -> Self {
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let app = Self::app_for(rtc, Arc::clone(&store));
+        let sfu = MockSfu::start();
+        let app = Self::app_for(rtc, Arc::clone(&store), &sfu);
         Self {
             _dir: dir,
             store,
             app,
+            sfu,
         }
     }
 
-    fn app_for(rtc: &str, store: Arc<FjallStore>) -> axum::Router {
+    fn app_for(rtc: &str, store: Arc<FjallStore>, sfu: &MockSfu) -> axum::Router {
+        let rtc = rtc
+            .replace("wss://sfu.example.org", &sfu.url)
+            .replace("wss://127.0.0.1:7880", &sfu.url);
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n{rtc}"
         ))
@@ -86,7 +98,7 @@ impl Harness {
 
     /// A new app over the same store: what a restart sees.
     fn restart(&mut self, rtc: &str) {
-        self.app = Self::app_for(rtc, Arc::clone(&self.store));
+        self.app = Self::app_for(rtc, Arc::clone(&self.store), &self.sfu);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -111,6 +123,20 @@ impl Harness {
         }
         self.call(request.body(Body::from(body.to_string())).unwrap())
             .await
+    }
+
+    /// Deliver a webhook body with `authorization` as its `Authorization`.
+    async fn webhook(&self, authorization: &str, body: &str) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("POST")
+                .uri(WEBHOOK)
+                .header("authorization", authorization)
+                .header("content-type", "application/webhook+json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
     }
 
     async fn get(&self, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -227,7 +253,7 @@ async fn status_reports_the_model_and_defaults_to_the_config() {
     assert_eq!(body["configured"], true);
     assert_eq!(body["model"], "remote");
     assert_eq!(body["switch"], Value::Null, "never flipped");
-    assert_eq!(body["sfu_url"], "wss://sfu.example.org");
+    assert_eq!(body["sfu_url"], harness.sfu.url);
     assert_eq!(body["version_pin"], "v1.13.5");
     assert_eq!(body["supervised"]["health"], "remote");
 
@@ -424,7 +450,7 @@ async fn the_local_model_mints_identically_and_reports_supervision() {
         StatusCode::OK,
         "same minter, supervised or not: {body}"
     );
-    assert_eq!(body["url"], "wss://127.0.0.1:7880");
+    assert_eq!(body["url"], harness.sfu.url);
     assert!(
         body["jwt"]
             .as_str()
@@ -439,7 +465,7 @@ async fn the_local_model_mints_identically_and_reports_supervision() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["url"], "wss://127.0.0.1:7880");
+    assert_eq!(body["url"], harness.sfu.url);
 }
 
 /// MSC4195's homeserver endpoint: the access token is the credential, the
@@ -456,11 +482,11 @@ async fn get_token_mints_over_the_access_token() {
             .post(path, Some(&alice.access_token), json!({ "room_id": room }))
             .await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
-        assert_eq!(body["url"], "wss://sfu.example.org", "{path}");
+        assert_eq!(body["url"], harness.sfu.url, "{path}");
         let jwt = body["jwt"].as_str().expect("a jwt");
         let claims: Value =
             serde_json::from_slice(&base64url_decode(jwt.split('.').nth(1).unwrap())).unwrap();
-        assert_eq!(claims["video"]["room"], room);
+        assert_eq!(claims["video"]["room"], lk_hash(&[&room, "m.call#ROOM"]));
         assert_eq!(
             claims["sub"],
             format!("{}:{}", alice.user_id, alice.device_id),
@@ -481,6 +507,30 @@ async fn get_token_mints_over_the_access_token() {
     ))
     .unwrap();
     assert_eq!(claims["sub"], format!("{}:EXTRA", alice.user_id));
+
+    // With a MatrixRTC member, the identity is the Matrix 2.0 hash and the
+    // room the slot's.
+    let (status, body) = harness
+        .post(
+            GET_TOKEN_STABLE,
+            Some(&alice.access_token),
+            json!({
+                "room_id": room,
+                "slot_id": "m.call#ROOM",
+                "member": { "id": "member-1", "claimed_device_id": alice.device_id },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claims: Value = serde_json::from_slice(&base64url_decode(
+        body["jwt"].as_str().unwrap().split('.').nth(1).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        claims["sub"],
+        lk_hash(&[&alice.user_id, &alice.device_id, "member-1"])
+    );
+    assert_eq!(claims["video"]["canPublish"], true);
 
     let (status, body) = harness
         .post(
@@ -556,41 +606,39 @@ async fn delegation_is_held_then_released_by_sfu_events() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["held_delegations"], 1);
 
-    // A stranger's key releases nothing.
-    let (status, _) = harness
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri(WEBHOOK)
-                .header("authorization", "wrong-key")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "event": "participant_left",
-                            "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } })
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let left = json!({ "event": "participant_left",
+        "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } })
+    .to_string();
 
+    // A stranger's secret releases nothing, and neither does the SFU's own
+    // signature over some other body.
+    let joined = json!({ "event": "participant_joined" }).to_string();
+    for (authorization, what) in [
+        (
+            webhook_authorization("APIkey", "wrong-secret", &left),
+            "a stranger's secret",
+        ),
+        (
+            webhook_authorization("APIkey", "not-the-signing-key", &joined),
+            "a signature over another body",
+        ),
+        ("APIkey".to_owned(), "the bare key"),
+    ] {
+        let (status, _) = harness.webhook(&authorization, &left).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+    }
+
+    let both = json!({ "events": [
+        { "event": "participant_joined",
+          "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } },
+        { "event": "participant_left",
+          "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } },
+    ]})
+    .to_string();
     let (status, body) = harness
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri(WEBHOOK)
-                .header("authorization", "APIkey")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "events": [
-                        { "event": "participant_joined",
-                          "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } },
-                        { "event": "participant_left",
-                          "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } },
-                    ]})
-                    .to_string(),
-                ))
-                .unwrap(),
+        .webhook(
+            &webhook_authorization("APIkey", "not-the-signing-key", &both),
+            &both,
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -602,6 +650,49 @@ async fn delegation_is_held_then_released_by_sfu_events() {
     let (status, body) = harness.get(ADMIN, Some(&alice.access_token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["held_delegations"], 0);
+}
+
+/// A Matrix 2.0 participant's `LiveKit` identity is a hash, and the SFU's
+/// webhook says nothing else about them: the hold records that identity
+/// from the member the delegation request names, and a webhook releases
+/// that participant's hold and no other's.
+#[tokio::test]
+async fn a_matrix_2_hold_is_released_by_its_hashed_identity() {
+    let harness = Harness::with(REMOTE);
+    let alice = harness.register("alice").await;
+    harness.make_admin(&alice);
+    let room = harness.create_room(&alice).await;
+    for (delay_id, member_id) in [("hold-a", "member-a"), ("hold-b", "member-b")] {
+        let (status, body) = harness
+            .post(
+                DELEGATE,
+                Some(&alice.access_token),
+                json!({
+                    "room_id": room,
+                    "slot_id": "m.call#ROOM",
+                    "member": { "id": member_id, "claimed_device_id": alice.device_id },
+                    "delay_id": delay_id,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let left = json!({ "event": "participant_left", "participant": {
+        "identity": lk_hash(&[&alice.user_id, &alice.device_id, "member-a"]),
+    } })
+    .to_string();
+    let (status, body) = harness
+        .webhook(
+            &webhook_authorization("APIkey", "not-the-signing-key", &left),
+            &left,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["released"], 1, "member-a's hold only: {body}");
+    let (_, body) = harness.get(ADMIN, Some(&alice.access_token)).await;
+    assert_eq!(body["held_delegations"], 1, "member-b's hold stays");
 }
 
 /// Unconfigured, the delegation probe is the 404 Element Call reads as
@@ -621,8 +712,9 @@ async fn unconfigured_the_probe_is_a_404() {
     assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
 }
 
-/// The generated sidecar config carries the SFU's keys, self-creating
-/// rooms and the webhook — and lands away from the operator's files.
+/// The generated sidecar config carries the SFU's keys, leaves room
+/// creation to the minter, points the webhook here — and lands away from
+/// the operator's files.
 #[test]
 fn sidecar_config_generation_carries_the_keys_and_the_webhook() {
     let dir = TempDir::new().unwrap();
@@ -644,7 +736,7 @@ fn sidecar_config_generation_carries_the_keys_and_the_webhook() {
     let rendered = std::fs::read_to_string(&generated).unwrap();
     assert!(rendered.contains("APIkey"), "{rendered}");
     assert!(rendered.contains("not-the-signing-key"), "{rendered}");
-    assert!(rendered.contains("auto_create: true"), "{rendered}");
+    assert!(rendered.contains("auto_create: false"), "{rendered}");
     assert!(
         rendered.contains("https://matrix.example.org/_spindle/rtc/livekit/sfu/webhook"),
         "{rendered}"
