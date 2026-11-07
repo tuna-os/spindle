@@ -282,11 +282,14 @@ pub const SERVICE_PATH: &str = "/_spindle/rtc/livekit";
 /// The `livekit_service_url` a client is told, when the service is on.
 #[must_use]
 pub fn service_url(config: &crate::Config) -> Option<String> {
-    config
-        .rtc
-        .livekit
-        .as_ref()
-        .map(|_| format!("{}{SERVICE_PATH}", config.client_base_url()))
+    // `public_base_url` is often written with a trailing slash, and a
+    // doubled one in the advertised URL is a different path to a proxy.
+    config.rtc.livekit.as_ref().map(|_| {
+        format!(
+            "{}{SERVICE_PATH}",
+            config.client_base_url().trim_end_matches('/')
+        )
+    })
 }
 
 /// The switch, read.
@@ -1505,7 +1508,7 @@ fn render_config(config: &crate::Config) -> Result<(PathBuf, String), String> {
     let path = generated_config_path(config);
     let webhook_url = format!(
         "{}/_spindle/rtc/livekit/sfu/webhook",
-        config.client_base_url()
+        config.client_base_url().trim_end_matches('/')
     );
     // Rooms are made by the minter, for this server's users (and listed
     // servers'), through the room API; a participant's join never makes

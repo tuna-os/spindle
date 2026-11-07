@@ -907,3 +907,20 @@ fn misconfiguration_is_refused_at_startup() {
         "publishing on this SFU is granted server by server"
     );
 }
+
+/// `public_base_url` is often written with a trailing slash; the
+/// advertised transport must not double it, because a doubled slash is a
+/// different path to a reverse proxy, and clients append `/sfu/get` to it.
+#[test]
+fn a_trailing_slash_on_the_base_url_is_not_doubled() {
+    let config = spindle_server::Config::parse(
+        "[server]\nname = \"example.org\"\npublic_base_url = \"https://matrix.example.org/\"\n\
+         [rtc.livekit]\nurl = \"wss://sfu.example.org\"\nkey = \"k\"\nsecret = \"s\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        spindle_server::livekit::service_url(&config).as_deref(),
+        Some("https://matrix.example.org/_spindle/rtc/livekit")
+    );
+}
