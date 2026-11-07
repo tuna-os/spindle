@@ -60,7 +60,8 @@ pub enum Origin {
 ///
 /// Five outcomes are the receipt checks' own verdicts; `refused` is
 /// everything refused before them -- a bad signature, an unknown room --
-/// so the series add up to every PDU received.
+/// and `recovery_pending` is a PDU answered before its dependency recovery
+/// ended, so the series add up to every PDU received.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PduOutcome {
     /// Appended to the timeline through the ordinary receipt checks,
@@ -78,16 +79,20 @@ pub enum PduOutcome {
     RefusedMissingDeps,
     /// Refused before any receipt check.
     Refused,
+    /// Answered while its dependency recovery was still running (#808). The
+    /// recovery continues, and places the event if it succeeds.
+    Pending,
 }
 
 impl PduOutcome {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Accepted,
         Self::GapAccepted,
         Self::SoftFailed,
         Self::Rejected,
         Self::RefusedMissingDeps,
         Self::Refused,
+        Self::Pending,
     ];
 
     fn label(self) -> &'static str {
@@ -98,6 +103,7 @@ impl PduOutcome {
             Self::Rejected => "rejected",
             Self::RefusedMissingDeps => "refused_missing_deps",
             Self::Refused => "refused",
+            Self::Pending => "recovery_pending",
         }
     }
 }
@@ -142,6 +148,32 @@ impl RecoveryResult {
             Self::Timeout => "timeout",
             Self::Invalid => "invalid",
             Self::NegativeCached => "negative_cached",
+        }
+    }
+}
+
+/// What became of a PDU that needs a dependency recovery, at the gate that
+/// keeps a room's recoveries few (#808).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryAdmission {
+    /// A new recovery was started for it.
+    Started,
+    /// The recovery of the same event was in flight, and it waited for
+    /// that one: a retried PDU.
+    Joined,
+    /// Refused at once: the room had as many recoveries in flight as it
+    /// can have.
+    Busy,
+}
+
+impl RecoveryAdmission {
+    const ALL: [Self; 3] = [Self::Started, Self::Joined, Self::Busy];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Joined => "joined",
+            Self::Busy => "busy",
         }
     }
 }
@@ -330,6 +362,8 @@ pub struct Metrics {
     pdu_outcomes: [[AtomicU64; PduOutcome::ALL.len()]; 2],
     /// Predecessor recovery attempts by result ([`RecoveryResult`]).
     recovery_attempts: [AtomicU64; RecoveryResult::ALL.len()],
+    /// PDUs at the recovery gate by what it decided ([`RecoveryAdmission`]).
+    recovery_admissions: [AtomicU64; RecoveryAdmission::ALL.len()],
     recovery_latency: Family,
     /// Bodies fetched from peers by recovery or gap acceptance ([`FetchKind`]).
     recovery_fetched: [AtomicU64; FetchKind::ALL.len()],
@@ -428,6 +462,7 @@ impl Default for Metrics {
             sync_lag: Family::default(),
             pdu_outcomes: Default::default(),
             recovery_attempts: Default::default(),
+            recovery_admissions: Default::default(),
             recovery_latency: Family::default(),
             recovery_fetched: Default::default(),
             gap_acceptances: Default::default(),
@@ -1678,6 +1713,12 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record what the recovery gate decided about one PDU.
+    pub fn record_recovery_admission(&self, admission: RecoveryAdmission) {
+        self.recovery_admissions[slot(&RecoveryAdmission::ALL, admission)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one predecessor recovery attempt against one peer, and how
     /// long it took.
     pub fn record_recovery(&self, result: RecoveryResult, elapsed: Duration) {
@@ -1766,6 +1807,12 @@ impl Metrics {
 
     /// Read one counter, for tests that assert a metric actually moved.
     #[must_use]
+    pub fn recovery_admission_count(&self, admission: RecoveryAdmission) -> u64 {
+        self.recovery_admissions[slot(&RecoveryAdmission::ALL, admission)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
     pub fn fetched_count(&self, kind: FetchKind) -> u64 {
         self.recovery_fetched[slot(&FetchKind::ALL, kind)].load(Ordering::Relaxed)
     }
@@ -1807,6 +1854,19 @@ impl Metrics {
                 "spindle_federation_recovery_attempts_total{{result=\"{}\"}} {}",
                 result.label(),
                 self.recovery_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_admissions_total PDUs that need a \
+         dependency recovery, by what the per-room gate decided.\n\
+         # TYPE spindle_federation_recovery_admissions_total counter\n",
+        );
+        for admission in RecoveryAdmission::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_admissions_total{{result=\"{}\"}} {}",
+                admission.label(),
+                self.recovery_admission_count(admission)
             );
         }
         out.push_str(
@@ -2876,6 +2936,10 @@ mod tests {
         metrics.record_fetched(FetchKind::Predecessor, 2);
         metrics.record_gap(GapResult::Accepted);
         metrics.observe_state_ids("ok", Duration::from_millis(400));
+        metrics.record_pdu(PduOutcome::Pending, false);
+        metrics.record_recovery_admission(RecoveryAdmission::Joined);
+        metrics.record_recovery_admission(RecoveryAdmission::Busy);
+        metrics.record_recovery_admission(RecoveryAdmission::Busy);
 
         assert_eq!(metrics.pdu_count(PduOutcome::GapAccepted), 2);
         assert_eq!(metrics.relayed_pdu_count(PduOutcome::GapAccepted, true), 1);
@@ -2888,12 +2952,22 @@ mod tests {
         assert_eq!(metrics.fetched_count(FetchKind::Predecessor), 2);
         assert_eq!(metrics.fetched_count(FetchKind::Auth), 0);
         assert_eq!(metrics.gap_count(GapResult::Accepted), 1);
+        assert_eq!(metrics.pdu_count(PduOutcome::Pending), 1);
+        assert_eq!(
+            metrics.recovery_admission_count(RecoveryAdmission::Started),
+            0
+        );
+        assert_eq!(metrics.recovery_admission_count(RecoveryAdmission::Busy), 2);
 
         let text = metrics.render();
         for line in [
             "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"false\"} 1",
             "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"true\"} 1",
             "spindle_federation_recovery_attempts_total{result=\"rate_limited\"} 1",
+            "spindle_federation_pdus_received_total{result=\"recovery_pending\",relayed=\"false\"} 1",
+            "spindle_federation_recovery_admissions_total{result=\"started\"} 0",
+            "spindle_federation_recovery_admissions_total{result=\"joined\"} 1",
+            "spindle_federation_recovery_admissions_total{result=\"busy\"} 2",
             "spindle_federation_recovery_events_fetched_total{kind=\"gap_state\"} 7",
             "spindle_federation_gap_acceptances_total{result=\"accepted\"} 1",
             // Twelve seconds lands in the ten-to-thirty bucket, which the

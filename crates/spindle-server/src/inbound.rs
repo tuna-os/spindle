@@ -241,7 +241,9 @@ pub(crate) async fn receive_from_hub(
         let event_id = pdu["event_id"].as_str().unwrap_or("$ours").to_owned();
         return (event_id, Ok(()));
     }
-    recovery::receive(state, hub, None, pdu).await
+    // As long as `/send` waits for a recovery: this answer is awaited too.
+    let deadline = tokio::time::Instant::now() + recovery::SEND_BUDGET;
+    recovery::receive(state, hub, None, pdu, deadline).await
 }
 
 /// The version a received PDU is to be read under.
@@ -291,15 +293,38 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
 /// A PDU whose sender is on another server is relayed: the origin sends it
 /// for that server, as the spec permits. It verifies against the keys of
 /// the sender's server, which `recovery::receive` gets when it needs them.
+///
+/// The PDUs of one room are judged in order, and the rooms side by side
+/// (#808). A PDU that waits for its dependency recovery until `deadline`
+/// holds back only the later PDUs of its own room, which can need the
+/// events that recovery places.
 async fn receive_pdus(
     state: &AppState,
     origin: &str,
     key_map: Option<&crate::federation::PeerKeys>,
     pdus: &[Value],
+    deadline: tokio::time::Instant,
 ) -> serde_json::Map<String, Value> {
-    let mut results = serde_json::Map::new();
+    // At most fifty PDUs, so a scan finds the room of each.
+    let mut rooms: Vec<(Option<&str>, Vec<&Value>)> = Vec::new();
     for pdu in pdus {
-        let (event_id, outcome) = recovery::receive(state, origin, key_map, pdu).await;
+        let room = pdu["room_id"].as_str();
+        match rooms.iter_mut().find(|(id, _)| *id == room) {
+            Some((_, group)) => group.push(pdu),
+            None => rooms.push((room, vec![pdu])),
+        }
+    }
+    let judged = futures_util::future::join_all(rooms.into_iter().map(|(_, group)| async move {
+        let mut judged = Vec::with_capacity(group.len());
+        for pdu in group {
+            let verdict = recovery::receive(state, origin, key_map, pdu, deadline).await;
+            judged.push((pdu, verdict));
+        }
+        judged
+    }))
+    .await;
+    let mut results = serde_json::Map::new();
+    for (pdu, (event_id, outcome)) in judged.into_iter().flatten() {
         let result = match outcome {
             Ok(()) => json!({}),
             Err(reason) => {
@@ -484,12 +509,19 @@ pub(crate) fn join_candidates(
 /// applied — for the origin's own users only, so no server can put words
 /// in another's hands — keys, to-device messages and device lists go to
 /// `e2ee_federation`, and the rest are accepted, counted and dropped.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction's checks and work, read top to bottom"
+)]
 pub(crate) async fn send_transaction(
     state: AppState,
     headers: axum::http::HeaderMap,
     txn_id: String,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<Value>, MatrixError> {
+    // The budget runs from arrival, so time spent waiting for keys or for
+    // a turn below comes out of the recovery's share, not the sender's.
+    let deadline = tokio::time::Instant::now() + recovery::SEND_BUDGET;
     let uri = request
         .uri()
         .path_and_query()
@@ -556,7 +588,9 @@ pub(crate) async fn send_transaction(
         crate::blocking::offload_async(
             std::sync::Arc::clone(&state.metrics),
             crate::metrics::BlockingTask::FederationSend,
-            move || async move { receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await },
+            move || async move {
+                receive_pdus(&state, &origin, key_map.as_ref(), &pdus, deadline).await
+            },
         )
         .await?
     };

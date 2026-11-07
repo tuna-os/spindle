@@ -3414,6 +3414,7 @@ dependencies = [
  "blake3",
  "criterion",
  "form_urlencoded",
+ "futures-util",
  "hickory-resolver",
  "hmac",
  "image",

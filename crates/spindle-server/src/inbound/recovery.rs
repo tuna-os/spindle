@@ -17,6 +17,12 @@
 //! duplicate requests`). A later PDU waits for the recovery in flight, then
 //! tries the ordinary path first, which is usually enough: the event before
 //! it was just placed.
+//!
+//! `/send` waits for a recovery only until [`SEND_BUDGET`] (#808). The
+//! recovery runs as a task of its own and goes on past that; the PDU is
+//! answered as still pending, and the recovery places the event when it
+//! finishes. A retried PDU joins the recovery in flight for it, and a room
+//! holds at most [`MAX_ROOM_RECOVERIES`] at once.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -24,11 +30,14 @@ use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::AppState;
 use crate::blocking::spawn_detached;
 use crate::federation::{Federation, FederationError, PeerKeys};
-use crate::metrics::{BlockingTask, FetchKind, GapResult, Metrics, PduOutcome, RecoveryResult};
+use crate::metrics::{
+    BlockingTask, FetchKind, GapResult, Metrics, PduOutcome, RecoveryAdmission, RecoveryResult,
+};
 use crate::rooms::{RoomError, Rooms};
 use crate::signing::ServerKey;
 
@@ -40,10 +49,32 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// append. Longer than a recovery, because its walk is wider and it is the
 /// last resort before refusing.
 const GAP_TIMEOUT: Duration = Duration::from_secs(90);
-/// How long a PDU waits for another recovery in the same room to finish
-/// before it is refused as missing its dependencies, to be retried with the
-/// transaction.
-const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+/// How long `/send` waits for the dependency recoveries of its PDUs,
+/// counted from the arrival of the transaction (#808). Synapse's federation
+/// client gives up on a request after `federation.client_timeout_ms`, 60 s
+/// by default. Its catch-up (`_catch_up_transmission_loop`) sends one
+/// transaction for each room, oldest room first, and ends the pass at the
+/// first transaction that fails. So one room whose recovery holds the
+/// answer past 60 s stops the delivery of every room after it. Twenty
+/// seconds leaves a wide margin under that timeout for the key fetches and
+/// the room work around the recoveries. A recovery that is still running
+/// at the budget is not cancelled: it continues detached.
+pub(super) const SEND_BUDGET: Duration = Duration::from_secs(20);
+/// The recoveries that one room can have in flight at once (#808): one that
+/// has the room's turn and one that waits for it. A third PDU that needs a
+/// recovery is refused at once. With no limit, a sender that retries can
+/// keep detached work queued for a room long after it stopped waiting for
+/// the answers. A refused event is not lost: the recovery of a later event
+/// that names it gets it with the rest of the history between.
+const MAX_ROOM_RECOVERIES: usize = 2;
+
+/// What became of one PDU, as `/send` answers it.
+type Verdict = (PduOutcome, Result<(), String>);
+
+/// The recoveries in flight in one room: each event, and the channel its
+/// verdict is published on.
+type InFlight = Vec<(String, watch::Receiver<Option<Verdict>>)>;
+
 /// How long a peer that answered 429 is left alone for one room and one
 /// kind of request, when it does not say. Clamped to a sane range when it
 /// does, so a peer cannot switch recovery off for a day or ask to be
@@ -132,10 +163,10 @@ type CooldownKey = (String, String, Endpoint);
 /// recovery and gap acceptance failed, whoever was asked.
 type FailedKey = (String, Option<String>);
 
-/// Per-room single flight for dependency recovery, the peers this server
-/// is leaving alone after they answered 429, the dependencies that
-/// failed verification lately, and the turns inbound transactions take at
-/// room work.
+/// Per-room single flight for dependency recovery, the recoveries in flight,
+/// the peers this server is leaving alone after they answered 429, the
+/// dependencies that failed verification lately, and the turns inbound
+/// transactions take at room work.
 ///
 /// Process-local on purpose: all of it is about requests made right now.
 /// A restart forgets them, which costs at most one more request per peer.
@@ -144,6 +175,10 @@ pub struct RecoveryGate {
     /// One async lock per room with a recovery in flight. Weak, so a room
     /// nobody is recovering holds nothing; dead entries are swept on entry.
     rooms: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// `room` -> each event whose recovery is in flight there, and where
+    /// its verdict is published (#808). At most [`MAX_ROOM_RECOVERIES`]
+    /// for each room; a room with none has no entry.
+    inflight: Mutex<HashMap<String, InFlight>>,
     /// `(room, peer, endpoint)` -> not before.
     cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
     /// When each room and each origin was last admitted to a gap
@@ -166,6 +201,7 @@ impl RecoveryGate {
     pub fn new(failure_ttl: Duration) -> Self {
         Self {
             rooms: Mutex::default(),
+            inflight: Mutex::default(),
             cooldowns: Mutex::default(),
             gap_admissions: Mutex::default(),
             failed: Mutex::default(),
@@ -200,6 +236,48 @@ impl RecoveryGate {
             }
         };
         lock.lock_owned().await
+    }
+
+    /// Admit the recovery of `event_id` in `room_id` (#808): join the one
+    /// in flight for the same event, start one if the room has a place
+    /// for it, or refuse when it does not.
+    pub(super) fn admit(self: &Arc<Self>, room_id: &str, event_id: &str) -> Admission {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = inflight.entry(room_id.to_owned()).or_default();
+        if let Some((_, verdict)) = running.iter().find(|(id, _)| id == event_id) {
+            return Admission::Join(verdict.clone());
+        }
+        if running.len() >= MAX_ROOM_RECOVERIES {
+            return Admission::Busy;
+        }
+        let (sender, verdict) = watch::channel(None);
+        running.push((event_id.to_owned(), verdict.clone()));
+        Admission::Start(
+            Ticket {
+                gate: Arc::clone(self),
+                room_id: room_id.to_owned(),
+                event_id: event_id.to_owned(),
+                verdict: sender,
+            },
+            verdict,
+        )
+    }
+
+    /// Free the place of a recovery that ended.
+    fn release(&self, room_id: &str, event_id: &str) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(running) = inflight.get_mut(room_id) {
+            running.retain(|(id, _)| id != event_id);
+            if running.is_empty() {
+                inflight.remove(room_id);
+            }
+        }
     }
 
     /// Whether `peer` asked to be left alone for this room and endpoint.
@@ -361,6 +439,42 @@ impl RecoveryGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(room_id);
+    }
+}
+
+/// What [`RecoveryGate::admit`] decided about one PDU's recovery.
+pub(super) enum Admission {
+    /// Run the recovery and publish its verdict on the ticket. The receiver
+    /// gets that verdict.
+    Start(Ticket, watch::Receiver<Option<Verdict>>),
+    /// The recovery of this event is in flight: wait for its verdict.
+    Join(watch::Receiver<Option<Verdict>>),
+    /// The room has [`MAX_ROOM_RECOVERIES`] in flight.
+    Busy,
+}
+
+/// The place of one recovery in [`RecoveryGate`]'s registry. When it is
+/// dropped the place is free again, also after a panic, so a recovery that
+/// failed cannot hold its room's place. A PDU that waits for a ticket that
+/// was dropped without a verdict sees the channel close.
+pub(super) struct Ticket {
+    gate: Arc<RecoveryGate>,
+    room_id: String,
+    event_id: String,
+    verdict: watch::Sender<Option<Verdict>>,
+}
+
+impl Ticket {
+    /// Give the verdict to every PDU that waits for it, and free the place.
+    /// The verdict is sent first, so a PDU that joins in between gets it.
+    fn publish(self, verdict: Verdict) {
+        self.verdict.send_replace(Some(verdict));
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.gate.release(&self.room_id, &self.event_id);
     }
 }
 
@@ -694,17 +808,21 @@ fn signature_refusal(
 /// The signatures in the PDU, not the origin, identify the sender's
 /// server: `verify` gets the keys of each server that the room version
 /// requires.
+///
+/// A dependency recovery is waited for until `deadline` at most (#808); see
+/// [`SEND_BUDGET`].
 pub(super) async fn receive(
     state: &AppState,
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
+    deadline: tokio::time::Instant,
 ) -> (String, Result<(), String>) {
     let relayed = pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
         .is_some_and(|(_, domain)| domain != origin);
-    let (id, outcome, result) = Box::pin(judge(state, origin, origin_keys, pdu)).await;
+    let (id, outcome, result) = Box::pin(judge(state, origin, origin_keys, pdu, deadline)).await;
     state.metrics.record_pdu(outcome, relayed);
     (id, result)
 }
@@ -746,6 +864,7 @@ async fn judge(
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
+    deadline: tokio::time::Instant,
 ) -> (String, PduOutcome, Result<(), String>) {
     let Some(room_id) = pdu["room_id"].as_str() else {
         return (
@@ -835,40 +954,90 @@ async fn judge(
         return (event.id, outcome, result);
     }
 
-    // The rest runs as its own task, so a sending server that gives up on
-    // the transaction does not cancel a recovery halfway: the work finishes,
-    // and the transaction's retry finds the event already placed. It holds
-    // the room's turn for as long as it runs. A blocking-pool task rather
-    // than a spawned one: it ingests what it fetched and resolves state
-    // over it, which on a worker held that worker for as long (#614).
+    // The recovery runs as its own task, so a sending server that gives up
+    // on the transaction does not cancel it halfway, and this request stops
+    // waiting for it at the deadline (#808). It holds the room's turn for
+    // as long as it runs. A blocking-pool task rather than a spawned one:
+    // it ingests what it fetched and resolves state over it, which on a
+    // worker held that worker for as long (#614).
     let id = event.id.clone();
-    let task = {
-        let state = state.clone();
-        let origin = origin.to_owned();
-        let room_id = room_id.to_owned();
-        async move {
-            let Ok(turn) =
-                tokio::time::timeout(RECOVERY_WAIT, state.recovery.enter(&room_id)).await
-            else {
-                return (
-                    PduOutcome::RefusedMissingDeps,
-                    Err("another dependency recovery for this room is still running".to_owned()),
-                );
-            };
-            let outcome = resolve(&state, &origin, &room_id, &version, &event, &mut keys).await;
-            drop(turn);
-            outcome
+    let verdict = match state.recovery.admit(room_id, &id) {
+        Admission::Busy => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Busy);
+            return (
+                id,
+                PduOutcome::RefusedMissingDeps,
+                Err(format!(
+                    "{error}; this room already has {MAX_ROOM_RECOVERIES} dependency \
+                     recoveries in flight, so this event is not recovered now"
+                )),
+            );
+        }
+        Admission::Join(verdict) => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Joined);
+            verdict
+        }
+        Admission::Start(ticket, verdict) => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Started);
+            let state = state.clone();
+            let origin = origin.to_owned();
+            let room_id = room_id.to_owned();
+            // The handle is dropped: the task runs to its end.
+            drop(spawn_detached(
+                Arc::clone(&state.metrics),
+                BlockingTask::FederationCatchUp,
+                async move {
+                    let turn = state.recovery.enter(&room_id).await;
+                    let verdict =
+                        resolve(&state, &origin, &room_id, &version, &event, &mut keys).await;
+                    drop(turn);
+                    ticket.publish(verdict);
+                },
+            ));
+            verdict
         }
     };
-    let metrics = Arc::clone(&state.metrics);
-    match spawn_detached(metrics, BlockingTask::FederationCatchUp, task).await {
-        Ok((outcome, result)) => (id, outcome, result),
-        Err(error) => (
-            id,
-            PduOutcome::RefusedMissingDeps,
-            Err(format!("dependency recovery failed: {error}")),
+    let (outcome, result) = wait_for_verdict(verdict, deadline).await;
+    (id, outcome, result)
+}
+
+/// The verdict of a recovery in flight, or [`PduOutcome::Pending`] if it is
+/// still running at `deadline`.
+///
+/// A pending PDU gets an error string, not `{}`. The recovery can still
+/// fail, and `{}` says that the event was received. Senders do not resend
+/// an event for an error in the PDU results of a transaction that was
+/// answered 200: Synapse logs it and goes on. Spindle's own sender does the
+/// same. So the error costs the sender nothing, and the recovery still
+/// places the event when it succeeds.
+async fn wait_for_verdict(
+    mut verdict: watch::Receiver<Option<Verdict>>,
+    deadline: tokio::time::Instant,
+) -> Verdict {
+    match tokio::time::timeout_at(deadline, verdict.wait_for(Option::is_some)).await {
+        Ok(Ok(held)) => held.clone().unwrap_or_else(recovery_lost),
+        // The task ended with no verdict: it panicked.
+        Ok(Err(_)) => recovery_lost(),
+        Err(_) => (
+            PduOutcome::Pending,
+            Err("dependency recovery for this event is still running; \
+                 it continues, and places the event if it succeeds"
+                .to_owned()),
         ),
     }
+}
+
+fn recovery_lost() -> Verdict {
+    (
+        PduOutcome::RefusedMissingDeps,
+        Err("dependency recovery failed".to_owned()),
+    )
 }
 
 /// The predecessors and auth events the event names that this room lacks,
@@ -1462,5 +1631,41 @@ mod tests {
         gate.distrust_at(now, "!room", None, ["$named"]);
         assert_eq!(gate.failed_at(now, "!room", None, ["$named"]), None);
         assert_eq!(held(&gate), 0);
+    }
+
+    /// #808: the same event joins the recovery in flight for it, a room has
+    /// at most two in flight, another room is not counted against it, and a
+    /// ticket dropped without a verdict frees its place and closes the
+    /// channel of whoever waits.
+    #[test]
+    fn a_room_holds_two_recoveries_and_a_retry_joins_its_own() {
+        let gate = Arc::new(RecoveryGate::new(Duration::ZERO));
+        let Admission::Start(first, _) = gate.admit("!room", "$first") else {
+            panic!("the first recovery starts");
+        };
+        let Admission::Join(mut joined) = gate.admit("!room", "$first") else {
+            panic!("a retry joins the recovery in flight");
+        };
+        let Admission::Start(second, _) = gate.admit("!room", "$second") else {
+            panic!("one more recovery waits for the room's turn");
+        };
+        assert!(matches!(gate.admit("!room", "$third"), Admission::Busy));
+        assert!(matches!(
+            gate.admit("!other", "$third"),
+            Admission::Start(..)
+        ));
+
+        first.publish((PduOutcome::Accepted, Ok(())));
+        assert!(matches!(
+            *joined.borrow_and_update(),
+            Some((PduOutcome::Accepted, Ok(())))
+        ));
+        let Admission::Start(third, waiting) = gate.admit("!room", "$third") else {
+            panic!("a finished recovery frees its place");
+        };
+        drop(third);
+        assert!(waiting.has_changed().is_err(), "a lost recovery closes");
+        drop(second);
+        assert!(gate.inflight.lock().unwrap().is_empty());
     }
 }
