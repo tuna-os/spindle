@@ -63,13 +63,13 @@ to let back in.
 ## Amendment: the frozen unauthenticated surface is served
 
 Clients showed that the authenticated routes were not the whole story.
-This server claims no spec version past v1.3 and sends no MSC3916 flag.
-So nothing moves a client to the authenticated endpoints.
+This server claims no spec version past v1.3. Before this change it sent
+no MSC3916 flag. So nothing moved a client to the authenticated endpoints.
 
 Clients that predate those endpoints fetch avatars and thumbnails from
 the frozen
 `/_matrix/media/v3/download` and `/thumbnail` endpoints. Those fetches
-get 404s. The spec froze those endpoints but keeps them. All reference
+got 404s. The spec froze those endpoints but keeps them. All reference
 servers still serve them.
 
 The server now serves them as pure capability URLs. It returns the same

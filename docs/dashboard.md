@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**302 routes implemented; 0 known gaps in scope.**
+**305 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -232,7 +232,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags`
 - `PUT/DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}`
 
-### Media — 8 implemented, 0 planned
+### Media — 11 implemented, 0 planned
 
 - `GET /_matrix/client/v1/media/config`
 - `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
@@ -240,6 +240,9 @@ neither implemented nor counted.
 - `GET /_matrix/client/v1/media/preview_url`
 - `GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}`
 - `GET /_matrix/media/v3/config`
+- `GET /_matrix/media/v3/download/{server_name}/{media_id}`
+- `GET /_matrix/media/v3/download/{server_name}/{media_id}/{file_name}`
+- `GET /_matrix/media/v3/thumbnail/{server_name}/{media_id}`
 - `POST /_matrix/media/v3/upload`
 - `PUT /_matrix/media/v3/upload/{server_name}/{media_id}`
 
