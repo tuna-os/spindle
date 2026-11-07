@@ -10,11 +10,11 @@ and the diff is the work the release brought.
 
 ## Client-Server API
 
-142 of 166 operations served.
+145 of 166 operations served.
 
 ### Not served, in the spec since before v1.1
 
-8 of these are deprecated upstream and can stay unserved.
+5 of these are deprecated upstream and can stay unserved.
 
 - `POST /_matrix/client/v3/account/3pid` *(deprecated)* — `administrative_contact.yaml`
 - `POST /_matrix/client/v3/account/3pid/bind` — `administrative_contact.yaml`
@@ -35,10 +35,7 @@ and the diff is the work the release brought.
 - `GET /_matrix/client/v3/thirdparty/protocols` — `third_party_lookup.yaml`
 - `GET /_matrix/client/v3/thirdparty/user` — `third_party_lookup.yaml`
 - `GET /_matrix/client/v3/thirdparty/user/{protocol}` — `third_party_lookup.yaml`
-- `GET /_matrix/media/v3/download/{serverName}/{mediaId}` *(deprecated)* — `content-repo.yaml`
-- `GET /_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}` *(deprecated)* — `content-repo.yaml`
 - `GET /_matrix/media/v3/preview_url` *(deprecated)* — `content-repo.yaml`
-- `GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}` *(deprecated)* — `content-repo.yaml`
 
 ### Not served, added in v1.18
 
@@ -47,6 +44,9 @@ and the diff is the work the release brought.
 ### Served, but deprecated upstream
 
 - `GET /_matrix/media/v3/config` — `content-repo.yaml`
+- `GET /_matrix/media/v3/download/{serverName}/{mediaId}` — `content-repo.yaml`
+- `GET /_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}` — `content-repo.yaml`
+- `GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}` — `content-repo.yaml`
 
 ## Server-Server API
 

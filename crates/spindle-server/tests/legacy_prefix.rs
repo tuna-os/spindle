@@ -88,3 +88,83 @@ async fn r0_is_served_as_v3_with_its_query_string_intact() {
     let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
     assert_eq!(body["errcode"], "M_UNRECOGNIZED");
 }
+
+#[tokio::test]
+async fn r0_media_download_and_thumbnail_ride_the_frozen_v3_routes() {
+    // The `r0` media prefix rewrites to `v3`, so the frozen unauthenticated
+    // download and thumbnail live under both spellings. A client old enough
+    // to ask for `r0` gets bytes, not `M_UNRECOGNIZED`.
+    let (_dir, name) = start().await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!(
+            "http://{name}/_matrix/client/r0/register?kind=user"
+        ))
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "username": "r0-uploader",
+                "password": "hunter2",
+                "auth": { "type": "m.login.dummy", "session": "s" },
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    let token = body["access_token"].as_str().expect("a token").to_owned();
+
+    let mut png = Vec::new();
+    let mut image = image::RgbImage::new(8, 8);
+    for pixel in image.pixels_mut() {
+        *pixel = image::Rgb([0, 0, 255]);
+    }
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let response = client
+        .post(format!(
+            "http://{name}/_matrix/media/r0/upload?filename=dot.png"
+        ))
+        .bearer_auth(&token)
+        .header("content-type", "image/png")
+        .body(png.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    let mxc = body["content_uri"].as_str().expect("an mxc URI").to_owned();
+    let rest = mxc.strip_prefix("mxc://").expect("mxc scheme");
+    let (server, media_id) = rest.split_once('/').expect("server/id");
+
+    // No token attached: the frozen surface is capability-addressed.
+    let response = client
+        .get(format!(
+            "http://{name}/_matrix/media/r0/download/{server}/{media_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().to_vec(), png);
+
+    let response = client
+        .get(format!(
+            "http://{name}/_matrix/media/r0/thumbnail/{server}/{media_id}?width=50&height=50"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+}

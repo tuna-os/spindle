@@ -11,13 +11,17 @@ use serde_json::{Value, json};
 
 /// Uploading and fetching files.
 ///
-/// Only the authenticated surface. The unauthenticated `/media/v3/download`
-/// endpoints are deliberately absent: the spec froze and deprecated them
-/// because an unauthenticated media URL is a capability that leaks the moment
-/// it is pasted anywhere, and serving them would undo the access control the
-/// authenticated endpoints exist to impose. A client old enough to need them
-/// gets a 404, which is the truthful answer for a surface this server does not
-/// offer.
+/// The authenticated surface, plus the frozen unauthenticated download and
+/// thumbnail endpoints as pure capability URLs.
+///
+/// The spec froze and deprecated the unauthenticated `/media/v3/download`
+/// endpoints, but did not remove them, and every reference server still
+/// serves them — while this server advertises no spec version or flag that
+/// would move a client onto the authenticated ones, refusing them turns
+/// every avatar and thumbnail in those clients into a 404. Media IDs are
+/// 128 random bits (ADR 0003), so possession of the URI is the capability
+/// here exactly as it is on the authenticated routes; the only difference
+/// is that no token is bound alongside it.
 pub fn routes(max_upload_bytes: usize) -> Router<AppState> {
     Router::new()
         .route(
@@ -58,6 +62,18 @@ pub fn routes(max_upload_bytes: usize) -> Router<AppState> {
         .route(
             "/_matrix/client/v1/media/thumbnail/{server_name}/{media_id}",
             get(thumbnail_media),
+        )
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}",
+            get(download_media_legacy),
+        )
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}/{file_name}",
+            get(download_media_legacy_named),
+        )
+        .route(
+            "/_matrix/media/v3/thumbnail/{server_name}/{media_id}",
+            get(thumbnail_media_legacy),
         )
         .route(
             "/_matrix/federation/v1/media/thumbnail/{media_id}",
@@ -211,10 +227,10 @@ async fn media_config(State(state): State<AppState>) -> Json<Value> {
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
 async fn download_media(
     State(state): State<AppState>,
-    AccountAuthenticated(identity): AccountAuthenticated,
+    AccountAuthenticated(_identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &identity, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
 }
 
 /// The same, with a filename the client would like the browser to use.
@@ -225,36 +241,111 @@ async fn download_media(
 /// `.exe` in someone's downloads folder.
 async fn download_media_named(
     State(state): State<AppState>,
-    AccountAuthenticated(identity): AccountAuthenticated,
+    AccountAuthenticated(_identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &identity, &server_name, &media_id).await
+    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
 }
 
-/// The identity is authenticated and then, by ADR 0003, not consulted:
-/// possession of the URI is the capability, as the spec and every reference
-/// server have it. The binding is what makes the route require a token at
-/// all. `docs/architecture-decisions/0003-media-authorization.md` says why,
-/// and what would supersede it.
-async fn serve_media(
+/// `GET /_matrix/media/v3/download/{server_name}/{media_id}`, and the
+/// `{file_name}` twin.
+///
+/// The frozen unauthenticated surface, served as a pure capability URL:
+/// the media ID is 128 random bits (ADR 0003), so holding the URI is the
+/// authorization, exactly as on the authenticated routes — only without a
+/// token bound alongside it. This is what clients that predate MSC3916, or
+/// that gate on a spec version this server does not claim, ask for; without
+/// it every avatar and thumbnail in those clients is a 404.
+///
+/// Frozen as Synapse freezes it: remote media is served only once this
+/// server has cached it, and is never fetched on an unauthenticated
+/// request. A fetch there would let anyone with no account make this
+/// server download, and keep, whatever a peer of their choosing serves.
+async fn download_media_legacy(
+    State(state): State<AppState>,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+) -> Result<axum::response::Response, MatrixError> {
+    serve_media(&state, &server_name, &media_id, Remote::CachedOnly).await
+}
+
+/// The same, with a filename the client would like the browser to use.
+///
+/// As on the authenticated twin, the name in the path is ignored in favour
+/// of the one recorded at upload.
+async fn download_media_legacy_named(
+    State(state): State<AppState>,
+    axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Result<axum::response::Response, MatrixError> {
+    serve_media(&state, &server_name, &media_id, Remote::CachedOnly).await
+}
+
+/// What a media route may do about remote media this server holds no copy
+/// of.
+#[derive(Debug, Clone, Copy)]
+enum Remote {
+    /// Fetch it over federation and cache it: the authenticated routes.
+    Fetch,
+    /// Answer from the cache alone: the frozen unauthenticated routes. An
+    /// uncached item is the plain `M_NOT_FOUND` an unknown local ID gets,
+    /// with nothing about any peer in it.
+    CachedOnly,
+}
+
+/// The local store ID that `server_name`/`media_id` is served from: the ID
+/// itself for this server's media, the cache ID for a peer's.
+async fn stored_media_id(
     state: &AppState,
-    _identity: &crate::accounts::Identity,
     server_name: &str,
     media_id: &str,
+    remote: Remote,
+) -> Result<String, MatrixError> {
+    if state.media.is_ours(server_name) {
+        return Ok(media_id.to_owned());
+    }
+    match remote {
+        Remote::Fetch => cached_remote_media(state, server_name, media_id).await,
+        Remote::CachedOnly => {
+            let cache_id = crate::media::Media::remote_id(server_name, media_id);
+            let cached = state
+                .media
+                .record(&cache_id)
+                .map_err(|error| media_error(&error))?
+                .is_some();
+            if cached {
+                Ok(cache_id)
+            } else {
+                Err(media_error(&crate::media::MediaError::Unknown(
+                    media_id.to_owned(),
+                )))
+            }
+        }
+    }
+}
+
+/// Serves the bytes for a media URI the caller holds, local or federated.
+/// On the authenticated routes the caller additionally presents a token
+/// (bound and then, by ADR 0003, not consulted); on the frozen legacy
+/// routes the URI alone is the capability, as the spec and every reference
+/// server have it. `docs/architecture-decisions/0003-media-authorization.md`
+/// says why, and what would supersede it.
+async fn serve_media(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+    remote: Remote,
 ) -> Result<axum::response::Response, MatrixError> {
-    let media_id = if state.media.is_ours(server_name) {
-        media_id.to_owned()
-    } else {
-        cached_remote_media(state, server_name, media_id).await?
-    };
-    let media_id = media_id.as_str();
+    let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     let (record, bytes) = state
         .media
-        .bytes(media_id)
+        .bytes(&media_id)
         .await
         .map_err(|error| media_error(&error))?;
 
@@ -461,11 +552,32 @@ async fn thumbnail_media(
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    let media_id = if state.media.is_ours(&server_name) {
-        media_id
-    } else {
-        cached_remote_media(&state, &server_name, &media_id).await?
-    };
+    serve_thumbnail(&state, &server_name, &media_id, query, Remote::Fetch).await
+}
+
+/// `GET /_matrix/media/v3/thumbnail/{server_name}/{media_id}`.
+///
+/// The frozen unauthenticated twin of the route above, served as a pure
+/// capability URL for the same reason [`download_media_legacy`] gives, and
+/// frozen the same way: remote media only from the cache. This is the
+/// endpoint clients fetch avatars and thumbnails from until they move to
+/// authenticated media.
+async fn thumbnail_media_legacy(
+    State(state): State<AppState>,
+    axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
+) -> Result<axum::response::Response, MatrixError> {
+    serve_thumbnail(&state, &server_name, &media_id, query, Remote::CachedOnly).await
+}
+
+async fn serve_thumbnail(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+    query: ThumbnailQuery,
+    remote: Remote,
+) -> Result<axum::response::Response, MatrixError> {
+    let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     if query.width == 0 || query.height == 0 {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,

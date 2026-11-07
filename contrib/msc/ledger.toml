@@ -234,6 +234,7 @@ number = 3916
 title = "Authenticated media"
 status = "served"
 stable = "1.11"
+unstable = ["org.matrix.msc3916"]
 evidence = ["crates/spindle-server/tests/federation_media.rs", "crates/spindle-server/tests/media.rs", "crates/spindle-server/tests/spec_wave2.rs"]
 
 [[msc]]

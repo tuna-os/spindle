@@ -6,16 +6,19 @@
 //! repeat downloads, thumbnails — is served from local storage.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
-/// One full homeserver on a real TCP listener, named by its own address.
+/// One full homeserver on a real TCP listener, named by its own address,
+/// counting every request it is sent.
 struct Instance {
     _dir: TempDir,
     name: String,
     client: reqwest::Client,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Instance {
@@ -34,7 +37,16 @@ impl Instance {
             dir.path().display(),
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let app = spindle_server::app(config, store)
+            .expect("the app builds")
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    next.run(request)
+                },
+            ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -47,6 +59,7 @@ impl Instance {
             _dir: dir,
             name,
             client: reqwest::Client::new(),
+            requests,
         }
     }
 
@@ -109,6 +122,21 @@ impl Instance {
             .to_owned();
         let bytes = response.bytes().await.unwrap().to_vec();
         (status, content_type, bytes)
+    }
+
+    /// An unauthenticated `GET` of `path`: status, the body parsed (or
+    /// `Value::Null` when it is not JSON), and the raw bytes.
+    async fn get(&self, path: &str) -> (u16, Value, Vec<u8>) {
+        let response = self
+            .client
+            .get(format!("http://{}{path}", self.name))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.unwrap().to_vec();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body, bytes)
     }
 }
 
@@ -207,4 +235,79 @@ async fn media_nobody_has_stays_a_404_not_a_fabrication() {
     // or a fabricated empty file.
     let (status, _, _) = mirror.download(&bob, "127.0.0.1:9", "whatever").await;
     assert_eq!(status, 404);
+}
+
+/// The frozen unauthenticated routes never fetch: remote media this server
+/// has not cached is a plain 404 that names no peer, and the peer is not
+/// asked. Once an authenticated download has cached it, they serve it.
+#[tokio::test]
+async fn the_legacy_routes_serve_cached_remote_media_and_never_fetch_it() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let media_id = origin
+        .upload(&alice, "image/png", "photo.png", &small_png())
+        .await;
+    let legacy = [
+        format!("/_matrix/media/v3/download/{}/{media_id}", origin.name),
+        format!(
+            "/_matrix/media/v3/download/{}/{media_id}/photo.png",
+            origin.name
+        ),
+        format!(
+            "/_matrix/media/v3/thumbnail/{}/{media_id}?width=32&height=32",
+            origin.name
+        ),
+    ];
+
+    let before = origin.requests.load(Ordering::SeqCst);
+    for path in &legacy {
+        let (status, body, _) = mirror.get(path).await;
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "{path}: {body}");
+        assert!(
+            !body["error"].as_str().unwrap().contains(&origin.name),
+            "the answer names no peer: {body}"
+        );
+    }
+    assert_eq!(
+        origin.requests.load(Ordering::SeqCst),
+        before,
+        "an unauthenticated request made no federation request"
+    );
+
+    // A peer that is not there gets the same plain answer: no fetch is
+    // tried, so there is no federation error to repeat.
+    let (status, body, _) = mirror
+        .get("/_matrix/media/v3/download/127.0.0.1:9/whatever")
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+    assert!(
+        !body["error"].as_str().unwrap().contains("127.0.0.1:9"),
+        "{body}"
+    );
+
+    // An authenticated download fetches the file and caches it...
+    let (status, _, bytes) = mirror.download(&bob, &origin.name, &media_id).await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, small_png());
+    let after_fetch = origin.requests.load(Ordering::SeqCst);
+    assert!(after_fetch > before, "the authenticated route fetched");
+
+    // ...and from then on the legacy routes serve it, from the cache.
+    for path in &legacy[..2] {
+        let (status, _, bytes) = mirror.get(path).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(bytes, small_png(), "{path}");
+    }
+    let (status, _, bytes) = mirror.get(&legacy[2]).await;
+    assert_eq!(status, 200);
+    image::load_from_memory(&bytes).expect("a decodable thumbnail");
+    assert_eq!(
+        origin.requests.load(Ordering::SeqCst),
+        after_fetch,
+        "the legacy routes served the cached copy"
+    );
 }
