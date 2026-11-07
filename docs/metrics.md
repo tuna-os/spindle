@@ -32,6 +32,8 @@ the incident it was supposed to explain.
 | `spindle_http_requests_total` | counter | `route`, `method`, `status` | Requests served. |
 | `spindle_http_request_duration_seconds` | histogram | `route` | Time to serve one request, in the wide buckets (0.1 ms to 120 s). A sync that was allowed to long-poll -- classic `/sync` or sliding sync with a `since`/`pos` and a non-zero `timeout` -- is timed under its route with ` (long-poll)` appended (for example `route="/_matrix/client/v3/sync (long-poll)"`), so its intentional wait does not become the route's p95. An initial sync, or one with `timeout=0`, stays under the plain template. `spindle_http_requests_total` keeps the plain template for both. |
 | `spindle_federation_queue_depth` | gauge | `destination` | Events waiting to go out, per peer. |
+| `spindle_federation_destinations_backing_off` | gauge | `backoff` = `short`\|`long` | Destinations whose last delivery failed. `short` ones are retried at least once a minute. `long` ones have failed for ten minutes or more: each waits as long as it has been down, up to a day, or until it sends this server a request. Many `long` destinations is normal on a server in large public rooms; it is the dead servers in them. |
+| `spindle_federation_catch_up_dropped_total` | counter | — | Queued events that a destination down for ten minutes or more will not get: its queue is cut to the newest ten events of each room, and the peer fetches older ones if it wants them. To-device messages and device-list updates are never dropped. |
 | `spindle_federation_edus_received_total` | counter | `edu_type` = `m.typing`\|`m.receipt`\|`m.presence`\|`m.direct_to_device`\|`m.device_list_update`\|`m.signing_key_update`\|`other`, `result` = `accepted`\|`ignored`\|`malformed`\|`unsupported` | EDUs peers sent in transactions. `ignored` is well-formed but nothing applied (a user not on the origin, not in the room, an origin the room's server ACL denies, an unknown event). `unsupported` is a type this server does not act on: unknown types, and `m.presence` when `[presence] enabled = false`, so its volume shows up here before anyone switches it on. For to-device, device-list and signing-key EDUs `accepted` means handed to the handler, which runs its own checks. |
 | `spindle_federation_edus_sent_total` | counter | `edu_type` (as above) | EDUs put into outbound transactions. Read receipts are coalesced per destination, so one `m.receipt` carries every waiting reader. |
 | `spindle_federation_receipts_received_total` | counter | `result` = `accepted`\|`foreign_user`\|`not_joined`\|`denied`\|`unknown_event`\|`unsupported_type`\|`malformed`\|`over_limit` | Read receipts inside inbound `m.receipt` EDUs. Only `m.read` federates; `unsupported_type` counts anything else, `m.read.private` included. `denied` is an origin the room's server ACL denies. `over_limit` is past the 500-per-EDU bound. |
@@ -175,6 +177,15 @@ messages, device-list updates and key updates) wait in a different
 outbox. They go in the same transactions. Thus a peer that waits for
 only those EDUs shows 0 here. The admin API `federation/destinations`
 shows its failures and its backoff.
+
+A server that stays down does not keep its queue. After ten minutes of
+failures, its wait grows with the outage, up to a day. The outbox also
+cuts its queue to the newest ten events of each room
+(`spindle_federation_catch_up_dropped_total`). A request from that server
+ends the wait at once. Thus a queue depth that stays high for one
+destination is a live peer that is slow, not a dead one.
+`spindle_federation_destinations_backing_off{backoff="long"}` counts the
+dead ones.
 
 ```promql
 topk(5, spindle_federation_queue_depth)

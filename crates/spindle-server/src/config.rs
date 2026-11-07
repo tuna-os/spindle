@@ -1141,9 +1141,12 @@ pub struct FederationConfig {
     #[serde(default)]
     pub allow_internal: Vec<String>,
     /// Base retry delay for outbound delivery, milliseconds. Doubles per
-    /// consecutive failure per destination, capped at 64× unless the peer
-    /// has a `max_backoff_ms` of its own below. Tests shrink it; operators
-    /// should not need to touch it.
+    /// consecutive failure per destination, capped at 64×; once a
+    /// destination has failed for 600× this (ten minutes at the default),
+    /// each wait is as long as the outage so far, up to a day, and the
+    /// destination is caught up rather than sent its backlog. A peer with a
+    /// `max_backoff_ms` of its own below keeps doubling to that cap
+    /// instead. Tests shrink it; operators should not need to touch it.
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
     /// Peers reached by configuration rather than by resolving their name,
@@ -1481,12 +1484,14 @@ pub struct PeerConfig {
     /// rather than turning authentication off for every peer.
     pub url: String,
     /// The longest this server waits between delivery attempts while the
-    /// peer is unreachable, milliseconds. Unset means the ordinary cap of
-    /// 64× `retry_base_ms`, about a minute. A peer that is expected to be
-    /// dark for hours -- a phone, a gateway on a venue uplink -- is given
-    /// hours here, so that its queue waits at the cost of one connection
-    /// attempt per period rather than one a minute. Nothing queued is
-    /// dropped either way; rows leave the outbox only when the peer
+    /// peer is unreachable, milliseconds. Unset means the ordinary
+    /// schedule: at most 64× `retry_base_ms`, about a minute, for the first
+    /// ten minutes of an outage, then as long as the outage so far, up to
+    /// a day, with the peer's queue cut to each room's newest events. A
+    /// peer that is expected to be dark for hours -- a phone, a gateway on
+    /// a venue uplink -- is given hours here, so that its queue waits at
+    /// the cost of one connection attempt per period. Nothing queued for
+    /// such a peer is dropped; its rows leave the outbox only when it
     /// acknowledges them.
     #[serde(default)]
     pub max_backoff_ms: Option<u64>,

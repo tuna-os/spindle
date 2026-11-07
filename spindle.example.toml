@@ -185,8 +185,11 @@ insecure_http = false
 allow_internal = []
 
 # Base retry delay for outbound delivery, in milliseconds. Doubles per
-# consecutive failure per destination, capped at 64×. Tests shrink it;
-# operators should not need to touch it.
+# consecutive failure per destination, capped at 64×. A destination failing
+# for 600× this (ten minutes at the default) then waits as long as it has
+# been down, up to a day, or until it sends this server a request; when it
+# returns it gets each room's newest events, not the whole backlog. Tests
+# shrink it; operators should not need to touch it.
 retry_base_ms = 1000
 
 # Peers reached by configuration rather than by resolving their name: a
@@ -194,7 +197,7 @@ retry_base_ms = 1000
 # (docs/mesh-federation.md). `url` is scheme, host and port, no path; http is
 # allowed here without `insecure_http`. `max_backoff_ms` is the longest wait
 # between delivery attempts while the peer is unreachable -- hours for a peer
-# that is expected to be dark -- and nothing queued is dropped either way.
+# that is expected to be dark -- and nothing queued for such a peer is dropped.
 # peers = { "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" = { url = "http://10.20.0.5:8008", max_backoff_ms = 3600000 } }
 
 # Notaries asked for a peer's signing keys when the peer cannot answer for

@@ -7,9 +7,10 @@
 //! shares a room with, every server with deliveries waiting in the
 //! outbox, and every server the outbox has tried since this process
 //! started. The retry columns come from the outbox loop
-//! (`Federation::delivery_health`), so they say how delivery stands now,
-//! and a restart starts them afresh, which is also when the outbox
-//! retries every destination at once.
+//! (`Federation::delivery_health`), so they say how delivery stands now.
+//! A destination that was failing when the process stopped is reported,
+//! and waited on, as failing after it starts: the outbox keeps its backoff
+//! in the store (#801).
 
 use std::collections::{BTreeMap, BTreeSet};
 

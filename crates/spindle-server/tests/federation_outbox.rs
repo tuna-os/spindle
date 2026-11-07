@@ -8,7 +8,10 @@
 //! more rows getting a new one so the replay table cannot swallow them,
 //! and delivery surviving a server rebuild over the same directory -- for
 //! PDUs, and for the EDUs a peer cannot ask for again (to-device messages,
-//! device-list updates), while typing stays fire-once.
+//! device-list updates), while typing stays fire-once. And for a peer
+//! that stays down (#801): a wait that grows with the outage, survives a
+//! restart and ends when the peer speaks to us, and a catch-up that sends
+//! a returning peer each room's newest events rather than its backlog.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +20,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ruma::signatures::Ed25519KeyPair;
 use serde_json::{Value, json};
+use spindle_server::federation::DeliveryHealth;
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -32,6 +37,9 @@ struct Stub {
     refuse: Arc<AtomicUsize>,
     /// The attempts refused, recorded like deliveries.
     refused: Arc<Mutex<Vec<Delivery>>>,
+    /// The key it signs its own requests with, served at
+    /// `/_matrix/key/v2/server`.
+    pair: Ed25519KeyPair,
 }
 
 impl Stub {
@@ -45,6 +53,14 @@ impl Stub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address: SocketAddr = listener.local_addr().unwrap();
         let name = format!("127.0.0.1:{}", address.port());
+        let document = Ed25519KeyPair::generate();
+        let pair = Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap();
+        let mut key_document = json!({
+            "server_name": name,
+            "valid_until_ts": now_millis() + 600_000,
+            "verify_keys": { "ed25519:0": { "key": unpadded(&pair.public_key()) } },
+        });
+        sign_value(&name, &pair, &mut key_document);
 
         let record = Arc::clone(&deliveries);
         let gate = Arc::clone(&refuse);
@@ -96,6 +112,13 @@ impl Stub {
                         axum::Json(json!({ "event": body["event"] }))
                     },
                 ),
+            )
+            .route(
+                "/_matrix/key/v2/server",
+                axum::routing::get(move || {
+                    let document = key_document.clone();
+                    async move { axum::Json(document) }
+                }),
             );
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -105,7 +128,34 @@ impl Stub {
             deliveries,
             refuse,
             refused,
+            pair,
         }
+    }
+
+    /// A signed request from this peer to `destination`'s `uri`, the way a
+    /// homeserver signs one.
+    fn authorization(&self, method: &str, uri: &str, destination: &str, body: &Value) -> String {
+        let mut object = json!({
+            "method": method,
+            "uri": uri,
+            "origin": self.name,
+            "destination": destination,
+            "content": body,
+        });
+        sign_value(&self.name, &self.pair, &mut object);
+        let signature = object["signatures"][&self.name]["ed25519:0"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        format!(
+            "X-Matrix origin=\"{}\",destination=\"{destination}\",key=\"ed25519:0\",sig=\"{signature}\"",
+            self.name
+        )
+    }
+
+    /// Every attempt this peer has seen, refused or accepted.
+    fn attempts(&self) -> usize {
+        self.refused.lock().unwrap().len() + self.deliveries.lock().unwrap().len()
     }
 
     fn user(&self) -> String {
@@ -154,23 +204,68 @@ struct Harness {
     dir: TempDir,
     store: Arc<FjallStore>,
     app: axum::Router,
+    state: spindle_server::AppState,
+    retry_base_ms: u64,
 }
 
 impl Harness {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let app = Self::build(&store);
-        Self { dir, store, app }
+        Self::with_retry_base(50)
     }
 
-    fn build(store: &Arc<FjallStore>) -> axum::Router {
-        let config = spindle_server::Config::parse(
+    /// A server whose outbox backs off from `retry_base_ms`: a destination
+    /// down for 600 times that is in its long wait (#801).
+    fn with_retry_base(retry_base_ms: u64) -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let (app, state) = Self::build(&store, retry_base_ms);
+        Self {
+            dir,
+            store,
+            app,
+            state,
+            retry_base_ms,
+        }
+    }
+
+    fn build(
+        store: &Arc<FjallStore>,
+        retry_base_ms: u64,
+    ) -> (axum::Router, spindle_server::AppState) {
+        let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
-             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
-        )
+             [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n\
+             retry_base_ms = {retry_base_ms}\n",
+        ))
         .unwrap();
-        spindle_server::app(config, Arc::clone(store)).expect("the app builds")
+        spindle_server::app_with_state(
+            config,
+            Arc::clone(store),
+            Arc::new(spindle_server::metrics::Metrics::new()),
+        )
+        .expect("the app builds")
+    }
+
+    /// How the outbox stands with `destination`.
+    fn health(&self, destination: &str) -> DeliveryHealth {
+        self.state
+            .federation
+            .delivery_health()
+            .remove(destination)
+            .unwrap_or_default()
+    }
+
+    /// Wait, up to `seconds`, until the outbox waits at least `millis`
+    /// between attempts at `destination`.
+    async fn wait_for_backoff(&self, destination: &str, millis: u64, seconds: u64) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(seconds) {
+            if self.health(destination).retry_interval >= millis {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     /// A second server over the same store.
@@ -181,7 +276,7 @@ impl Harness {
     /// rows are read back from the store by the new server's drain loop,
     /// which is what "survive a rebuild" means here.
     fn restart(&mut self) {
-        self.app = Self::build(&self.store);
+        (self.app, self.state) = Self::build(&self.store, self.retry_base_ms);
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -316,6 +411,28 @@ impl Harness {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A transaction from `stub` with nothing in it: the peer talking to
+    /// us, as a server back up does.
+    async fn hear_from(&self, stub: &Stub, txn: &str) {
+        let uri = format!("/_matrix/federation/v1/send/{txn}");
+        let body = json!({ "origin": stub.name, "origin_server_ts": now_millis(), "pdus": [] });
+        let (status, answer) = self
+            .call(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header(
+                        "authorization",
+                        stub.authorization("PUT", &uri, "example.org", &body),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
     }
 
     async fn start_typing(&self, room: &str, token: &str) {
@@ -770,4 +887,224 @@ async fn a_live_peer_is_not_kept_waiting_behind_dead_servers() {
         arrived,
         "the live peer got nothing within 10 s while dead servers were owed rows"
     );
+}
+
+fn sign_value(entity: &str, pair: &Ed25519KeyPair, value: &mut Value) {
+    let ruma::CanonicalJsonValue::Object(mut object) =
+        ruma::CanonicalJsonValue::try_from(value.clone()).unwrap()
+    else {
+        unreachable!()
+    };
+    ruma::signatures::sign_json(entity, pair, &mut object).unwrap();
+    *value = serde_json::to_value(&object).unwrap();
+}
+
+fn unpadded(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let byte = |index: usize| -> u32 { chunk.get(index).copied().unwrap_or(0).into() };
+        let triple = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for position in 0..=chunk.len() {
+            out.push(ALPHABET[((triple >> (18 - 6 * position)) & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap()
+}
+
+/// The `retry_base_ms` of the #801 tests: 5 ms, so an outage is long after
+/// 600 times that, three seconds, and its wait is seconds long too.
+const FAST_BASE_MS: u64 = 5;
+
+/// #801: a peer down for long is waited on for as long as it has been down
+/// -- not once a minute forever -- and the wait ends the moment the peer
+/// sends us a request, as Synapse's does.
+#[tokio::test]
+async fn a_long_dead_peer_waits_as_long_as_it_was_down_until_it_speaks_to_us() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let harness = Harness::with_retry_base(FAST_BASE_MS);
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    harness.say(&room, &alice, "while you were out", "t1").await;
+
+    // The old cap was 64× the base, 320 ms here; six seconds is the
+    // outage's own length.
+    assert!(
+        harness.wait_for_backoff(&stub.name, 6_000, 20).await,
+        "the wait never grew past the fast phase: {:?}",
+        harness.health(&stub.name)
+    );
+    stub.refuse.store(0, Ordering::SeqCst);
+    let attempts = stub.attempts();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(stub.attempts(), attempts, "the wait was not kept");
+    assert_eq!(
+        harness.state.metrics.destinations_backing_off(),
+        (0, 1),
+        "counted as one destination in its long wait"
+    );
+
+    // The peer talks to us: it is up, and the wait is over.
+    harness.hear_from(&stub, "back").await;
+    let heard = std::time::Instant::now();
+    let mut arrived = false;
+    while heard.elapsed() < Duration::from_millis(2_000) {
+        if stub
+            .pdus()
+            .iter()
+            .any(|pdu| pdu["content"]["body"] == json!("while you were out"))
+        {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        arrived,
+        "not delivered within 2 s of the peer's request, with seconds of wait left: {:?}",
+        harness.health(&stub.name)
+    );
+    // Healthy again: nothing stored for it any more.
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(2)
+        && !spindle_store::ReadView::scan_prefix(
+            harness.store.as_ref(),
+            &spindle_core::keys::destination_retry_all(),
+        )
+        .unwrap()
+        .is_empty()
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let health = harness.health(&stub.name);
+    assert_eq!(
+        (health.retry_interval, health.failure_ts),
+        (0, None),
+        "{health:?}"
+    );
+    assert!(
+        spindle_store::ReadView::scan_prefix(
+            harness.store.as_ref(),
+            &spindle_core::keys::destination_retry_all(),
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// #801: the wait survives a restart. Without the stored row a restart
+/// tried every dead server at once and started each one's schedule over.
+#[tokio::test]
+async fn a_restart_keeps_waiting_on_a_long_dead_peer() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let mut harness = Harness::with_retry_base(FAST_BASE_MS);
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    harness.say(&room, &alice, "across the restart", "t1").await;
+    assert!(
+        harness.wait_for_backoff(&stub.name, 4_000, 20).await,
+        "{:?}",
+        harness.health(&stub.name)
+    );
+    let attempts = stub.attempts();
+    harness.restart();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(
+        stub.attempts(),
+        attempts,
+        "the restarted server retried at once"
+    );
+    let restored = harness.health(&stub.name);
+    assert!(restored.retry_interval >= 4_000, "{restored:?}");
+    assert!(restored.failure_ts.is_some(), "{restored:?}");
+
+    // And it still delivers once the peer is back and says so.
+    stub.refuse.store(0, Ordering::SeqCst);
+    harness.hear_from(&stub, "back").await;
+    assert!(
+        stub.wait_for(|stub| stub
+            .pdus()
+            .iter()
+            .any(|pdu| pdu["content"]["body"] == json!("across the restart")))
+            .await,
+        "{:?}",
+        stub.delivered()
+    );
+}
+
+/// #801: a peer back from a long outage gets each room's newest events,
+/// not its whole backlog -- it fetches the rest through their
+/// `prev_events` if it wants it -- and every to-device message and
+/// device-list update queued for it, which it could not ask for again.
+#[tokio::test]
+async fn a_peer_back_from_a_long_outage_is_caught_up_and_keeps_its_to_device_messages() {
+    let stub = Stub::start().await;
+    let harness = Harness::with_retry_base(FAST_BASE_MS);
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    assert!(
+        stub.wait_for(|stub| !stub.delivered().is_empty()).await,
+        "the invite reached the peer first"
+    );
+    let before = stub.delivered().len();
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    for index in 0..25 {
+        harness
+            .say(&room, &alice, &format!("m{index}"), &format!("t{index}"))
+            .await;
+    }
+    harness.upload_device_keys(&alice).await;
+    for index in 0..3 {
+        harness
+            .send_to_device(
+                &alice,
+                &stub.user(),
+                &format!("k{index}"),
+                &format!("key {index}"),
+            )
+            .await;
+    }
+    assert!(
+        harness.wait_for_backoff(&stub.name, 3_000, 20).await,
+        "{:?}",
+        harness.health(&stub.name)
+    );
+    // Cut at the failure that found the outage long: fifteen of the
+    // twenty-five messages.
+    assert_eq!(harness.state.metrics.catch_up_dropped(), 15);
+
+    stub.refuse.store(0, Ordering::SeqCst);
+    harness.hear_from(&stub, "back").await;
+    assert!(
+        stub.wait_for(|stub| {
+            let edus = stub.edus();
+            (0..3).all(|index| carries_to_device(&edus, &format!("key {index}")))
+                && carries(&edus, "m.device_list_update")
+                && stub
+                    .pdus()
+                    .iter()
+                    .any(|pdu| pdu["content"]["body"] == json!("m24"))
+        })
+        .await,
+        "{:?}",
+        stub.delivered()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bodies: Vec<String> = stub.delivered()[before..]
+        .iter()
+        .flat_map(|(_, _, body)| body["pdus"].as_array().cloned().unwrap_or_default())
+        .filter_map(|pdu| pdu["content"]["body"].as_str().map(str::to_owned))
+        .collect();
+    let newest: Vec<String> = (15..25).map(|index| format!("m{index}")).collect();
+    assert_eq!(bodies, newest);
+    assert_eq!(harness.state.metrics.destinations_backing_off(), (0, 0));
 }
