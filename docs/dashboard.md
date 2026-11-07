@@ -386,8 +386,8 @@ neither implemented nor counted.
 
 - **Micro-benchmarks** (fork resolution vs ruma-state-res, HAMT vs im,
   storage ops): published automatically to the
-  [benchmark site](https://tuna-os.github.io/spindle/) on every push
-  to main — the numbers in the open are the numbers from the code.
+  [benchmark site](https://tuna-os.github.io/spindle/) every week
+  from main — the numbers in the open are the numbers from the code.
 - **Server-level comparisons** vs Synapse and Continuwuity: measured
   per milestone with `scripts/api-benchmark.py` (same driver, same
   host, same sitting); raw results are committed under
