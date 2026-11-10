@@ -82,6 +82,9 @@ async fn identify(
                 refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
                 Ok(identity)
             }
+            None if accounts.is_expired(&token).unwrap_or(false) => {
+                Err(MatrixError::expired_token())
+            }
             None => Err(MatrixError::unknown_token()),
         },
         Err(error) => Err(MatrixError::internal(&error.to_string())),

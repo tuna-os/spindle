@@ -4,8 +4,8 @@
 //! the ones that fail silently: a token stored in clear still logs you in, and
 //! a user-enumeration oracle still answers correctly.
 
-use spindle_server::accounts::{AccountError, Accounts};
-use spindle_store::{FjallStore, ReadView};
+use spindle_server::accounts::{ACCESS_TOKEN_LIFETIME_MS, AccountError, Accounts};
+use spindle_store::{FjallStore, ReadView, Store};
 use tempfile::TempDir;
 
 fn store() -> (TempDir, FjallStore) {
@@ -309,4 +309,158 @@ fn a_password_hash_written_by_an_older_argon2_still_verifies() {
 
     assert!(accounts.verify_password("legacy", "correct horse").unwrap());
     assert!(!accounts.verify_password("legacy", "wrong horse").unwrap());
+}
+
+/// The one-hour lifetime `expires_in_ms` advertises must be enforced, not
+/// advice: a token the client was told expires must stop working, and the
+/// refresh the client then performs must work.
+#[test]
+fn an_expired_access_token_is_refused_and_a_refresh_replaces_it() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, true).unwrap();
+    let refresh = session.refresh_token.clone().unwrap();
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+
+    assert!(
+        accounts
+            .identify_at(&session.access_token, now + 1_000)
+            .unwrap()
+            .is_some(),
+        "fresh"
+    );
+    let later = now + ACCESS_TOKEN_LIFETIME_MS + 60_000;
+    assert!(
+        accounts
+            .identify_at(&session.access_token, later)
+            .unwrap()
+            .is_none(),
+        "an access token past its lifetime must be refused"
+    );
+
+    let renewed = accounts.refresh(&refresh).unwrap();
+    assert!(
+        accounts.identify(&renewed.access_token).unwrap().is_some(),
+        "the refreshed token works"
+    );
+}
+
+/// A token without a refresh token cannot be renewed, so expiring it would
+/// only log its client out.
+#[test]
+fn a_token_without_a_refresh_token_never_expires() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, false).unwrap();
+    let far = u64::MAX / 2;
+    assert!(
+        accounts
+            .identify_at(&session.access_token, far)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Rows written before tokens carried an issue time must keep working, so an
+/// upgrade does not sign everyone out.
+#[test]
+fn a_token_row_from_before_expiry_existed_still_authenticates() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, true).unwrap();
+
+    // Rewrite every token row the way the previous version stored it.
+    let mut rewritten = 0;
+    for prefix in 0x00_u8..=0x0f {
+        for (key, value) in store.scan_prefix(&[prefix]).unwrap() {
+            let Ok(mut row) = serde_json::from_slice::<serde_json::Value>(&value) else {
+                continue;
+            };
+            if row.get("issued_at_ms").is_some() {
+                row.as_object_mut().unwrap().remove("issued_at_ms");
+                store.put(&key, row.to_string().as_bytes()).unwrap();
+                rewritten += 1;
+            }
+        }
+    }
+    assert!(rewritten >= 1, "no token row carried a timestamp to strip");
+
+    let far = u64::MAX / 2;
+    assert!(
+        accounts
+            .identify_at(&session.access_token, far)
+            .unwrap()
+            .is_some(),
+        "an old-format row must keep authenticating"
+    );
+}
+
+/// Logging out ends the session, not just the token presented: the refresh
+/// token would otherwise mint a working pair afterwards.
+#[test]
+fn logout_ends_the_refresh_token_and_the_device_too() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, true).unwrap();
+    let refresh = session.refresh_token.clone().unwrap();
+    let other = accounts.create_session("alice", None, None, true).unwrap();
+
+    accounts.logout(&session.access_token).unwrap();
+
+    assert!(matches!(
+        accounts.refresh(&refresh),
+        Err(AccountError::UnknownToken)
+    ));
+    assert!(
+        accounts
+            .device("alice", &session.device.device_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        accounts.identify(&other.access_token).unwrap().is_some(),
+        "another device's session is untouched"
+    );
+}
+
+/// Revocation names either half of the pair (RFC 7009), and either ends the
+/// whole session.
+#[test]
+fn ending_a_session_by_its_refresh_token_kills_the_access_token() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, true).unwrap();
+
+    accounts
+        .logout(session.refresh_token.as_deref().unwrap())
+        .unwrap();
+    assert!(accounts.identify(&session.access_token).unwrap().is_none());
+    assert!(accounts.logout("unknown").unwrap().is_none());
+}
+
+/// Rotation must retire the access token it replaces, or every refresh
+/// leaves one more token that is good until the device is deleted.
+#[test]
+fn refreshing_retires_the_previous_access_token() {
+    let (_dir, store) = store();
+    let accounts = Accounts::new(&store, "example.org");
+    accounts.register("alice", "correct horse").unwrap();
+    let session = accounts.create_session("alice", None, None, true).unwrap();
+
+    let renewed = accounts
+        .refresh(session.refresh_token.as_deref().unwrap())
+        .unwrap();
+    assert!(accounts.identify(&session.access_token).unwrap().is_none());
+    assert!(accounts.identify(&renewed.access_token).unwrap().is_some());
 }

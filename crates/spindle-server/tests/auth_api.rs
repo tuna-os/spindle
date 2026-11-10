@@ -674,3 +674,131 @@ async fn unknown_endpoints_answer_m_unrecognized_json() {
         assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{path}: {body}");
     }
 }
+
+async fn register_refreshing(harness: &Harness) -> Value {
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/register",
+            &json!({
+                "username": "alice",
+                "password": "hunter2",
+                "refresh_token": true,
+                "auth": { "type": "m.login.dummy", "session": "register" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// Signing out of a client that refreshes must end the session: afterwards
+/// the refresh token it held mints nothing, and the device is gone.
+#[tokio::test]
+async fn logout_ends_a_refreshing_session() {
+    let harness = Harness::new();
+    let body = register_refreshing(&harness).await;
+    let access = body["access_token"].as_str().unwrap();
+    let refresh = body["refresh_token"].as_str().unwrap();
+
+    let (status, _) = harness
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/logout")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, refused) = harness
+        .post(
+            "/_matrix/client/v3/refresh",
+            &json!({ "refresh_token": refresh }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+    assert_eq!(refused["errcode"], "M_UNKNOWN_TOKEN");
+}
+
+/// Refreshing replaces the pair; the access token it replaces stops working.
+#[tokio::test]
+async fn refreshing_ends_the_previous_access_token() {
+    let harness = Harness::new();
+    let body = register_refreshing(&harness).await;
+    let old_access = body["access_token"].as_str().unwrap();
+
+    let (status, refreshed) = harness
+        .post(
+            "/_matrix/client/v3/refresh",
+            &json!({ "refresh_token": body["refresh_token"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+
+    let (status, refused) = harness
+        .get_auth("/_matrix/client/v3/account/whoami", old_access)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+    let (status, _) = harness
+        .get_auth(
+            "/_matrix/client/v3/account/whoami",
+            refreshed["access_token"].as_str().unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// An access token past its lifetime answers as the spec asks of a client
+/// that can refresh (`M_UNKNOWN_TOKEN` with `soft_logout`), and the refresh
+/// then succeeds. The issue time is backdated in the store rather than slept
+/// through.
+#[tokio::test]
+async fn an_expired_access_token_answers_soft_logout_and_refresh_recovers() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let harness = Harness::reopen(&store);
+    let body = register_refreshing(&harness).await;
+    let access = body["access_token"].as_str().unwrap();
+
+    let mut backdated = 0;
+    for prefix in 0x00_u8..=0x0f {
+        for (key, value) in spindle_store::ReadView::scan_prefix(store.as_ref(), &[prefix]).unwrap()
+        {
+            let Ok(mut row) = serde_json::from_slice::<Value>(&value) else {
+                continue;
+            };
+            if row.get("issued_at_ms").is_some() {
+                row["issued_at_ms"] = json!(1);
+                spindle_store::Store::put(store.as_ref(), &key, row.to_string().as_bytes())
+                    .unwrap();
+                backdated += 1;
+            }
+        }
+    }
+    assert!(backdated >= 1, "no token row carried an issue time");
+
+    let (status, refused) = harness
+        .get_auth("/_matrix/client/v3/account/whoami", access)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+    assert_eq!(refused["errcode"], "M_UNKNOWN_TOKEN");
+    assert_eq!(refused["soft_logout"], true, "{refused}");
+
+    let (status, refreshed) = harness
+        .post(
+            "/_matrix/client/v3/refresh",
+            &json!({ "refresh_token": body["refresh_token"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    let (status, _) = harness
+        .get_auth(
+            "/_matrix/client/v3/account/whoami",
+            refreshed["access_token"].as_str().unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}

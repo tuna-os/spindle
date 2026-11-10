@@ -87,6 +87,17 @@ impl MatrixError {
         )
     }
 
+    /// An access token past its lifetime: `M_UNKNOWN_TOKEN` with
+    /// `soft_logout`, which tells a refreshing client to refresh rather than
+    /// to discard the session.
+    #[must_use]
+    pub fn expired_token() -> Self {
+        Self {
+            soft_logout: true,
+            ..Self::unknown_token()
+        }
+    }
+
     #[must_use]
     pub fn missing_token() -> Self {
         Self::new(

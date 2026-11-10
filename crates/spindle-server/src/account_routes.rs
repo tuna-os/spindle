@@ -705,7 +705,7 @@ async fn logout(
         )?;
         crate::mas::device_list_changed(&state, &identity.user_id);
     } else {
-        accounts.logout(token).map_err(|error| internal(&error))?;
+        crate::mas::end_local_session(&state, &accounts, token)?;
     }
     Ok(Json(json!({})))
 }

@@ -532,6 +532,32 @@ pub(crate) fn remove_device(
     Ok(())
 }
 
+/// End the local session an access or refresh token belongs to: the device,
+/// all its tokens, its E2E material, and the device-list change peers learn
+/// of. Returns whether the token named a session; an unknown token is not an
+/// error, which is what RFC 7009 asks of revocation.
+pub(crate) fn end_local_session(
+    state: &AppState,
+    accounts: &Accounts<'_, spindle_store::FjallStore>,
+    token: &str,
+) -> Result<bool, MatrixError> {
+    let Some(record) = accounts
+        .session_of(token)
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    remove_device(
+        state,
+        accounts,
+        &record.localpart,
+        &record.device_id,
+        EndedBy::Server,
+    )?;
+    device_list_changed(state, &accounts.user_id(&record.localpart));
+    Ok(true)
+}
+
 /// Mark the user's device list changed and wake `/sync`, so peers stop
 /// (or start) encrypting to the right set of devices.
 pub(crate) fn device_list_changed(state: &AppState, user_id: &str) {
