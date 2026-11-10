@@ -432,12 +432,24 @@ async fn register_available(
         .ok_or_else(|| MatrixError::bad_json("no username"))?
         .to_lowercase();
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    if crate::server_notices::is_reserved_localpart(&state, &username) {
+        return Err(reserved_by_service());
+    }
     match accounts.availability(&username) {
         Ok(()) => Ok(Json(json!({ "available": true }))),
         Err(AccountError::UserInUse) => Err(MatrixError::user_in_use()),
         Err(AccountError::InvalidUsername) => Err(MatrixError::invalid_username()),
         Err(other) => Err(MatrixError::internal(&other.to_string())),
     }
+}
+
+/// A localpart a service identity holds, refused like an exclusive namespace.
+fn reserved_by_service() -> MatrixError {
+    MatrixError::new(
+        StatusCode::BAD_REQUEST,
+        "M_EXCLUSIVE",
+        "this localpart is reserved by this server for a service",
+    )
 }
 
 /// `POST /_matrix/client/v3/register`
@@ -501,6 +513,9 @@ async fn register(
     // dance for the same reason the username checks are — a client should
     // not complete auth for a name it can never have.
     if let Some(name) = username.as_deref() {
+        if crate::server_notices::is_reserved_localpart(&state, name) {
+            return Err(reserved_by_service());
+        }
         let user_id = format!("@{name}:{}", state.config.server.name);
         if state.appservices.exclusively_claims(&user_id) {
             return Err(MatrixError::new(
@@ -644,7 +659,7 @@ fn register_appservice_user(
     }
     let accounts = Accounts::new(state.store.as_ref(), server_name);
     accounts
-        .register(username, &crate::accounts::unguessable_password())
+        .register_service(username)
         .map_err(|error| match error {
             AccountError::UserInUse => MatrixError::user_in_use(),
             AccountError::InvalidUsername => MatrixError::invalid_username(),

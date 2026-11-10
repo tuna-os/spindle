@@ -367,6 +367,19 @@ impl Appservices {
         &self.list
     }
 
+    /// Whether `localpart` is some registration's `sender_localpart`.
+    /// Ordinary registration must refuse it: the service creates that
+    /// account on first use, and a user who got there first would hold a
+    /// password login to the service's own identity.
+    #[must_use]
+    pub fn reserves_localpart(&self, localpart: &str) -> bool {
+        self.list.iter().any(|registration| {
+            registration
+                .sender_localpart
+                .eq_ignore_ascii_case(localpart)
+        })
+    }
+
     /// Whether any service holds an *exclusive* users-namespace claim on
     /// `user_id`. Exclusivity is a reservation against everyone else:
     /// ordinary registration must refuse the name, or the service arrives

@@ -498,6 +498,7 @@ impl<S: Store> Importer<'_, S> {
                 locked: false,
                 suspended: false,
                 erased: false,
+                service_owned: false,
             }
         } else {
             if self.placeholder.is_none() {

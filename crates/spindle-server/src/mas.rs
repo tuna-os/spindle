@@ -132,6 +132,13 @@ async fn is_localpart_available(
 ) -> Result<Json<Value>, MatrixError> {
     admit(&state, &headers)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
+    if crate::server_notices::is_reserved_localpart(&state, &query.localpart) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_EXCLUSIVE",
+            "this localpart is reserved by this server for a service",
+        ));
+    }
     match accounts.availability(&query.localpart) {
         Ok(()) => {}
         Err(AccountError::UserInUse) => return Err(MatrixError::user_in_use()),
@@ -179,6 +186,13 @@ async fn provision_user(
         .map_err(|error| MatrixError::internal(&error.to_string()))?
         .is_some();
     if !known {
+        if crate::server_notices::is_reserved_localpart(&state, &request.localpart) {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_EXCLUSIVE",
+                "this localpart is reserved by this server for a service",
+            ));
+        }
         accounts
             .register(&request.localpart, &unguessable_password())
             .map_err(|error| match error {
