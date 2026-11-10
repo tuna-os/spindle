@@ -1452,7 +1452,7 @@ operator toil.
 
 **Status.** The truncation primitive is built (#817). `truncate_room_log`
 records a chain checkpoint `(floor, chain[floor - 1])` in its own keyspace,
-then deletes the log entries, bodies, stream rows, relation rows and old
+then deletes the log entries, bodies, stream rows, state-delta rows, relation rows and old
 membership rows below the floor. A load, `load_exhaustive` and `spindle
 verify` start the chain from the checkpoint (§5.3). The entries of the
 current state and of the parents of kept entries stay, without a chain

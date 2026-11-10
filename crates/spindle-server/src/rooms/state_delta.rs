@@ -56,6 +56,11 @@ fn decode(raw: &[u8]) -> Option<DeltaRow> {
     Some((li, set))
 }
 
+/// The log index of the event a stored delta row belongs to.
+pub(super) fn row_li(raw: &[u8]) -> Option<i64> {
+    decode(raw).map(|(li, _)| li)
+}
+
 impl Rooms {
     /// The delta rows a room wrote in `(since, until]`, oldest first.
     ///

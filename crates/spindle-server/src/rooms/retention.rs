@@ -226,6 +226,7 @@ impl Rooms {
         report.bodies = delete_counting(store, &bodies)?;
         report.index_rows += delete_counting(store, &reverse)?;
         report.index_rows += self.delete_stream_rows(room_id, log, floor)?;
+        report.index_rows += self.delete_state_delta_rows(room_id, log, floor)?;
         report.index_rows += self.delete_relation_rows(room_id, log, floor)?;
         let users: BTreeSet<&str> = doomed
             .iter()
@@ -293,6 +294,27 @@ impl Rooms {
             }
             keys.push(key);
         }
+        Ok(delete_counting(store, &keys)?)
+    }
+
+    /// Drop the current-state deltas (#819) of the entries the floor
+    /// removed. A delta shares its stream id with the event that caused
+    /// it, so it is dead weight once that event's stream row is gone.
+    fn delete_state_delta_rows(
+        &self,
+        room_id: &str,
+        log: &RoomLog,
+        floor: i64,
+    ) -> Result<u64, RoomError> {
+        let store = self.store.as_ref();
+        let keys: Vec<Vec<u8>> =
+            ReadView::scan_prefix(store, &spindle_core::keys::room_state_delta_prefix(room_id))?
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let li = super::state_delta::row_li(&value)?;
+                    (li < floor && log.entry_at(li).is_none()).then_some(key)
+                })
+                .collect();
         Ok(delete_counting(store, &keys)?)
     }
 

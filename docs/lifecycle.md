@@ -81,7 +81,7 @@ error, not as a missing node. The server must be stopped.
 ## Truncating a room's history
 
 A truncation removes the log of a room below a position (#817). It removes
-the log entries, the event bodies, the stream rows, the relation rows and
+the log entries, the event bodies, the stream rows, the state-delta rows, the relation rows and
 the old membership rows. After it, `spindle gc` can free the state nodes
 that only the removed entries used.
 

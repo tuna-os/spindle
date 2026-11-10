@@ -11,9 +11,9 @@ use std::sync::Arc;
 use serde_json::json;
 use spindle_core::keys::{Keyspace, keyspace_prefix, room_prefix};
 use spindle_core::{ChainHash, EventId, RoomLog};
-use spindle_server::rooms::Rooms;
+use spindle_server::rooms::{Rooms, StateBlock};
 use spindle_server::signing::ServerKey;
-use spindle_store::{FjallStore, ReadView, RoomStore};
+use spindle_store::{FjallStore, ReadView, RoomStore, Store};
 use tempfile::TempDir;
 
 const SERVER: &str = "example.org";
@@ -516,4 +516,84 @@ fn the_entries_of_the_current_state_outlive_the_floor() {
         "alice's open stint survives: {intervals:?}"
     );
     assert!(intervals[0].0 < floor && intervals[0].1 == i64::MAX);
+}
+
+/// A delta row (#819) beside an event below the floor goes with it, one
+/// beside a retained event stays, and a sync that starts below the floor
+/// still answers.
+#[test]
+fn state_delta_rows_below_the_floor_go_and_a_sync_from_below_it_answers() {
+    let fixture = fixture(12);
+    let floor = fixture.watermark(2, 3);
+    let log = fixture.log();
+    let topic = fixture
+        .rooms
+        .state(&fixture.room)
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "m.room.topic")
+        .map(|event| event["event_id"].as_str().unwrap().to_owned())
+        .unwrap();
+    // A message below the floor is dropped by the truncation, unlike the
+    // state events that stay pinned; the head is above it.
+    let streams: Vec<(u64, i64)> = ReadView::scan_prefix(
+        fixture.store.as_ref(),
+        &spindle_core::keys::room_stream_prefix(&fixture.room),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|(key, value)| {
+        let li = i64::from_be_bytes(value[..8].try_into().unwrap());
+        (spindle_core::keys::room_stream_from_key(&key).unwrap(), li)
+    })
+    .collect();
+    let doomed = streams
+        .iter()
+        .find(|(_, li)| *li < floor && log.entry_at(*li).is_some_and(|e| e.state_key.is_none()))
+        .copied()
+        .unwrap();
+    let kept = streams
+        .iter()
+        .rev()
+        .find(|(_, li)| *li >= floor)
+        .copied()
+        .unwrap();
+    let natural = fixture.rows(Keyspace::RoomStateDelta);
+    for (stream_id, li) in [doomed, kept] {
+        let row = json!({ "li": li, "set": [["m.room.topic", "", topic]] });
+        fixture
+            .store
+            .put(
+                &spindle_core::keys::room_state_delta(&fixture.room, stream_id),
+                row.to_string().as_bytes(),
+            )
+            .unwrap();
+    }
+    assert_eq!(fixture.rows(Keyspace::RoomStateDelta), natural + 2);
+
+    fixture
+        .rooms
+        .truncate_room_log(&fixture.room, floor)
+        .unwrap();
+
+    let has = |stream_id| {
+        ReadView::get(
+            fixture.store.as_ref(),
+            &spindle_core::keys::room_state_delta(&fixture.room, stream_id),
+        )
+        .unwrap()
+        .is_some()
+    };
+    assert!(!has(doomed.0), "the delta below the floor is removed");
+    assert!(has(kept.0), "the delta of a retained event stays");
+    for since in [0, doomed.0 - 1] {
+        let sync = fixture
+            .rooms
+            .sync(ALICE, Some(since), 10, StateBlock::Rendered, false)
+            .unwrap();
+        assert!(
+            sync.rooms.iter().any(|room| room.room_id == fixture.room),
+            "a sync from below the floor answers for the room"
+        );
+    }
 }
