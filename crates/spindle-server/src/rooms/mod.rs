@@ -539,23 +539,50 @@ impl Rooms {
         Self::with_metrics(store, server_name, Arc::default())
     }
 
+    /// As [`Rooms::new`] with a registry to scrape.
+    ///
+    /// # Panics
+    ///
+    /// If the store cannot be read to find where the stream resumes. The
+    /// server uses [`Rooms::try_with_metrics`] and reports that instead.
     #[must_use]
     pub fn with_metrics(
         store: Arc<FjallStore>,
         server_name: impl Into<String>,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
+        Self::try_with_metrics(store, server_name, metrics)
+            .expect("the store can be read to resume the stream")
+    }
+
+    /// [`Rooms::with_metrics`], refusing to start when the store cannot be
+    /// read (#815).
+    ///
+    /// Where the stream resumes is read from the store. A read that failed
+    /// and counted as zero would resume the counter below ids already on
+    /// disk and overwrite the entries they point at.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error of the read that failed.
+    pub fn try_with_metrics(
+        store: Arc<FjallStore>,
+        server_name: impl Into<String>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Self, spindle_store::StoreError> {
         let store_for_stream = Arc::clone(&store);
         // Read once and used twice: the stream's own high-water mark bounds
         // the index backfill and is one of the four drawers the counter
         // resumes above.
-        let stream_high = highest_stream_row(store_for_stream.as_ref());
+        let stream_high = highest_stream_row(store_for_stream.as_ref())?;
         // Before anything reads the reverse index, make it complete. A store
         // written by a binary without it has a forward stream and no index,
         // and an incremental `/sync` answered from an empty index would
         // report that nothing had happened -- not slower, wrong.
-        backfill_room_stream_index(store_for_stream.as_ref(), stream_high);
-        Self {
+        backfill_room_stream_index(store_for_stream.as_ref(), stream_high)?;
+        let resume_at = highest_stream_id(store_for_stream.as_ref(), stream_high)?;
+        let checkpointed = read_stream_checkpoint(store_for_stream.as_ref())?;
+        Ok(Self {
             policy_federation: Mutex::new(None),
             store,
             server_name: server_name.into(),
@@ -581,14 +608,11 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
-            checkpointed_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
-            stream: crate::stream::Stream::resuming_at(highest_stream_id(
-                store_for_stream.as_ref(),
-                stream_high,
-            )),
+            checkpointed_position: Mutex::new(checkpointed),
+            stream: crate::stream::Stream::resuming_at(resume_at),
             appended: tokio::sync::Notify::new(),
             partial: partial::PartialRooms::load(store_for_stream.as_ref()),
-        }
+        })
     }
 
     /// Persist one fully validated Synapse replay.
@@ -8067,25 +8091,65 @@ impl StreamRecord {
     }
 }
 
+/// The largest number `of` reads from any row under `prefix`, or 0 when there
+/// is none.
+///
+/// Streamed, so one row is in memory at a time whatever the keyspace holds.
+/// The recovery below used to copy whole keyspaces into a `Vec` to take a
+/// maximum, and to read a failed scan as an empty one (#815): a counter
+/// resumed below ids already on disk re-issues them, so a read error here
+/// has to stop the start, not count as zero.
+fn max_over(
+    store: &dyn spindle_store::ReadView,
+    prefix: &[u8],
+    of: impl Fn(&[u8], &[u8]) -> Option<u64>,
+) -> Result<u64, spindle_store::StoreError> {
+    let mut best = 0_u64;
+    spindle_store::ReadView::visit_prefix(store, prefix, &mut |key, value| {
+        if let Some(number) = of(key, value) {
+            best = best.max(number);
+        }
+        Ok(())
+    })?;
+    Ok(best)
+}
+
+/// The number in the last eight bytes of a key, which is where the
+/// side-stream keyspaces keep their big-endian sequence.
+fn trailing_u64(key: &[u8]) -> Option<u64> {
+    key.get(key.len().checked_sub(8)?..)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+}
+
+/// A value that is exactly a big-endian `u64`.
+fn value_u64(value: &[u8]) -> Option<u64> {
+    value.try_into().map(u64::from_be_bytes).ok()
+}
+
 /// The highest id in the forward stream index, or 0 for a fresh store.
 ///
-/// A prefix scan rather than a stored high-water mark: one number that has to
-/// be kept in step with the rows it describes is one number that can disagree
-/// with them, and the rows are the truth.
-fn highest_stream_row(store: &FjallStore) -> u64 {
-    spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
-        .max()
-        .unwrap_or(0)
+/// The rows rather than a stored high-water mark: one number that has to be
+/// kept in step with the rows it describes is one number that can disagree
+/// with them, and the rows are the truth. Stream keys are the id in
+/// big-endian, so the highest is the last key: one seek, not a scan of a
+/// keyspace that holds a row for every event the server has ever stored.
+fn highest_stream_row(
+    store: &dyn spindle_store::ReadView,
+) -> Result<u64, spindle_store::StoreError> {
+    let prefix = spindle_core::keys::stream_prefix();
+    // The next keyspace byte is above every key under this one.
+    let end = [prefix[0], prefix[1] + 1];
+    Ok(spindle_store::ReadView::last_before(store, &prefix, &end)?
+        .and_then(|(key, _)| spindle_core::keys::stream_from_key(&key))
+        .unwrap_or(0))
 }
 
 /// Fill in any reverse-index rows the forward stream has and the index does
 /// not, and report how many were written.
 ///
 /// Every append writes both rows in one batch, so in the steady state there
-/// is nothing to do and this costs one scan of a keyspace holding eight bytes
+/// is nothing to do and this costs one pass over a keyspace holding eight bytes
 /// per event. It is not dead code, though: a store written before the reverse
 /// index existed has a forward stream and no index at all, and reading it
 /// with this binary must not silently answer `/sync` from an index that stops
@@ -8096,26 +8160,26 @@ fn highest_stream_row(store: &FjallStore) -> u64 {
 /// The comparison is `max` against `max` rather than a count, because the two
 /// keyspaces are written together: any id the index is missing is above the
 /// highest id it holds.
-fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
-    let indexed = spindle_store::ReadView::scan_prefix(
+fn backfill_room_stream_index(
+    store: &FjallStore,
+    through: u64,
+) -> Result<usize, spindle_store::StoreError> {
+    let indexed = max_over(
         store,
         &[
             spindle_core::keys::KEY_SCHEMA_VERSION,
             spindle_core::keys::Keyspace::RoomStream as u8,
         ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(key, _)| spindle_core::keys::room_stream_from_key(key))
-    .max()
-    .unwrap_or(0);
+        |key, _| spindle_core::keys::room_stream_from_key(key),
+    )?;
     if indexed >= through {
-        return 0;
+        return Ok(0);
     }
+    // Only the migration case reaches here, and it writes while it reads, so
+    // it takes its rows first.
     let mut written = 0;
     for (key, raw) in
-        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
-            .unwrap_or_default()
+        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())?
     {
         let Some(stream_id) = spindle_core::keys::stream_from_key(&key) else {
             continue;
@@ -8126,17 +8190,14 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
         let Some(record) = StreamRecord::decode(&raw) else {
             continue;
         };
-        if spindle_store::Store::put(
+        spindle_store::Store::put(
             store,
             &spindle_core::keys::room_stream(&record.room_id, stream_id),
             &record.li.to_be_bytes(),
-        )
-        .is_ok()
-        {
-            written += 1;
-        }
+        )?;
+        written += 1;
     }
-    written
+    Ok(written)
 }
 
 /// How many positions past an issued token the stream checkpoint reaches.
@@ -8148,138 +8209,105 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
 /// to promise that.
 const CHECKPOINT_LEASE: u64 = 1_024;
 
-fn read_stream_checkpoint(store: &FjallStore) -> u64 {
-    spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-        .unwrap_or(0)
+fn read_stream_checkpoint(
+    store: &dyn spindle_store::ReadView,
+) -> Result<u64, spindle_store::StoreError> {
+    Ok(
+        spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())?
+            .and_then(|value| value_u64(&value))
+            .unwrap_or(0),
+    )
 }
 
 /// The highest stream id already on disk, or 0 for a fresh store.
 ///
 /// `from_stream` is [`highest_stream_row`], passed in because the caller has
-/// already paid for that scan.
-fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
+/// already paid for that read.
+///
+/// # Errors
+///
+/// A read that fails is an error and never a zero: a counter resumed below
+/// an id on disk re-issues it (#815).
+fn highest_stream_id(
+    store: &dyn spindle_store::ReadView,
+    from_stream: u64,
+) -> Result<u64, spindle_store::StoreError> {
+    use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace};
     // Pending to-device messages drew from this counter without writing a
     // stream row, so their sequence numbers are invisible to `from_stream`.
     // A counter resumed below them would eventually re-allocate a pending
     // message's sequence for the same device and overwrite it — silent loss
     // of session-establishment ciphertext. Their keys end in the big-endian
     // sequence, so the maximum is read off the last eight bytes.
-    let from_to_device = spindle_store::ReadView::scan_prefix(
+    let from_to_device = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::ToDevice as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(key, _)| {
-        key.get(key.len().checked_sub(8)?..)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u64::from_be_bytes)
-    })
-    .max()
-    .unwrap_or(0);
+        &[KEY_SCHEMA_VERSION, Keyspace::ToDevice as u8],
+        |key, _| trailing_u64(key),
+    )?;
     // Device-list watermarks are the third drawer the counter allocates into
     // without a stream row. The failure a low resume causes here is subtler
     // than an overwrite: `/sync` hands out `next_batch` tokens read off this
     // counter, so a change recorded at a re-used low sequence would sit at or
     // below a token a client already holds — and that client would never hear
     // that a device changed, and keep encrypting to a stale device set.
-    let from_device_lists = spindle_store::ReadView::scan_prefix(
+    let from_device_lists = max_over(
         store,
         &spindle_core::keys::device_list_change_prefix(),
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
+        |_, value| value_u64(value),
+    )?;
     // An out-of-band federated invite has no room event and therefore no
     // `Stream` row, but its pending record carries the side-stream position
     // that makes it a one-shot incremental-sync change. Resume above those
     // positions too, or a restart can reuse one and make a later invite sit
     // at or below a token the client already holds.
-    let from_pending_invites = spindle_store::ReadView::scan_prefix(
+    let from_pending_invites = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::PendingInvite as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| {
-        serde_json::from_slice::<Value>(value)
-            .ok()?
-            .get("stream_id")?
-            .as_u64()
-    })
-    .max()
-    .unwrap_or(0);
-    let from_account_data = spindle_store::ReadView::scan_prefix(
+        &[KEY_SCHEMA_VERSION, Keyspace::PendingInvite as u8],
+        |_, value| {
+            serde_json::from_slice::<Value>(value)
+                .ok()?
+                .get("stream_id")?
+                .as_u64()
+        },
+    )?;
+    let from_account_data = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::AccountDataStream as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
+        &[KEY_SCHEMA_VERSION, Keyspace::AccountDataStream as u8],
+        |_, value| value_u64(value),
+    )?;
     // The federation outbox is the fourth drawer: its rows carry the
     // sequence in the key's last eight bytes and have no stream row, and a
     // counter resumed below one would eventually overwrite a pending
     // delivery for the same destination.
-    let from_outbox =
-        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::federation_outbox_all())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|(key, _)| {
-                key.get(key.len().checked_sub(8)?..)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u64::from_be_bytes)
-            })
-            .max()
-            .unwrap_or(0);
+    let from_outbox = max_over(
+        store,
+        &spindle_core::keys::federation_outbox_all(),
+        |key, _| trailing_u64(key),
+    )?;
     // A completed fresh import fences historical notifications at this durable
     // global position. Pending side-stream rows can later be consumed/deleted;
     // restarting below the push cursor would assign new events old IDs and
     // silently suppress their notifications. Malformed rows retain the same
     // ignore policy as the other counter drawers above.
-    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())?
+        .and_then(|value| value_u64(&value))
         .unwrap_or(0);
     // An appservice can drain the last to-device row without any Matrix
     // client syncing. Its durable acknowledgement is also a counter floor.
-    let from_appservices = spindle_store::ReadView::scan_prefix(
+    let from_appservices = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::AppserviceCursor as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
-    from_stream
-        .max(read_stream_checkpoint(store))
+        &[KEY_SCHEMA_VERSION, Keyspace::AppserviceCursor as u8],
+        |_, value| value_u64(value),
+    )?;
+    Ok(from_stream
+        .max(read_stream_checkpoint(store)?)
         .max(from_appservices)
         .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
         .max(from_pending_invites)
         .max(from_account_data)
-        .max(from_outbox)
+        .max(from_outbox))
 }
 
 #[cfg(test)]
@@ -8287,7 +8315,7 @@ mod stream_index_tests {
     use spindle_store::{FjallStore, Store};
     use tempfile::TempDir;
 
-    use super::{StreamRecord, backfill_room_stream_index, highest_stream_row};
+    use super::{StreamRecord, backfill_room_stream_index, highest_stream_id, highest_stream_row};
 
     /// Write forward stream rows from `first` and no index rows, which is
     /// what a store written before the reverse index looks like.
@@ -8318,7 +8346,7 @@ mod stream_index_tests {
         );
 
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             3
         );
         assert_eq!(
@@ -8349,11 +8377,11 @@ mod stream_index_tests {
         let store = FjallStore::open(dir.path()).unwrap();
         unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
 
-        let through = highest_stream_row(&store);
-        assert_eq!(backfill_room_stream_index(&store, through), 2);
+        let through = highest_stream_row(&store).unwrap();
+        assert_eq!(backfill_room_stream_index(&store, through).unwrap(), 2);
 
         let before = store.scanned();
-        assert_eq!(backfill_room_stream_index(&store, through), 0);
+        assert_eq!(backfill_room_stream_index(&store, through).unwrap(), 0);
         assert_eq!(
             store.scanned() - before,
             2,
@@ -8410,16 +8438,109 @@ mod stream_index_tests {
         let store = FjallStore::open(dir.path()).unwrap();
         unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             2
         );
 
         unindexed(&store, 3, &["!c:example.org"]);
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             1,
             "only the row the older binary missed"
         );
+    }
+
+    /// #815: the stream's high-water mark is one seek, not a scan of a
+    /// keyspace that holds a row for every event the server has stored.
+    #[test]
+    fn finding_the_highest_stream_row_does_not_read_every_row() {
+        let rows_read = |events: u64| {
+            let dir = TempDir::new().unwrap();
+            let store = FjallStore::open(dir.path()).unwrap();
+            unindexed(
+                &store,
+                1,
+                &vec!["!a:example.org"; usize::try_from(events).unwrap()],
+            );
+            let before = store.scanned();
+            assert_eq!(highest_stream_row(&store).unwrap(), events);
+            store.scanned() - before
+        };
+        let small = rows_read(10);
+        let large = rows_read(3_000);
+        assert_eq!(
+            small, large,
+            "the rows read grew with the stream: {small} for 10 events, {large} for 3000"
+        );
+        assert!(large <= 1, "one seek, not {large} rows");
+    }
+
+    /// A store whose every read fails, the way a bad block does.
+    struct Unreadable;
+
+    impl spindle_store::ReadView for Unreadable {
+        fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_prefix(
+            &self,
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_from(
+            &self,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_until(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn key_table(&self) -> std::sync::Arc<dyn spindle_core::StateKeyTable> {
+            spindle_core::MemStateKeyTable::shared()
+        }
+    }
+
+    /// #815: a read that fails is not a position of zero. A counter resumed
+    /// below ids already on disk re-issues them and overwrites the entries
+    /// they point at, so recovery has to stop the start.
+    #[test]
+    fn a_failed_read_stops_recovery_instead_of_resuming_at_zero() {
+        assert!(highest_stream_row(&Unreadable).is_err());
+        assert!(highest_stream_id(&Unreadable, 0).is_err());
+        assert!(super::read_stream_checkpoint(&Unreadable).is_err());
+    }
+
+    /// Every counter drawer still floors the resumed position, now that they
+    /// are read by streaming.
+    #[test]
+    fn every_drawer_still_sets_the_floor() {
+        use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace};
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 0);
+
+        // A pending to-device sequence, key ends in it.
+        let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::ToDevice as u8, 1, 2, 3];
+        key.extend_from_slice(&700_u64.to_be_bytes());
+        store.put(&key, b"x").unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 700);
+
+        // A device-list watermark, in the value.
+        let mut key = spindle_core::keys::device_list_change_prefix();
+        key.extend_from_slice(b"@u:example.org");
+        store.put(&key, &900_u64.to_be_bytes()).unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 900);
+
+        // The stream's own high-water mark outranks them when it is higher.
+        assert_eq!(highest_stream_id(&store, 1_000).unwrap(), 1_000);
     }
 }
 
