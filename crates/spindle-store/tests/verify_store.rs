@@ -86,6 +86,10 @@ impl Store for FlakyReads {
         self.inner.commit_deferred(writes)
     }
 
+    fn commit_ops_deferred(&self, ops: &[spindle_store::BatchOp]) -> Result<(), StoreError> {
+        self.inner.commit_ops_deferred(ops)
+    }
+
     fn sync(&self, durability: Durability) -> Result<(), StoreError> {
         self.inner.sync(durability)
     }

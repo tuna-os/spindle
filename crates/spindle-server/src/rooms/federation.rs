@@ -323,9 +323,7 @@ impl Rooms {
                     accepted.insert(id, candidate);
                 }
             }
-            rooms
-                .store
-                .commit(&writes, spindle_store::Durability::Group)?;
+            rooms.store.commit(&writes, rooms.store.durability())?;
             Ok(())
         })
     }
@@ -1708,11 +1706,7 @@ impl Rooms {
             ));
         }
         if !outliers.is_empty() {
-            spindle_store::Store::commit(
-                self.store.as_ref(),
-                &outliers,
-                spindle_store::Durability::Group,
-            )?;
+            spindle_store::Store::commit(self.store.as_ref(), &outliers, self.store.durability())?;
         }
 
         // The membership the join replaces -- usually the invite it accepts

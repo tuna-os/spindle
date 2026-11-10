@@ -946,6 +946,7 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let periodic_sync = apply_durability(&store, &config.storage);
 
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
@@ -1028,6 +1029,7 @@ async fn serve() -> ExitCode {
             tracing::error!("federation listener did not stop cleanly: {error}");
         }
     }
+    drop(periodic_sync);
     close_store(store).await;
     flush_traces(tracer_provider);
     match served {
@@ -1090,6 +1092,18 @@ fn flush_traces(provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>) {
     {
         tracing::warn!("trace exporter did not flush: {error}");
     }
+}
+
+/// Apply `[storage] durability` to the open store, and start the timer
+/// that `relaxed` promises. The guard syncs once more when dropped, so keep
+/// it until just before the store closes.
+fn apply_durability(
+    store: &Arc<FjallStore>,
+    storage: &spindle_server::config::StorageConfig,
+) -> Option<spindle_store::PeriodicSync> {
+    store.set_durability(storage.durability.into());
+    (storage.durability == spindle_server::config::DurabilityMode::Relaxed)
+        .then(|| store.spawn_periodic_sync(Duration::from_millis(storage.relaxed_sync_interval_ms)))
 }
 
 /// Close the store here, on the thread that opened it, once nothing else

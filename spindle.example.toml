@@ -51,6 +51,18 @@ path = "./data"
 # longest are dropped and load again from disk when asked for. A room in use
 # is never dropped. 0 means no limit.
 # max_resident_rooms = 4096
+# How hard a commit is made durable before it is acknowledged.
+#   "strict"  fsync data and metadata for every commit.
+#   "group"   one fsync shared by concurrent commits. The default.
+#   "relaxed" room commits wait for the OS page cache only; a timer fsyncs.
+# Security writes (access tokens, accounts, devices, one-time keys, the
+# signing key) are never weaker than "group", even under "relaxed". Under
+# "strict" they are strict too.
+# durability = "group"
+# Under "relaxed", how often the journal is fsynced in the background, in
+# milliseconds. A crash loses at most about this much. Ignored otherwise.
+# Must be above zero.
+# relaxed_sync_interval_ms = 1000
 
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and
 # advertised by both media config endpoints. Match the old server on migration.

@@ -1136,9 +1136,21 @@ async fn purge_resolves_time_and_refuses_ambiguity() {
     let newest_ts = body["chunk"][0]["event"]["origin_server_ts"]
         .as_u64()
         .unwrap();
+    let (batches, barriers) = (server.store.journalled(), server.store.barriers());
     let (status, body) = purge(&ops, json!({ "before_ts": newest_ts })).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["events_purged"], 3, "all three messages: {body}");
+    // The three body deletes are one atomic batch, not three tombstones that
+    // a crash can separate (#810). The watermark and the audit row are puts.
+    assert_eq!(
+        server.store.journalled() - batches,
+        1,
+        "the body deletes are a single journalled batch"
+    );
+    assert!(
+        server.store.barriers() > barriers,
+        "the purge is synced before it reports success"
+    );
     let (status, body) = server
         .request(
             reqwest::Method::GET,

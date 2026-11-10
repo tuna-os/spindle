@@ -113,6 +113,22 @@ pub enum Durability {
 }
 
 impl Durability {
+    const fn to_bits(self) -> u8 {
+        match self {
+            Self::Strict => 0,
+            Self::Group => 1,
+            Self::Relaxed => 2,
+        }
+    }
+
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Strict,
+            2 => Self::Relaxed,
+            _ => Self::Group,
+        }
+    }
+
     fn persist_mode(self) -> PersistMode {
         match self {
             Self::Strict => PersistMode::SyncAll,
@@ -159,6 +175,27 @@ mod durability_tests {
 
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
+
+/// One operation in an atomic batch: a write or a delete.
+///
+/// [`Record`] can only put, so a path that must remove rows together with
+/// writing others (or removing several together) could not use a batch and
+/// fell back to one unsynced delete per key. A tombstone is journalled in
+/// the same batch as the puts around it, so a crash shows all of them or
+/// none (#810).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BatchOp {
+    /// Write `value` under the key.
+    Put(Vec<u8>, Vec<u8>),
+    /// Remove the key. Removing an absent key is not an error.
+    Delete(Vec<u8>),
+}
+
+impl From<Record> for BatchOp {
+    fn from((key, value): Record) -> Self {
+        Self::Put(key, value)
+    }
+}
 
 /// What [`ReadView::visit_prefix`] calls with each key and value; an error
 /// stops the scan and is returned from it.
@@ -431,6 +468,25 @@ pub trait Store: ReadView {
     /// Returns a backend error if the write fails.
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError>;
 
+    /// [`Store::commit_deferred`] for a batch that may delete: journal every
+    /// operation atomically, without making them durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the write fails.
+    fn commit_ops_deferred(&self, ops: &[BatchOp]) -> Result<(), StoreError>;
+
+    /// [`Store::commit`] for a batch that may delete. All operations are
+    /// visible together or not at all, and count as one write batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the commit fails.
+    fn commit_ops(&self, ops: &[BatchOp], durability: Durability) -> Result<(), StoreError> {
+        self.commit_ops_deferred(ops)?;
+        self.sync(durability)
+    }
+
     /// [`Store::commit`]'s second half: make everything journalled so far
     /// durable, to the standard `durability` asks for.
     ///
@@ -659,6 +715,14 @@ pub struct FjallStore {
     journalled: AtomicU64,
     /// Shared by every writer, which is what lets their fsyncs become one.
     group: GroupCommit,
+    /// The operator's `[storage] durability`, as [`Durability::to_bits`].
+    ///
+    /// Set once after open by [`FjallStore::set_durability`]. See
+    /// [`FjallStore::effective`] for how it combines with what a call site
+    /// asks for.
+    configured: AtomicU8,
+    /// The `journalled` reading the last periodic persist covered.
+    periodic_seen: AtomicU64,
     /// Set by the first write or sync the engine refuses, and never cleared.
     ///
     /// fjall poisons its database on a failed journal write or sync -- a
@@ -680,6 +744,28 @@ pub struct FjallStore {
     /// Holds a drain through journal insertion so another room cannot
     /// persist nodes before the batch carrying their intern rows.
     intern_drain: Mutex<()>,
+}
+
+/// Guard for the thread [`FjallStore::spawn_periodic_sync`] starts.
+///
+/// Dropping it stops the thread and syncs once more, so a clean shutdown
+/// under `relaxed` loses nothing.
+pub struct PeriodicSync {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    store: std::sync::Weak<FjallStore>,
+}
+
+impl Drop for PeriodicSync {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(store) = self.store.upgrade() {
+            let _ = store.relaxed_tick();
+        }
+    }
 }
 
 /// Newly allocated intern-table pairs as batch rows (#79).
@@ -764,6 +850,114 @@ impl FjallStore {
     #[must_use]
     pub fn barriers(&self) -> u64 {
         self.ungrouped_syncs.load(Ordering::Relaxed) + self.group.counters().0
+    }
+
+    /// Choose the durability of the operator's `[storage] durability`.
+    ///
+    /// Call once after open, before serving. Room commits ask for
+    /// [`Self::durability`]; every other call site asks for `Group` or
+    /// stronger and is held to [`Self::effective`].
+    pub fn set_durability(&self, durability: Durability) {
+        self.configured
+            .store(durability.to_bits(), Ordering::Release);
+    }
+
+    /// The configured durability: what a room commit should ask for.
+    #[must_use]
+    pub fn durability(&self) -> Durability {
+        Durability::from_bits(self.configured.load(Ordering::Acquire))
+    }
+
+    /// What a call site asking for `requested` actually gets.
+    ///
+    /// The rule: configuration can strengthen a request, never weaken it.
+    /// Under `strict` a `Group` request (tokens, accounts, the signing key,
+    /// one-time keys, purge watermarks) becomes `Strict`. Under `relaxed`
+    /// that request stays `Group`, because a lost token or key is not a
+    /// lost message suffix a client retries. Only a caller that asks for
+    /// `Relaxed` itself (room commits under `relaxed`, presence) gets none.
+    #[must_use]
+    pub fn effective(&self, requested: Durability) -> Durability {
+        match (requested, self.durability()) {
+            (Durability::Group, Durability::Strict) => Durability::Strict,
+            _ => requested,
+        }
+    }
+
+    /// Journal a finished batch of `rows` operations without syncing it.
+    fn finish_batch(&self, batch: fjall::OwnedWriteBatch, rows: usize) -> Result<(), StoreError> {
+        // Always `Buffer`: the bytes reach the journal and nothing is synced.
+        // Which sync they get -- if any -- is `sync`'s decision.
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
+        // Rows, not batches: a batch of a hundred is a hundred rows to
+        // merge and compact, and counting it as one would let a path claim
+        // it writes less by bundling the same work.
+        self.written.fetch_add(rows as u64, Ordering::Relaxed);
+        // After the write, so an observer that sees the count move knows the
+        // bytes are already journalled and a sync will cover them.
+        self.journalled.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// One tick of the periodic persist `relaxed` relies on: fsync if
+    /// anything was journalled since the last tick. Returns whether it did.
+    ///
+    /// Goes through the group, so a tick that lands beside a commit's sync
+    /// shares it. Public so a test can drive a tick without sleeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the sync fails.
+    pub fn relaxed_tick(&self) -> Result<bool, StoreError> {
+        // Read before the sync: a write landing during it is left for the
+        // next tick rather than marked covered.
+        let seen = self.journalled.load(Ordering::Acquire);
+        if seen == self.periodic_seen.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.injected(true)?;
+        self.latch(self.group.sync(&self.db, Durability::Group.persist_mode()))?;
+        self.periodic_seen.store(seen, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Run [`Self::relaxed_tick`] every `interval` on a background thread,
+    /// so a crash under `relaxed` loses at most that window.
+    ///
+    /// The thread holds the store weakly: it never keeps a store open. The
+    /// returned guard stops the thread when dropped, after one last tick.
+    #[must_use]
+    pub fn spawn_periodic_sync(self: &Arc<Self>, interval: std::time::Duration) -> PeriodicSync {
+        let (stop, wake) = std::sync::mpsc::channel::<()>();
+        let store = Arc::downgrade(self);
+        let thread = std::thread::Builder::new()
+            .name("store-periodic-sync".to_owned())
+            .spawn({
+                let store = store.clone();
+                move || {
+                    // Only a timeout means "tick"; a message or a dropped
+                    // sender both mean "stop".
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        wake.recv_timeout(interval)
+                    {
+                        let Some(store) = store.upgrade() else { break };
+                        // A failed sync has latched `accepts_writes` off, which
+                        // is where the readiness probe looks.
+                        let _ = store.relaxed_tick();
+                    }
+                }
+            })
+            .ok();
+        PeriodicSync {
+            stop: Some(stop),
+            thread,
+            store,
+        }
     }
 
     /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
@@ -907,6 +1101,8 @@ impl FjallStore {
             ungrouped_syncs: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
+            configured: AtomicU8::new(Durability::Group.to_bits()),
+            periodic_seen: AtomicU64::new(0),
             write_refused: AtomicBool::new(false),
             fault: AtomicU8::new(NO_FAULT),
             db,
@@ -1395,26 +1591,25 @@ impl Store for FjallStore {
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
         }
-        // Always `Buffer`: the bytes reach the journal and nothing is synced.
-        // Which sync they get -- if any -- is `sync`'s decision.
-        self.latch(
-            batch
-                .durability(Some(PersistMode::Buffer))
-                .commit()
-                .map_err(StoreError::from),
-        )?;
-        // Rows, not batches: a batch of a hundred is a hundred rows to
-        // merge and compact, and counting it as one would let a path claim
-        // it writes less by bundling the same work.
-        self.written
-            .fetch_add(writes.len() as u64, Ordering::Relaxed);
-        // After the write, so an observer that sees the count move knows the
-        // bytes are already journalled and a sync will cover them.
-        self.journalled.fetch_add(1, Ordering::Release);
-        Ok(())
+        self.finish_batch(batch, writes.len())
+    }
+
+    fn commit_ops_deferred(&self, ops: &[BatchOp]) -> Result<(), StoreError> {
+        self.injected(false)?;
+        let mut batch = self.db.batch();
+        for op in ops {
+            match op {
+                BatchOp::Put(key, value) => {
+                    batch.insert(&self.partition, key.as_slice(), value.as_slice());
+                }
+                BatchOp::Delete(key) => batch.remove(&self.partition, key.as_slice()),
+            }
+        }
+        self.finish_batch(batch, ops.len())
     }
 
     fn sync(&self, durability: Durability) -> Result<(), StoreError> {
+        let durability = self.effective(durability);
         // Every arm takes its syscall from `persist_mode`, so that mapping
         // stays the one place the modes are defined and
         // `durability_modes_map_to_distinct_syscalls` keeps pinning
