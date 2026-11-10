@@ -29,7 +29,8 @@
 //! engine's directory lock is what guarantees no server is writing.
 //!
 //! **Refuses rather than guesses.** A missing or corrupt reachable node, an
-//! unreadable root-holding record, or a row in a root-holding keyspace this
+//! unreadable root-holding record (an undecodable `CurrentState` cache row
+//! is the exception: it is dropped), or a row in a root-holding keyspace this
 //! collector does not read stops the run before anything is deleted. Each
 //! of those means the mark is not the whole truth, and a sweep from a partial
 //! mark deletes live state.
@@ -41,6 +42,14 @@ use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, keyspa
 
 use crate::codec::{CurrentStateRecord, EntryRecord, SidelinedRecord};
 use crate::{ReadView, Store, StoreError};
+
+/// How many dead nodes the sweep holds before it deletes them.
+///
+/// The sweep used to collect every dead address first, which for a store
+/// that is mostly garbage is as large as the mark set. The scan runs under a
+/// snapshot and the mark is complete, so a delete cannot change what the scan
+/// sees: it deletes as it goes, one batch at a time.
+const SWEEP_BATCH: usize = 4096;
 
 /// What one collection found, and what it removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -59,6 +68,15 @@ pub struct GcReport {
     pub swept: u64,
     /// Key and value bytes of the unreachable nodes.
     pub swept_bytes: u64,
+    /// The most dead addresses the sweep held at once: at most
+    /// [`SWEEP_BATCH`], however many nodes were dead.
+    pub peak_pending: u64,
+    /// Batched deletes issued (or, on a dry run, that would be).
+    pub delete_batches: u64,
+    /// `CurrentState` rows that did not decode, deleted (or, on a dry run,
+    /// that would be). The row is a cache, and a room load already ignores
+    /// one it cannot read, so it is not a reason to refuse.
+    pub dropped_cache_rows: u64,
 }
 
 /// Why a collection stopped before sweeping.
@@ -158,36 +176,47 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
         marked: HashSet::new(),
         stack: Vec::new(),
         report: GcReport::default(),
+        dropped: Vec::new(),
     };
-    marker.holders(Keyspace::Log, |value| {
+    marker.holders(Keyspace::Log, Unreadable::Refuse, |value| {
         EntryRecord::decode(value)
             .ok()
             .map(|record| record.state_root)
     })?;
-    marker.holders(Keyspace::Sidelined, |value| {
+    marker.holders(Keyspace::Sidelined, Unreadable::Refuse, |value| {
         SidelinedRecord::decode(value)
             .ok()
             .map(|record| record.state_root)
     })?;
     // A gap event's row is the root of the state after it, then its ID
     // (`rooms::gaps`, and the migration that rewrites these in place).
-    marker.holders(Keyspace::FederationGapEvent, |value| {
+    marker.holders(Keyspace::FederationGapEvent, Unreadable::Refuse, |value| {
         value.get(..32).and_then(|root| root.try_into().ok())
     })?;
     // A cache, but one whose nodes a reopened room reads: sweeping them
-    // would turn the next restart's cheap load back into a resolution.
-    marker.holders(Keyspace::CurrentState, |value| {
+    // would turn the next restart's cheap load back into a resolution. A row
+    // that does not decode names no nodes and is dropped, as `RoomStore`
+    // ignores it at load.
+    marker.holders(Keyspace::CurrentState, Unreadable::Drop, |value| {
         CurrentStateRecord::decode(value)
             .ok()
             .map(|record| record.root)
     })?;
     let Marker {
-        marked, mut report, ..
+        marked,
+        mut report,
+        dropped,
+        ..
     } = marker;
     report.marked = marked.len() as u64;
 
     let prefix = keyspace_prefix(Keyspace::StateNode);
-    let mut garbage: Vec<[u8; 32]> = Vec::new();
+    let mut sweep = Sweep {
+        store,
+        dry_run,
+        pending: Vec::new(),
+    };
+    let mut failure = None;
     view.visit_prefix(&prefix, &mut |key, value| {
         // A key of any other shape is not a node this collector wrote or
         // can judge, so it is left alone rather than counted dead.
@@ -197,22 +226,67 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
         else {
             return Ok(());
         };
-        if !marked.contains(&StateRoot::from_bytes(address)) {
-            garbage.push(address);
-            report.swept_bytes += (key.len() + value.len()) as u64;
+        if marked.contains(&StateRoot::from_bytes(address)) {
+            return Ok(());
         }
-        Ok(())
-    })?;
-    report.swept = garbage.len() as u64;
+        report.swept += 1;
+        report.swept_bytes += (key.len() + value.len()) as u64;
+        sweep.add(key.to_vec(), &mut report).map_err(|error| {
+            failure = Some(error);
+            // Only stops the scan; `failure` is what is reported.
+            StoreError::Backend("state collection stopped".to_owned())
+        })
+    })
+    .map_err(|error| failure.take().unwrap_or(error))?;
     drop(snapshot);
-
-    if !dry_run && !garbage.is_empty() {
-        for address in &garbage {
-            store.delete(&content_addressed(Keyspace::StateNode, address))?;
+    sweep.drain(&mut report)?;
+    report.dropped_cache_rows = dropped.len() as u64;
+    if !dry_run {
+        for chunk in dropped.chunks(SWEEP_BATCH) {
+            store.delete_batch(chunk)?;
         }
         store.flush()?;
     }
     Ok(report)
+}
+
+/// The sweep's buffer of dead keys, deleted a batch at a time.
+struct Sweep<'a, S: Store> {
+    store: &'a S,
+    dry_run: bool,
+    pending: Vec<Vec<u8>>,
+}
+
+impl<S: Store> Sweep<'_, S> {
+    fn add(&mut self, key: Vec<u8>, report: &mut GcReport) -> Result<(), StoreError> {
+        self.pending.push(key);
+        report.peak_pending = report.peak_pending.max(self.pending.len() as u64);
+        if self.pending.len() >= SWEEP_BATCH {
+            self.drain(report)?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self, report: &mut GcReport) -> Result<(), StoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        report.delete_batches += 1;
+        let keys = std::mem::take(&mut self.pending);
+        if self.dry_run {
+            return Ok(());
+        }
+        self.store.delete_batch(&keys)
+    }
+}
+
+/// What a root-holding row that does not decode means.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    /// The root is unknown, so the mark is incomplete: stop.
+    Refuse,
+    /// The row is a cache that names nothing: delete it.
+    Drop,
 }
 
 /// The mark phase's state: what has been reached, and what is still to
@@ -224,6 +298,8 @@ struct Marker<'a> {
     marked: HashSet<StateRoot>,
     stack: Vec<StateRoot>,
     report: GcReport,
+    /// Keys of the [`Unreadable::Drop`] rows that did not decode.
+    dropped: Vec<Vec<u8>>,
 }
 
 impl Marker<'_> {
@@ -231,6 +307,7 @@ impl Marker<'_> {
     fn holders(
         &mut self,
         keyspace: Keyspace,
+        unreadable: Unreadable,
         root_of: impl Fn(&[u8]) -> Option<[u8; 32]>,
     ) -> Result<(), GcError> {
         let view = self.view;
@@ -238,10 +315,16 @@ impl Marker<'_> {
         let scanned = view.visit_prefix(&keyspace_prefix(keyspace), &mut |key, value| {
             let marked = match root_of(value) {
                 Some(root) => self.mark(StateRoot::from_bytes(root)),
-                None => Err(GcError::UnreadableHolder {
-                    keyspace,
-                    key: key.to_vec(),
-                }),
+                None => match unreadable {
+                    Unreadable::Refuse => Err(GcError::UnreadableHolder {
+                        keyspace,
+                        key: key.to_vec(),
+                    }),
+                    Unreadable::Drop => {
+                        self.dropped.push(key.to_vec());
+                        Ok(())
+                    }
+                },
             };
             marked.map_err(|error| {
                 failure = Some(error);

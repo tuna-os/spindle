@@ -67,6 +67,17 @@ that came back smaller. Exits non-zero when anything is absent, and names the
 media IDs rather than only the content hashes: the hash is what the backend
 calls it, the ID is what you have to look for in your other copy.
 
+## Verifying the store
+
+```
+spindle verify <config>
+```
+
+This command checks every room. It reads each record, the whole chain and
+every state root. Run it after a crash, a restore or a disk fault. It names
+each room that fails and exits non-zero. A read error is reported as an
+error, not as a missing node. The server must be stopped.
+
 ## Collecting unreachable state
 
 ```
@@ -92,6 +103,11 @@ the same report and deletes nothing. A second run deletes nothing.
 **It does not guess.** It stops before any delete if a reachable node is
 missing or has the wrong hash. It also stops if it cannot read the root of a
 record. A sweep from an incomplete mark deletes live state.
+The one exception is a current-state cache row that does not decode. A room
+load already ignores such a row, so the command deletes it.
+
+The sweep deletes in batches of 4096 nodes. It does not hold all dead nodes
+in memory. It still holds the set of reachable nodes.
 
 **Offline only**, and not available as a background task. The key of a node
 is its content. When a server makes a node again, it writes the same key
