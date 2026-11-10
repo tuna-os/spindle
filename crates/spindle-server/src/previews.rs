@@ -194,7 +194,10 @@ impl Previews {
             // Lost the race: keep the winner's, whose image is the one a
             // client may already hold, and discard our copy of the image.
             if let Some(id) = image_id(&self.media, &og) {
-                self.media.delete(&id).await.map_err(|e| storage(&e))?;
+                self.media
+                    .delete_unheld(&id)
+                    .await
+                    .map_err(|e| storage(&e))?;
             }
             *held = Some(total);
             return Ok(entry.og.clone());
@@ -205,8 +208,13 @@ impl Previews {
         if let Some(old) = existing {
             // Replaced because stale: its image was re-hosted for it alone.
             total = total.saturating_sub(old.bytes);
+            // Never a quarantined or protected image: a stale preview's
+            // image may have been quarantined as evidence since it was made.
             if let Some(id) = old.media_id {
-                self.media.delete(&id).await.map_err(|e| storage(&e))?;
+                self.media
+                    .delete_unheld(&id)
+                    .await
+                    .map_err(|e| storage(&e))?;
             }
         }
         let evicted = self.evict_over_cap(cache_key, &mut total).await;
@@ -229,12 +237,13 @@ impl Previews {
             if *total <= self.cache_cap {
                 break;
             }
-            // A quarantined image is evidence: the preview that carries it
-            // stays, row and image, even if that leaves the cache over its cap.
+            // A quarantined image is evidence and a protected one was kept on
+            // purpose: the preview that carries either stays, row and image,
+            // even if that leaves the cache over its cap.
             if let Some(id) = &entry.media_id
                 && self
                     .media
-                    .is_quarantined(id)
+                    .is_held(id)
                     .map_err(|error| PreviewError::Storage(error.to_string()))?
             {
                 continue;
@@ -244,7 +253,7 @@ impl Previews {
             *total = total.saturating_sub(entry.bytes);
             if let Some(id) = entry.media_id {
                 self.media
-                    .delete(&id)
+                    .delete_unheld(&id)
                     .await
                     .map_err(|error| PreviewError::Storage(error.to_string()))?;
             }

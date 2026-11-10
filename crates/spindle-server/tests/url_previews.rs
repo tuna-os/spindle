@@ -584,6 +584,106 @@ async fn the_preview_cap_never_evicts_a_quarantined_image() {
     assert_eq!(cache.blob_files(), 2);
 }
 
+/// A stale preview's old image may have been quarantined since it was made.
+/// Replacing the row must not delete evidence: the image and its record stay.
+#[tokio::test]
+async fn refreshing_a_stale_preview_keeps_a_quarantined_old_image() {
+    let (fixture, _) = fixture().await;
+    let cache = Cache::new(1_000_000);
+    let url = format!("http://{fixture}/p/1");
+
+    let og = cache.previews.preview(&url, 1_000).await.unwrap();
+    let old_id = og["og:image"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        cache
+            .media
+            .set_quarantine(&old_id, Some("@admin:example.org"))
+            .unwrap()
+    );
+
+    cache.previews.preview(&url, 1_000 + 3_601).await.unwrap();
+
+    let record = cache.media.record(&old_id).unwrap();
+    assert!(
+        record.is_some_and(|record| record.quarantined_by.is_some()),
+        "the quarantined image survived the refresh"
+    );
+    assert_eq!(
+        cache.media.records().unwrap().len(),
+        2,
+        "the kept evidence and the new image"
+    );
+    // Blobs are content-addressed and both fetches carry the same bytes, so
+    // one file backs both records: it must still be there for the evidence.
+    assert_eq!(
+        cache.blob_files(),
+        1,
+        "the evidence bytes are still on disk"
+    );
+}
+
+/// The cap never removes a preview whose image is protected either.
+#[tokio::test]
+async fn the_preview_cap_never_evicts_a_protected_image() {
+    let (fixture, hits) = fixture().await;
+    let cache = Cache::new(7_000);
+
+    let og = cache
+        .previews
+        .preview(&format!("http://{fixture}/p/0"), 1_000)
+        .await
+        .unwrap();
+    let kept_id = og["og:image"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        cache
+            .media
+            .set_protected(&kept_id, Some("@admin:example.org"))
+            .unwrap()
+    );
+    for n in 1..5_u64 {
+        cache
+            .previews
+            .preview(&format!("http://{fixture}/p/{n}"), 1_000 + n)
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        cache.media.record(&kept_id).unwrap().is_some(),
+        "the protected image is kept"
+    );
+    // Its preview row is kept too: asked again inside the hour it is served
+    // from the cache, with no new fetch of the page or the image.
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    cache
+        .previews
+        .preview(&format!("http://{fixture}/p/0"), 1_010)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "the protected preview is still cached"
+    );
+    assert_eq!(
+        cache.held().0,
+        2,
+        "the oldest preview and the newest remain"
+    );
+}
+
 #[tokio::test]
 async fn refreshing_a_stale_preview_does_not_leave_the_old_image_behind() {
     let (fixture, _) = fixture().await;

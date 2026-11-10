@@ -1168,6 +1168,16 @@ impl Media {
             .is_some_and(|record| record.quarantined_by.is_some()))
     }
 
+    /// Whether `media_id` is quarantined or protected, so that no automatic
+    /// path may remove it (see [`Self::delete_unheld`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn is_held(&self, media_id: &str) -> Result<bool, MediaError> {
+        Ok(self.record(media_id)?.is_some_and(|record| record.held()))
+    }
+
     /// The `mxc://` URI for one of this server's media IDs.
     #[must_use]
     pub fn mxc(&self, media_id: &str) -> String {
