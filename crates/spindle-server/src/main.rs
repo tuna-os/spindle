@@ -909,6 +909,7 @@ async fn serve() -> ExitCode {
     };
 
     tracing::info!("spindle listening on {bind} as {name}");
+    warn_if_proxy_unset(&bind, &config.server.trusted_proxies);
     // The key is established before the listener accepts anything. A server
     // that binds and then discovers it cannot sign has already told a client it
     // was ready to take events it cannot create.
@@ -1767,5 +1768,19 @@ fn shutdown() -> impl Future<Output = ()> {
             let _ = signal::ctrl_c().await;
             tracing::info!("interrupted, draining");
         }
+    }
+}
+
+/// A loopback listener almost always sits behind a reverse proxy, and then
+/// every client's source limit is the proxy's (#831).
+fn warn_if_proxy_unset(bind: &str, trusted: &[spindle_server::client_addr::TrustedProxy]) {
+    let loopback = bind
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback());
+    if loopback && trusted.is_empty() {
+        tracing::warn!(
+            "listening on loopback with no [server] trusted_proxies: behind a reverse proxy \
+             all clients share one source address and one login and registration limit"
+        );
     }
 }

@@ -989,6 +989,13 @@ pub struct ServerConfig {
     /// server name need not be the hostname.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as
+    /// addresses or CIDR networks. Behind a proxy on the same host this is
+    /// `["127.0.0.1", "::1"]`. Empty means the header is never read, which
+    /// is right when clients connect directly and wrong behind a proxy:
+    /// every client then shares the proxy's address and its limits.
+    #[serde(default)]
+    pub trusted_proxies: Vec<crate::client_addr::TrustedProxy>,
     /// Who to contact about this server (spec v1.10), served at
     /// `/.well-known/matrix/support`. Absent means the endpoint answers
     /// 404, which is what the spec says an unconfigured server does.

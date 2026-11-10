@@ -33,6 +33,14 @@ edge and MatrixRTC (#38, #39). The per-account write budgets after them
 | `POST /_spindle/rtc/livekit/sfu/get` and `.../get_token` (built-in LiveKit service), MSC4195's `get_token` | user | 20 per 60 s | every request that carried a live OpenID token or access token, before the membership check |
 | the same, with another server's OpenID token, and the MSC4195 federation `get_token` | that server | 60 per 60 s | every request that names the server, before this server asks it to confirm the token |
 
+Source limits key on the TCP peer address. Behind a reverse proxy that is
+the proxy, so set `[server] trusted_proxies` to the proxy addresses. The
+server then reads the last `X-Forwarded-For` entry that no trusted proxy
+wrote. From any other peer it ignores the header. IPv6 sources share one key
+per /64 network. When the counter table is full, the server drops the oldest
+counters that are still under their limit and keeps every counter that is
+refusing a caller.
+
 The two mints are limited because they are not reads: an OpenID token is a
 durable row written on the caller's say-so, and both tokens exist to make
 a third party — a JWT service, an SFU — do work. Minting is an HMAC here
