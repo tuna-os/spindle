@@ -1061,6 +1061,7 @@ fn provision(
     if state
         .appservices
         .exclusively_claims(&accounts.user_id(&wanted))
+        || crate::server_notices::is_reserved_localpart(state, &wanted)
     {
         return Err(taken());
     }

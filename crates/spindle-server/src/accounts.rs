@@ -94,6 +94,13 @@ pub struct Account {
     /// not joined when they were sent, as Synapse does (#576).
     #[serde(default)]
     pub erased: bool,
+    /// Created by a service's own flow (appservice sender, server notices)
+    /// with a password nobody holds. Only such an account may be adopted
+    /// by the service later: a user who registered the name first holds a
+    /// password and would otherwise keep a login to the service's identity.
+    /// Cleared when a password is set, since someone then holds one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_owned: bool,
 }
 
 /// What a MAS password scheme adds to the plain hash (#797). MAS keeps it
@@ -222,6 +229,27 @@ impl<'a, S: Store> Accounts<'a, S> {
     /// Returns [`AccountError::UserInUse`] if the localpart is taken, or a
     /// storage error.
     pub fn register(&self, localpart: &str, password: &str) -> Result<Account, AccountError> {
+        self.register_with(localpart, password, false)
+    }
+
+    /// Register an account for a service's own identity (an appservice's
+    /// sender or user, the server-notices account) with a password nobody
+    /// holds, marked [`Account::service_owned`] so the service may later
+    /// adopt it and nobody else's account.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register`].
+    pub fn register_service(&self, localpart: &str) -> Result<Account, AccountError> {
+        self.register_with(localpart, &unguessable_password(), true)
+    }
+
+    fn register_with(
+        &self,
+        localpart: &str,
+        password: &str,
+        service_owned: bool,
+    ) -> Result<Account, AccountError> {
         validate_localpart(localpart)?;
         if self.account(localpart)?.is_some() {
             return Err(AccountError::UserInUse);
@@ -239,6 +267,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             locked: false,
             suspended: false,
             erased: false,
+            service_owned,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -278,6 +307,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             locked: false,
             suspended: false,
             erased: false,
+            service_owned: false,
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
@@ -793,6 +823,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         };
         account.password_hash = password_hash;
         account.password_scheme = None;
+        account.service_owned = false;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
         self.durable()?;

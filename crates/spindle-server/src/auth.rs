@@ -153,14 +153,37 @@ fn appservice_identity(
         })
         .unwrap_or_else(|| format!("appservice_{}", registration.id));
     let accounts = Accounts::new(state.store.as_ref(), server_name);
-    let known = accounts
+    let existing = accounts
         .account(localpart)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .is_some();
-    if !known {
-        accounts
-            .register(localpart, &crate::accounts::unguessable_password())
-            .map_err(|error| crate::routes::internal(&error))?;
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    match existing {
+        None => {
+            accounts
+                .register_service(localpart)
+                .map_err(|error| crate::routes::internal(&error))?;
+        }
+        // The sender is the service's own identity. An account already
+        // under that name that the service did not create may have a user's
+        // password on it, so the service is refused rather than handed it.
+        // Other namespace users stay adoptable: non-exclusive namespaces
+        // overlap real users on purpose.
+        Some(account)
+            if !account.service_owned
+                && registration
+                    .sender_localpart
+                    .eq_ignore_ascii_case(localpart) =>
+        {
+            return Err(MatrixError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                format!(
+                    "{user_id} already exists and was not created by the {} appservice; \
+                     it cannot be used as the service's sender",
+                    registration.id
+                ),
+            ));
+        }
+        Some(_) => {}
     }
     Ok(Identity {
         user_id,
