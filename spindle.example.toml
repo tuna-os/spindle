@@ -240,7 +240,9 @@ retry_base_ms = 1000
 # a gap in the room's history; this fetches that history with /backfill
 # (one /state_ids per chunk), verifies every event, and stores it so
 # /messages and /context serve it. Backfilled events never notify, never
-# change the room's current state and are never sent on.
+# change the room's current state and are never sent on. The same loop
+# retries events refused for missing dependencies, so a room's newest event
+# is not lost when no later event names it.
 gap_backfill = true
 # Events per /backfill request, and so per chunk.
 gap_backfill_chunk = 100
@@ -266,7 +268,8 @@ gap_acceptance_window_secs = 600
 # A dependency that failed verification (a forged body, or a signature
 # whose key cannot be found) is not fetched again for this many seconds.
 # In that time, a pushed event that names it is refused at once, without
-# a new recovery or gap acceptance; the sender sends it again later.
+# a new recovery or gap acceptance. This server keeps the event and
+# judges it again from the gap backfill loop.
 # 0 turns this off.
 dependency_failure_ttl_secs = 300
 

@@ -576,6 +576,12 @@ pub enum Keyspace {
     /// rather than its issuer, so an operator can move a provider to a new
     /// URL without orphaning every link.
     UpstreamLink = 0x49,
+    /// `(room_id, event_id)` -> a pushed PDU this server refused for
+    /// missing dependencies without storing a verdict (#822): its body, the
+    /// server that sent it, and how often it was tried again. The
+    /// gap-backfill loop retries each until it is applied or given up on,
+    /// so the newest event of a room that then goes quiet is not lost.
+    OwedEvent = 0x4b,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -918,6 +924,14 @@ pub fn historical_rejection(room_id: &str, event_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn federation_gap(room_id: &str, event_id: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::FederationGap, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
+/// One owed event ([`Keyspace::OwedEvent`]).
+#[must_use]
+pub fn owed_event(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::OwedEvent, room_id);
     key.extend_from_slice(event_id.as_bytes());
     key
 }

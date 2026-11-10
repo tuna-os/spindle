@@ -400,6 +400,8 @@ pub struct Metrics {
     gaps_remaining: AtomicU64,
     /// Requests refused by `[federation] allow`/`deny`, by direction.
     federation_listed: [AtomicU64; 2],
+    /// Pushed PDUs refused for missing dependencies and owed a retry (a gauge).
+    owed_events: AtomicU64,
     /// Peer signing-key lookups and event signature failures.
     keys: KeyMetrics,
     auth: AuthCounters,
@@ -484,6 +486,7 @@ impl Default for Metrics {
             backfill_events: Default::default(),
             gaps_remaining: AtomicU64::new(0),
             federation_listed: [AtomicU64::new(0), AtomicU64::new(0)],
+            owed_events: AtomicU64::new(0),
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
@@ -1783,6 +1786,18 @@ impl Metrics {
         self.backfill_events[slot(&BackfillEvent::ALL, kind)].load(Ordering::Relaxed)
     }
 
+    /// Set the number of owed events: refused for missing dependencies,
+    /// not yet applied. A gauge, set by the backfill loop each pass.
+    pub fn set_owed_events(&self, owed: u64) {
+        self.owed_events.store(owed, Ordering::Relaxed);
+    }
+
+    /// Read the owed-events gauge, for tests.
+    #[must_use]
+    pub fn owed_events(&self) -> u64 {
+        self.owed_events.load(Ordering::Relaxed)
+    }
+
     /// Read the gauge, for tests that assert it moved.
     #[must_use]
     pub fn gaps_remaining(&self) -> u64 {
@@ -1967,6 +1982,12 @@ impl Metrics {
             "spindle_federation_gaps_remaining {}",
             self.gaps_remaining()
         );
+        out.push_str(
+            "# HELP spindle_federation_owed_events Pushed events refused for missing \
+         dependencies that are still waiting for a retry.\n\
+         # TYPE spindle_federation_owed_events gauge\n",
+        );
+        let _ = writeln!(out, "spindle_federation_owed_events {}", self.owed_events());
         out.push_str(
             "# HELP spindle_federation_backfill_duration_seconds Time one gap \
          backfill chunk took, by result.\n\

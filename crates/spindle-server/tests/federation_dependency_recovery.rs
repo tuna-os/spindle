@@ -332,7 +332,7 @@ impl Harness {
             )
         });
         let version = version_id;
-        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n").unwrap();
+        let config = spindle_server::Config::parse("[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n[federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\ngap_backfill_idle_ms = 100\ngap_backfill_interval_ms = 50\ngap_backfill_retry_ms = 100\n").unwrap();
         let metrics = Arc::new(Metrics::new());
         let app =
             spindle_server::app_with_metrics(config, Arc::clone(&store), Arc::clone(&metrics))
@@ -839,9 +839,49 @@ async fn a_hung_recovery_answers_within_the_budget_and_holds_back_no_other_room(
     )
     .await;
     assert!(harness.held(&first.0) && harness.held(&second.0));
-    assert!(!harness.held(&crowded.0));
     assert_eq!(missing_asked(&harness.peer), 1, "no recovery ran twice");
     assert_eq!(admitted(RecoveryAdmission::Started), 2);
     assert_eq!(admitted(RecoveryAdmission::Joined), 1);
     assert_eq!(admitted(RecoveryAdmission::Busy), 1);
+}
+
+/// #822: the newest event of a room, refused because the room already has
+/// two recoveries in flight, is not lost. The sender was answered 200 and
+/// does not send it again, and no later event arrives. The gap-backfill
+/// loop applies it once its predecessor is placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tip_event_refused_while_the_room_was_busy_is_applied_later() {
+    let harness = Harness::new(11).await;
+    let first = harness.message(&harness.head, "first");
+    let second = harness.message(&first, "second");
+    let latest = harness.message(&second, "latest");
+    let branch = harness.message(&first, "branch");
+    let tip = harness.message(&second, "tip");
+    *harness.peer.window.lock().unwrap() = vec![second.1.clone(), first.1.clone()];
+    harness.peer.hang(true);
+
+    let held = tokio::spawn(answer(harness.transaction("held", &[&latest])));
+    let queued = tokio::spawn(answer(harness.transaction("queued", &[&branch])));
+    let admitted = |result| harness.metrics.recovery_admission_count(result);
+    wait_until("the room has two recoveries", MARGIN, || {
+        admitted(RecoveryAdmission::Started) == 2
+    })
+    .await;
+    let response = answer(harness.transaction("tip", &[&tip])).await;
+    let refusal = response["pdus"][&tip.0]["error"].as_str().unwrap_or("");
+    assert!(refusal.contains("in flight"), "{response}");
+    assert!(!harness.held(&tip.0));
+
+    harness.peer.hang(false);
+    held.await.unwrap();
+    queued.await.unwrap();
+    // No event follows the tip: only the retry can place it.
+    wait_until("the owed tip event is applied", MARGIN, || {
+        harness.held(&tip.0)
+    })
+    .await;
+    wait_until("nothing is owed any more", MARGIN, || {
+        harness.metrics.owed_events() == 0
+    })
+    .await;
 }

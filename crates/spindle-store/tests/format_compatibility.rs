@@ -197,6 +197,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::FederationGapSpan, 0x47),
         (Keyspace::PendingRedaction, 0x48),
         (Keyspace::UpstreamLink, 0x49),
+        (Keyspace::OwedEvent, 0x4b),
         (Keyspace::PendingKnock, 0x32),
         (Keyspace::OpenIdToken, 0x33),
         (Keyspace::Sticky, 0x34),
