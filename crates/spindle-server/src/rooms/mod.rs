@@ -172,9 +172,22 @@ pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
 pub use partial::PartialState;
 
+/// What a search tests each event with, and what the word index may use to
+/// skip events (#830).
+#[derive(Clone, Copy)]
+pub struct SearchPlan<'a> {
+    /// The lowercase text `matches` looks for in `content.body`, when that
+    /// is all it tests besides filters. `None` means the index is no help.
+    pub needle: Option<&'a str>,
+    /// The predicate that decides a hit.
+    pub matches: &'a (dyn Fn(&Value) -> bool + Sync),
+}
+
 pub struct Rooms {
     policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,
     store: Arc<FjallStore>,
+    /// `[search] index`: maintain and use the word index (#830).
+    search_index: std::sync::atomic::AtomicBool,
     /// Which destinations have PDUs queued, shared with the delivery loop
     /// ([`Self::outbox`]).
     outbox: Arc<crate::federation::outbox::OutboxIndex>,
@@ -585,6 +598,7 @@ impl Rooms {
         Ok(Self {
             policy_federation: Mutex::new(None),
             outbox: Arc::new(crate::federation::outbox::OutboxIndex::load(&store)),
+            search_index: std::sync::atomic::AtomicBool::new(false),
             store,
             server_name: server_name.into(),
             metrics,
@@ -2668,6 +2682,32 @@ impl Rooms {
         Ok(redaction_id)
     }
 
+    /// Drop the index rows of an event whose body is going away. Run while
+    /// the body is still in hand, so its words are known.
+    pub(super) fn unindex_body(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        body: &Value,
+    ) -> Result<(), RoomError> {
+        if !self.search_indexed() {
+            return Ok(());
+        }
+        let (Some(text), Some(li)) = (
+            crate::search_index::body_of(body),
+            self.event_position(room_id, event_id)?,
+        ) else {
+            return Ok(());
+        };
+        crate::search_index::remove(
+            self.store.as_ref(),
+            room_id,
+            spindle_core::LinearIndex::from_raw(li),
+            text,
+        )?;
+        Ok(())
+    }
+
     /// Rewrite a stored event to its redacted form.
     pub(super) fn apply_redaction(
         &self,
@@ -2685,6 +2725,7 @@ impl Rooms {
         // client can see why without the ID changing.
         let version = self.room_version(room_id)?;
         let json = Self::redacted_body(&version, &stored, redaction_id)?;
+        self.unindex_body(room_id, target, &stored)?;
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -3589,10 +3630,13 @@ impl Rooms {
     /// below `from`, of the positions `visible` admits: at most `limit` of
     /// them, and the position a following page starts below.
     ///
-    /// This is `/search` (#7's "search basics"), and it is a walk, not an
-    /// index: every body the walk passes is read and put to `matches`, so a
-    /// search costs the room it searches, back to the oldest position the
-    /// caller may see or until `limit` hits are in hand. The candidates are
+    /// This is `/search` (#7's "search basics"), and it is a walk: every
+    /// body the walk passes is read and put to `matches`, so a search costs
+    /// the room it searches, back to the oldest position the caller may see
+    /// or until `limit` hits are in hand. With `[search] index` on and a
+    /// `needle` that `matches` tests as lowercase containment in
+    /// `content.body`, the word index drops the positions that cannot match
+    /// first, so only the candidates are read (#830). The candidates are
     /// taken from the spine under the room's read lock and the bodies read
     /// outside it, as `messages_visible` does. A purged body below the
     /// watermark is not a hit (there is nothing to match), where every
@@ -3608,8 +3652,9 @@ impl Rooms {
         from: Option<i64>,
         limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
-        matches: &(dyn Fn(&Value) -> bool + Sync),
+        plan: &SearchPlan<'_>,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        let SearchPlan { needle, matches } = *plan;
         let candidates: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
@@ -3618,14 +3663,33 @@ impl Rooms {
                 .filter(|(li, _)| from.is_none_or(|from| *li < from) && visible(*li))
                 .collect())
         })?;
+        // The index only marks candidates that cannot match. They stay in
+        // the walk, unread: a page that ends on one still says a further
+        // page may follow, exactly as the scan does. Read after the
+        // spine, so every position it covers has its rows already: an
+        // append writes its rows and moves the marker in one batch.
+        let mut skipped = vec![false; candidates.len()];
+        if let Some(needle) = needle.filter(|_| self.search_indexed())
+            && let Some(marked) = crate::search_index::marker(self.store.as_ref(), room_id)?
+            && let Some(narrowed) =
+                crate::search_index::candidates(self.store.as_ref(), room_id, needle)?
+        {
+            skipped = candidates
+                .iter()
+                .map(|(li, _)| *li <= marked && !narrowed.contains(li))
+                .collect();
+        }
         let watermark = self.purge_watermark(room_id)?;
         let erased = self.erased_users()?;
         let mut hits = Vec::new();
-        for (li, event_id) in candidates {
+        for ((li, event_id), skip) in candidates.into_iter().zip(skipped) {
             if hits.len() == limit {
                 // This candidate is where the next page begins: `from` is
                 // exclusive, so one above it.
                 return Ok((hits, Some(li + 1)));
+            }
+            if skip {
+                continue;
             }
             let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
                 Ok(json) => json,
@@ -6006,6 +6070,44 @@ impl Rooms {
                 .any(|(room, _)| room == room_id)
     }
 
+    /// Turn the `/search` word index on or off (`[search] index`).
+    pub fn set_search_index(&self, on: bool) {
+        self.search_index
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn search_indexed(&self) -> bool {
+        self.search_index.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The index rows an entry adds, in its own batch: its words, and the
+    /// room's marker when this entry extends the indexed range without a
+    /// gap. Nothing when the index is off.
+    fn search_rows(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        json: &Value,
+    ) -> Result<Vec<spindle_store::Record>, RoomError> {
+        if !self.search_indexed() {
+            return Ok(Vec::new());
+        }
+        let mut rows = crate::search_index::body_of(json)
+            .map(|body| crate::search_index::rows(room_id, entry.li, body))
+            .unwrap_or_default();
+        let previous = log
+            .entries()
+            .rev()
+            .find(|candidate| candidate.li < entry.li)
+            .map(|candidate| candidate.li.get());
+        let current = crate::search_index::marker(self.store.as_ref(), room_id)?;
+        if let Some(next) = crate::search_index::next_marker(current, previous, entry.li.get()) {
+            rows.push(crate::search_index::marker_row(room_id, next));
+        }
+        Ok(rows)
+    }
+
     /// Set the most rooms to hold open at once; `0` lifts the limit.
     /// See [`Self::enforce_resident_budget`].
     pub fn set_max_resident_rooms(&self, limit: usize) {
@@ -7373,6 +7475,10 @@ impl Rooms {
             event_body_key(room_id, event_id),
             serde_json::to_vec(input.json)?,
         )];
+        // The search index rides the batch for the same reason: a word row
+        // without its event, or an event the index skips, would make a search
+        // disagree with the log (#830).
+        extra.extend(self.search_rows(log, room_id, entry, input.json)?);
         // The client's transaction, for the same reason: a retry finds it if
         // and only if the event is there to be found (#779).
         if let Some(transaction) = input.transaction {

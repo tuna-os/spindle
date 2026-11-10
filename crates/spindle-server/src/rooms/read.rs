@@ -477,13 +477,35 @@ impl RoomReader<'_> {
         limit: usize,
         matches: &(dyn Fn(&Value) -> bool + Sync),
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        self.search_planned(
+            from,
+            limit,
+            &super::SearchPlan {
+                needle: None,
+                matches,
+            },
+        )
+    }
+
+    /// [`Self::search`] with a plan, whose `needle` lets the word index
+    /// skip positions (#830).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`].
+    pub fn search_planned(
+        &self,
+        from: Option<i64>,
+        limit: usize,
+        plan: &super::SearchPlan<'_>,
+    ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
         self.rooms.search(
             &self.user_id,
             &self.room_id,
             from,
             limit,
             &|li| self.scope.admits(li),
-            matches,
+            plan,
         )
     }
 

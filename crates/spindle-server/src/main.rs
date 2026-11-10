@@ -178,7 +178,36 @@ fn store_maintenance_command() -> Option<ExitCode> {
             };
             Some(verify(&config_path))
         }
+        // `spindle reindex-search <config>` -- rebuild the `/search` word
+        // index from the log (#830). Offline like `verify`.
+        "reindex-search" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle reindex-search <config>");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(reindex_search(&config_path))
+        }
         _ => None,
+    }
+}
+
+/// Rebuild every room's search index from its log.
+fn reindex_search(config_path: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_server::search_index::reindex(&store) {
+        Ok(report) => {
+            println!(
+                "reindex-search: {} rooms, {} log entries, {} index rows written",
+                report.rooms, report.entries, report.rows
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("reindex-search: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

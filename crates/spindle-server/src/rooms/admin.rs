@@ -370,7 +370,12 @@ impl RoomAdmin<'_> {
         let mut doomed = Vec::new();
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);
-            if spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)?.is_some() {
+            if let Some(bytes) = spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)? {
+                // The words go with the body: an index row for a body that
+                // is gone would only cost a read, but it is derived data.
+                if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    self.rooms.unindex_body(room_id, event_id, &body)?;
+                }
                 doomed.push(spindle_store::BatchOp::Delete(key));
             }
         }

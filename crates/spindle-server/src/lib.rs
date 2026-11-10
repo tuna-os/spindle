@@ -78,6 +78,7 @@ pub mod room_routes;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
+pub mod search_index;
 pub mod secrets;
 pub mod server_acl;
 pub mod server_notices;
@@ -477,6 +478,7 @@ fn open_rooms(
     )
     .map_err(|error| AppError::Store(error.to_string()))?;
     rooms.set_max_resident_rooms(config.storage.max_resident_rooms);
+    rooms.set_search_index(config.search.index);
     Ok(Arc::new(rooms))
 }
 

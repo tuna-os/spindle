@@ -141,11 +141,9 @@ fn order_preserving_encoding_survives_the_sign_boundary() {
     );
 }
 
-/// Keyspaces are discriminants written into every key. Reusing or reordering one
-/// makes two record types collide in the same byte range.
-#[test]
-fn keyspace_discriminants_are_unchanged() {
-    let table = [
+/// Every keyspace and the byte it owns. Its own function keeps the test short.
+fn keyspace_table() -> Vec<(Keyspace, u8)> {
+    vec![
         (Keyspace::Log, 0x01_u8),
         (Keyspace::EventIndex, 0x02),
         (Keyspace::StateNode, 0x03),
@@ -232,7 +230,17 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),
         (Keyspace::RoomStateDelta, 0x66),
-    ];
+        (Keyspace::SearchPosting, 0x80),
+        (Keyspace::SearchVocab, 0x81),
+        (Keyspace::SearchMarker, 0x82),
+    ]
+}
+
+/// Keyspaces are discriminants written into every key. Reusing or reordering one
+/// makes two record types collide in the same byte range.
+#[test]
+fn keyspace_discriminants_are_unchanged() {
+    let table = keyspace_table();
     let mut owner = std::collections::BTreeMap::new();
     for (keyspace, expected) in table {
         let key = room_prefix(keyspace, ROOM);
