@@ -381,6 +381,11 @@ impl SyncResult {
     }
 }
 
+/// One room's share of an incremental sync: its events, whether they were
+/// limited, where they begin, whether the room is told afresh, and what a
+/// skipped span changed in its state (#820).
+type RoomWindow = (Vec<Value>, bool, Option<i64>, bool, Vec<Value>);
+
 /// The state a window changed, as MSC4222's `state_after` wants it: the
 /// last event in the window for each `(type, state_key)` it touched. The
 /// window runs to the head, so the last event for a key *is* the state
@@ -4031,44 +4036,14 @@ impl Rooms {
             // takes a `prev_batch` for a room it already knew only when the
             // window is `limited`, so a join sent as a one-event slice left
             // Element unable to page back to anything said before it.
-            let (events, limited, prev_batch, fresh) = match range {
+            let (events, limited, prev_batch, fresh, skipped_state) = match range {
                 None => {
                     let (events, limited, prev_batch) =
                         self.timeline_tail(room_id, timeline_limit)?;
-                    (events, limited, prev_batch, true)
+                    (events, limited, prev_batch, true, Vec::new())
                 }
                 Some((since, until)) => {
-                    let slice = self.room_slice(room_id, since, until)?;
-                    // A join lands in the window, so a quiet room needs no
-                    // lookup: `sync_cost.rs` counts reads per joined room,
-                    // and this must stay flat across rooms where nothing
-                    // happened.
-                    let joined_at = if slice.is_empty() {
-                        None
-                    } else {
-                        self.membership_li(room_id, user_id)?
-                    };
-                    // A partial-state room whose resync completed in the
-                    // window is told afresh too (MSC3706): the members the
-                    // resync filled in were never timeline events, so the
-                    // state block of a fresh room is the only place a
-                    // client can learn of them. An in-memory check, so the
-                    // quiet room still costs no read.
-                    if joined_at.is_some_and(|li| slice.contains(&li))
-                        || self.resynced_between(room_id, since, until)
-                    {
-                        let (events, limited, prev_batch) =
-                            self.timeline_tail(room_id, timeline_limit)?;
-                        (events, limited, prev_batch, true)
-                    } else {
-                        let first = slice.iter().copied().min();
-                        (
-                            self.timeline_of(room_id, &slice, None)?,
-                            false,
-                            first,
-                            false,
-                        )
-                    }
+                    self.incremental_window(room_id, user_id, since, until, timeline_limit)?
                 }
             };
             // An incremental sync says nothing about a room where nothing
@@ -4099,9 +4074,16 @@ impl Rooms {
                     state_after,
                 )?
             } else if state_after {
-                (state_changed_in(&events), false)
+                // The block is the whole answer under `state_after`, so it
+                // covers the skipped span as well as the window.
+                let mut changed = skipped_state;
+                changed.extend(events.iter().cloned());
+                (state_changed_in(&changed), false)
             } else {
-                (Vec::new(), false)
+                // The state at the start of the timeline: what it was, plus
+                // what the skipped span changed. Empty unless the window was
+                // limited, because otherwise the timeline carries it all.
+                (skipped_state, false)
             };
             rooms.push(SyncRoom {
                 room_id: room_id.clone(),
@@ -4706,6 +4688,88 @@ impl Rooms {
             }
         }
         Ok(out)
+    }
+
+    /// One joined room's share of an incremental sync over `(since, until]`:
+    /// its events, whether they were limited, where they begin, whether the
+    /// room is told afresh, and what a skipped span changed in its state.
+    fn incremental_window(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        since: u64,
+        until: u64,
+        timeline_limit: usize,
+    ) -> Result<RoomWindow, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        // A join lands in the window, so a quiet room needs no
+        // lookup: `sync_cost.rs` counts reads per joined room,
+        // and this must stay flat across rooms where nothing
+        // happened.
+        let joined_at = if slice.is_empty() {
+            None
+        } else {
+            self.membership_li(room_id, user_id)?
+        };
+        // A partial-state room whose resync completed in the
+        // window is told afresh too (MSC3706): the members the
+        // resync filled in were never timeline events, so the
+        // state block of a fresh room is the only place a
+        // client can learn of them. An in-memory check, so the
+        // quiet room still costs no read.
+        if joined_at.is_some_and(|li| slice.contains(&li))
+            || self.resynced_between(room_id, since, until)
+        {
+            let (events, limited, prev_batch) = self.timeline_tail(room_id, timeline_limit)?;
+            Ok((events, limited, prev_batch, true, Vec::new()))
+        } else {
+            // The newest `timeline_limit` events, as an initial
+            // sync gives. A client back after a week used to get
+            // every event of every room in one response, with
+            // `limited` false so it never knew to page (#820).
+            // `slice` is in stream order and a room's stream
+            // order is its log order.
+            let skip = slice.len().saturating_sub(timeline_limit);
+            let (dropped, kept) = slice.split_at(skip);
+            let first = kept.iter().copied().min();
+            // What the skipped span changed in the room's state,
+            // which the client cannot read from a timeline that
+            // no longer carries it.
+            let skipped_state = if dropped.is_empty() {
+                Vec::new()
+            } else {
+                self.state_events_of(room_id, dropped)?
+            };
+            Ok((
+                self.timeline_of(room_id, kept, None)?,
+                !dropped.is_empty(),
+                first,
+                false,
+                skipped_state,
+            ))
+        }
+    }
+
+    /// The state events among `indices`, last one for each `(type,
+    /// state_key)`, oldest first.
+    ///
+    /// Which entries are state events is in the log already, so the bodies
+    /// read are the state events' and not every event's: a limited
+    /// incremental sync must not read the span it is skipping (#820).
+    fn state_events_of(&self, room_id: &str, indices: &[i64]) -> Result<Vec<Value>, RoomError> {
+        let state_ids = self.with_room_read(room_id, |_, log| {
+            Ok(indices
+                .iter()
+                .filter_map(|&li| log.entry_at(li))
+                .filter(|entry| entry.state_key.is_some())
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect::<Vec<_>>())
+        })?;
+        let mut events = Vec::with_capacity(state_ids.len());
+        for event_id in &state_ids {
+            events.push(self.event(room_id, event_id)?);
+        }
+        Ok(state_changed_in(&events))
     }
 
     /// Events that entered the global stream in `(since, until]`, in
