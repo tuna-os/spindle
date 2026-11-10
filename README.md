@@ -201,7 +201,7 @@ cargo feature, which is off by default and is not in the release builds.
 | **M6** Differentiators | In progress | Hub mode is built behind the off-by-default `hub-mode` feature and tested between Spindle peers. MLS is a recorded no-go ([docs/mls.md](docs/mls.md)) |
 | **M7** MatrixRTC | Server side served | **MSC4140 delayed events** — the dead-man's switch that stops calls accumulating ghost participants, which no other Rust homeserver served when Spindle added it — plus MSC4354 sticky events, MSC4143 transport discovery, a built-in LiveKit JWT service or the OpenID round trip for an external one, ringing and decline. Element Call's own Playwright suite runs with Spindle in Synapse's seat: thirteen specs pass, among them a two-party call with video through LiveKit and MatrixRTC 2.0 sticky-event membership with a rejoin after an improper leave. Spindle's own specs in the same rig add ringing, churn, a restart mid-call and a federated call |
 
-**306 routes** and a **424-test Complement ratchet** in CI, over a workspace of
+**316 routes** and a **424-test Complement ratchet** in CI, over a workspace of
 100+ test suites. The first two are gated — the [dashboard](docs/dashboard.md)
 is parsed from the router and CI fails on drift, and the ratchet is a file every
 entry of which must pass — so what they say matches `main` rather than matching
