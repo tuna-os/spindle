@@ -1859,12 +1859,23 @@ fn shutdown() -> impl Future<Output = ()> {
 }
 
 fn warn_if_registration_open(config: &Config, bind: &str) {
-    if config.open_registration_exposed() {
-        tracing::warn!(
-            "registration is open to anyone who can reach {bind}: set [registration] \
-             require_token = true, or bind to a loopback address behind a proxy that limits sign-ups"
-        );
+    if !config.open_registration_exposed() {
+        return;
     }
+    // Recommending the token is deliberate: it is the only control that
+    // lets an operator choose who joins. A CAPTCHA only slows bots, so it
+    // gets its own wording and does not silence the warning.
+    let advice = if config.registration.captcha.is_some() {
+        "the CAPTCHA slows bots, but anyone can still register. Set [registration] \
+         require_token = true to choose who joins"
+    } else {
+        "anyone can create accounts and use this server's storage. Set [registration] \
+         require_token = true (recommended), or set [registration.captcha] to slow bots"
+    };
+    tracing::warn!(
+        "registration is open to anyone who can reach {bind}: {advice}. A loopback bind \
+         behind a proxy that limits sign-ups is also safe"
+    );
 }
 
 /// A loopback listener almost always sits behind a reverse proxy, and then

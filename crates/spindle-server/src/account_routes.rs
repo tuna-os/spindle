@@ -403,25 +403,22 @@ fn registration_challenge(
     } else {
         "m.login.dummy"
     };
-    let terms = crate::registration_terms::enabled(state);
-    // The policy comes first in every flow, so no stage after it can be
-    // reached around it.
+    // The policy and CAPTCHA come first in every flow, in that order, so
+    // no stage after them can be reached around them.
+    let before: Vec<&'static str> = crate::registration_stages::required(state)
+        .into_iter()
+        .map(|(_, stage)| stage)
+        .collect();
     let staged = |stage: &'static str| {
-        if terms {
-            json!({ "stages": [crate::registration_terms::STAGE, stage] })
-        } else {
-            json!({ "stages": [stage] })
-        }
+        let mut stages = before.clone();
+        stages.push(stage);
+        json!({ "stages": stages })
     };
     let mut flows = vec![staged(uia_stage)];
     if crate::threepid::registration_by_email(state) {
         flows.push(staged("m.login.email.identity"));
     }
-    let params = if terms {
-        json!({ crate::registration_terms::STAGE: crate::registration_terms::params(state) })
-    } else {
-        json!({})
-    };
+    let params = crate::registration_stages::params(state);
     let mut body = json!({
         "flows": flows,
         "params": params,
@@ -467,6 +464,23 @@ fn reserved_by_service() -> MatrixError {
     )
 }
 
+/// Refuses a localpart a service identity or an exclusive appservice
+/// namespace holds.
+fn refuse_reserved_localpart(state: &AppState, name: &str) -> Result<(), MatrixError> {
+    if crate::server_notices::is_reserved_localpart(state, name) {
+        return Err(reserved_by_service());
+    }
+    let user_id = format!("@{name}:{}", state.config.server.name);
+    if state.appservices.exclusively_claims(&user_id) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_EXCLUSIVE",
+            "this localpart is reserved by an application service",
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /_matrix/client/v3/register`
 ///
 /// One UIA stage, `m.login.dummy`: the first request without `auth` gets a 401
@@ -503,9 +517,9 @@ async fn register(
     // run even when no auth has been presented yet. Capitals are folded
     // down rather than refused: the localpart grammar is lowercase, and a
     // client typing "Alice" means alice.
-    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let username = request.username.as_deref().map(str::to_lowercase);
     if let Some(name) = username.as_deref() {
+        let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
         match accounts.availability(name) {
             Ok(()) => {}
             Err(AccountError::UserInUse) => return Err(MatrixError::user_in_use()),
@@ -528,17 +542,7 @@ async fn register(
     // dance for the same reason the username checks are — a client should
     // not complete auth for a name it can never have.
     if let Some(name) = username.as_deref() {
-        if crate::server_notices::is_reserved_localpart(&state, name) {
-            return Err(reserved_by_service());
-        }
-        let user_id = format!("@{name}:{}", state.config.server.name);
-        if state.appservices.exclusively_claims(&user_id) {
-            return Err(MatrixError::new(
-                StatusCode::BAD_REQUEST,
-                "M_EXCLUSIVE",
-                "this localpart is reserved by an application service",
-            ));
-        }
+        refuse_reserved_localpart(&state, name)?;
     }
 
     // The challenge is the *body* of the 401, not an error wrapping it:
@@ -552,14 +556,18 @@ async fn register(
     // dummy stage carries no state a session would tie back to, and
     // Synapse accepts it. Its integration suite was refused here on every
     // test until this did.
-    if crate::registration_terms::enabled(&state)
-        && let Some(refusal) = crate::registration_terms::gate(
+    if !crate::registration_stages::required(&state).is_empty()
+        && let Some(refusal) = crate::registration_stages::gate(
+            &state,
             request.auth.as_ref(),
+            &source.to_string(),
             registration_challenge(&state, None),
         )
+        .await
     {
         return Ok(refusal);
     }
+    let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let (registration_token, address) = match registration_auth(&state, &request)? {
         Ok(done) => done,
         Err(challenge) => return Ok(challenge),

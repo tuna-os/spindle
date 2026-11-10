@@ -165,6 +165,21 @@ allow_private = []
 # integration explicitly needs it: this secret can create administrator users.
 # shared_secret = "replace-with-a-long-random-secret"
 
+# A CAPTCHA every new account solves (`m.login.recaptcha`, the legacy
+# registration flow). `provider` is "recaptcha", "hcaptcha" or "turnstile".
+# Prefer `secret_key_file` to `secret_key`: set exactly one. The secret is
+# never logged. `verify_url` replaces the provider's endpoint, and
+# `allow_internal` lists CIDR ranges that URL may sit in if they are not
+# routable (for a test stub). A provider that does not answer refuses the
+# registration.
+# [registration.captcha]
+# provider = "turnstile"
+# site_key = "0x4AAAAAAA-example"
+# secret_key_file = "/run/secrets/captcha_secret"
+# secret_key = "inline-secret"   # instead of secret_key_file
+# verify_url = "https://captcha.example.org/siteverify"
+# allow_internal = []
+
 # Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
 # Absent, the endpoint refuses and says so. The account is created on first use.
 # [server_notices]
