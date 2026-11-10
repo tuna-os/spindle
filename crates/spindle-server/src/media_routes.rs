@@ -624,7 +624,8 @@ fn media_error(error: &crate::media::MediaError) -> MatrixError {
             "M_LIMIT_EXCEEDED",
             error.to_string(),
         ),
-        Error::TooLarge { .. } => MatrixError::new(
+        // An image over the thumbnail pixel budget is refused for its size too.
+        Error::TooLarge { .. } | Error::ImageTooLarge { .. } => MatrixError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "M_TOO_LARGE",
             error.to_string(),

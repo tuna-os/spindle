@@ -490,7 +490,8 @@ fn app_state_with(
     let media = Arc::new(
         media::Media::new(Arc::clone(&store), blobs_for(&config), &config.server.name)
             .with_max_upload_bytes(config.media.max_upload_bytes)
-            .with_quota_bytes(config.media.max_bytes_per_user),
+            .with_quota_bytes(config.media.max_bytes_per_user)
+            .with_max_thumbnail_pixels(config.media.max_thumbnail_pixels),
     );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),

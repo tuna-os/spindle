@@ -799,3 +799,109 @@ async fn a_media_id_is_128_random_bits() {
     // is not a counter.
     assert_eq!(ids.len(), 8);
 }
+
+/// A PNG that declares `width` x `height` and then carries a few junk bytes
+/// where the pixel data should be: a few dozen bytes on the wire, the shape
+/// of a small file that claims a huge canvas.
+fn png_declaring(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut out, *b"IHDR", &header);
+    chunk(&mut out, *b"IDAT", &[0x78, 0x9c, 0x01, 0x02, 0x03]);
+    out
+}
+
+impl Harness {
+    async fn thumbnail_of(&self, token: &str, content_uri: &str) -> (StatusCode, Value) {
+        let (server, media_id) = content_uri
+            .strip_prefix("mxc://")
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        self.call(
+            Request::builder()
+                .uri(format!(
+                    "/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width=32&height=32"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn an_image_declaring_too_many_pixels_is_refused_before_decoding() {
+    // Counting, not timing: the declared canvas is 11000x11000 in a file of
+    // a few dozen bytes. The refusal must be the size one (413 M_TOO_LARGE),
+    // which only the header read can produce; a decode attempt would have
+    // failed on the corrupt pixel data as 400 M_UNSUPPORTED instead.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, body) = harness
+        .upload(&alice, "image/png", None, &png_declaring(11_000, 11_000))
+        .await;
+    let (status, body) = harness
+        .thumbnail_of(&alice, body["content_uri"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
+}
+
+#[tokio::test]
+async fn the_thumbnail_pixel_budget_is_exact() {
+    // A budget of N pixels thumbnails an N-pixel image and refuses N+1.
+    let harness = Harness::with_config("[media]\nmax_thumbnail_pixels = 100\n");
+    let alice = harness.register("alice").await;
+    let png = |width, height| {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    };
+    let (_, exact) = harness
+        .upload(&alice, "image/png", None, &png(10, 10))
+        .await;
+    let (status, body) = harness
+        .thumbnail_of(&alice, exact["content_uri"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, over) = harness
+        .upload(&alice, "image/png", None, &png(11, 10))
+        .await;
+    let (status, body) = harness
+        .thumbnail_of(&alice, over["content_uri"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
+}
