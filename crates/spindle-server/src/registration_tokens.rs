@@ -76,6 +76,9 @@ impl std::fmt::Display for TokenError {
     }
 }
 
+/// Serializes reading a token's uses and writing them back.
+static SPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The token rows.
 pub struct RegistrationTokens {
     store: Arc<FjallStore>,
@@ -215,14 +218,43 @@ impl RegistrationTokens {
             .is_some_and(|row| row.valid_at(now_millis())))
     }
 
-    /// Spend one use of `token`: an account was created with it.
+    /// Spend one use of `token`, if it still has one.
+    ///
+    /// The check and the write are one step under a lock: registrations
+    /// run in parallel, and two that each saw a use left would both have
+    /// spent the same one (#833). `false` means the token is gone, used up
+    /// or expired, and nothing was spent.
     ///
     /// # Errors
     ///
     /// Returns the store's error.
-    pub fn consume(&self, token: &str) -> Result<(), StoreError> {
+    pub fn try_consume(&self, token: &str) -> Result<bool, StoreError> {
+        let _guard = SPEND_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut row) = self.get(token)? else {
+            return Ok(false);
+        };
+        if !row.valid_at(now_millis()) {
+            return Ok(false);
+        }
+        row.completed = row.completed.saturating_add(1);
+        self.put(&row)?;
+        Ok(true)
+    }
+
+    /// Give back a use taken by [`Self::try_consume`], because the account
+    /// it was for was not created.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error.
+    pub fn release(&self, token: &str) -> Result<(), StoreError> {
+        let _guard = SPEND_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(mut row) = self.get(token)? {
-            row.completed = row.completed.saturating_add(1);
+            row.completed = row.completed.saturating_sub(1);
             self.put(&row)?;
         }
         Ok(())

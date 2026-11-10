@@ -1121,3 +1121,23 @@ async fn a_verdict_is_not_trusted_past_the_tokens_expiry() {
         "a token at the end of its life is asked about again"
     );
 }
+
+/// #833: a token the provider calls inactive costs one introspection, not
+/// one per request, so a caller repeating a bad token cannot make this server
+/// hammer the provider.
+#[tokio::test]
+async fn a_refused_token_is_introspected_once() {
+    let (provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+
+    for _ in 0..5 {
+        let (status, body) = whoami(&server, "never_issued").await;
+        assert_eq!(status, 401, "{body}");
+        assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+    }
+    assert_eq!(provider.introspections().len(), 1);
+
+    // A different bad token is its own question.
+    assert_eq!(whoami(&server, "also_never_issued").await.0, 401);
+    assert_eq!(provider.introspections().len(), 2);
+}

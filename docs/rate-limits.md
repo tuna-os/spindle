@@ -28,6 +28,7 @@ edge and MatrixRTC (#38, #39). The per-account write budgets after them
 | `POST /login` (password) | account | 5 per 60 s | a failed attempt; a success forgets both keys' history |
 | `POST /login` (password) | source address | 30 per 60 s | a failed attempt |
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
+| `POST /oauth2/registration` (built-in provider) | source address | 20 per 3600 s | every request. The body is at most 16 KiB, with at most 8 redirect URIs of 2 KiB each, and the scheme must be `https`, loopback `http` or a reversed-domain private scheme |
 | `PUT /send/m.rtc.notification` (and the MSC4075 unstable name) | account | `[ratelimit] rings_per_minute`, 10 | every attempt, delayed or not, whether or not the room then refuses it |
 | `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
 | `POST /_spindle/rtc/livekit/sfu/get` and `.../get_token` (built-in LiveKit service), MSC4195's `get_token` | user | 20 per 60 s | every request that carried a live OpenID token or access token, before the membership check |
@@ -40,6 +41,12 @@ wrote. From any other peer it ignores the header. IPv6 sources share one key
 per /64 network. When the counter table is full, the server drops the oldest
 counters that are still under their limit and keeps every counter that is
 refusing a caller.
+
+A registration token spends its use before the account is made, and
+gives it back if the account is not made. Two parallel requests cannot
+spend one use twice. Account creation checks the name again under a lock.
+The delegated-auth provider is asked once about a token it calls inactive.
+The answer is kept for up to 30 seconds.
 
 The two mints are limited because they are not reads: an OpenID token is a
 durable row written on the caller's say-so, and both tokens exist to make
@@ -138,6 +145,12 @@ Every configurable cap refuses zero at startup. A zero would reject every
 write, and a config that quietly disables a feature is worse than one that
 will not load. `password_hashes_waiting` is the exception. A zero there
 means no queue: a login gets a 429 when all workspaces are in use.
+
+## Not yet budgeted
+
+URL previews (`preview_url`) and downloads of remote media still have no
+budget per account. Each fetches from another host and stores the result
+with no expiry. Issue #833 tracks them.
 
 ## Account-driven storage growth
 

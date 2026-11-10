@@ -30,6 +30,11 @@ const STABLE_API_SCOPE: &str = "urn:matrix:client:api:*";
 const STABLE_DEVICE_SCOPE: &str = "urn:matrix:client:device:";
 const ADMIN_SCOPE: &str = "urn:synapse:admin:*";
 
+/// How long a refusal is remembered, at most.
+const UNKNOWN_TOKEN_TTL: Duration = Duration::from_secs(30);
+/// How many refused tokens are remembered at once.
+const MAX_UNKNOWN_TOKENS: usize = 4096;
+
 #[derive(Clone)]
 struct Verdict {
     user_id: String,
@@ -59,6 +64,10 @@ pub struct Delegated {
     /// the provider in every API call's latency; the hash keeps usable
     /// tokens out of process memory dumps, same as the token store.
     verdicts: Mutex<HashMap<[u8; 32], (Verdict, Instant)>>,
+    /// Token-hash → when to ask the provider again, for tokens it said are
+    /// not active. Brief, so a token issued just after a first attempt is
+    /// not refused for long.
+    unknown: Mutex<HashMap<[u8; 32], Instant>>,
     /// Bumped by every eviction. An introspection that was in flight
     /// while one happened may be carrying the very verdict the eviction
     /// ended -- the provider answered before the session was revoked --
@@ -78,6 +87,7 @@ impl Delegated {
             config,
             client: reqwest::Client::new(),
             verdicts: Mutex::new(HashMap::new()),
+            unknown: Mutex::new(HashMap::new()),
             evictions: AtomicU64::new(0),
             metadata: Mutex::new(None),
         }
@@ -278,6 +288,9 @@ impl Delegated {
             }
             return Ok(verdict);
         }
+        if self.recently_unknown(&key) {
+            return Err(MatrixError::unknown_token());
+        }
         let generation = self.evictions.load(Ordering::SeqCst);
         let verdict = self
             .introspect(store, server_name, token, generation)
@@ -295,6 +308,37 @@ impl Delegated {
             verdicts.insert(key, (verdict.clone(), Instant::now() + lifetime));
         }
         Ok(verdict)
+    }
+
+    /// Whether the provider refused this token a moment ago.
+    fn recently_unknown(&self, key: &[u8; 32]) -> bool {
+        self.unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Remember that the provider refused `token`, so a caller repeating a
+    /// bad token does not cost the provider a request each time (#833).
+    fn remember_unknown(&self, token: &str) {
+        let lifetime = self.ttl.min(UNKNOWN_TOKEN_TTL);
+        if lifetime.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut unknown = self
+            .unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if unknown.len() >= MAX_UNKNOWN_TOKENS {
+            unknown.retain(|_, until| *until > now);
+        }
+        // Full of live entries: skip rather than evict. The cache only saves
+        // requests, so a token that is not remembered costs one, as before.
+        if unknown.len() < MAX_UNKNOWN_TOKENS {
+            unknown.insert(*blake3::hash(token.as_bytes()).as_bytes(), now + lifetime);
+        }
     }
 
     async fn introspect(
@@ -329,9 +373,26 @@ impl Delegated {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(Value::Null);
+        // Only the provider calling the token inactive is remembered. A
+        // timeout or a 5xx above says nothing about the token, and a refusal
+        // from local state (a deleted device, a deactivated account) can
+        // lift the moment an admin acts, so those are asked again.
         if verdict["active"] != Value::Bool(true) {
+            self.remember_unknown(token);
             return Err(MatrixError::unknown_token());
         }
+        self.judge(store, server_name, &verdict, generation)
+    }
+
+    /// Turn the provider's introspection answer into a verdict, provisioning
+    /// the account and device it names.
+    fn judge(
+        &self,
+        store: &spindle_store::FjallStore,
+        server_name: &str,
+        verdict: &Value,
+        generation: u64,
+    ) -> Result<Verdict, MatrixError> {
         let scope = verdict["scope"].as_str().unwrap_or_default();
         let scopes: std::collections::HashSet<_> = scope.split_ascii_whitespace().collect();
         if !scopes.contains(API_SCOPE) && !scopes.contains(STABLE_API_SCOPE) {

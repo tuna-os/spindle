@@ -275,10 +275,30 @@ impl<'a, S: Store> Accounts<'a, S> {
             erased: false,
             service_owned,
         };
-        self.store
-            .put(&account_key(localpart), &encode(&account)?)?;
-        self.durable()?;
+        self.create_if_absent(&account)?;
         Ok(account)
+    }
+
+    /// Store a new account, or refuse because the name is now taken.
+    ///
+    /// The caller has already checked, but hashing the password takes long
+    /// enough for a second request for the same name to pass that check
+    /// too. The lock makes the second look and the write one step, so only
+    /// one of them gets the name (#833).
+    fn create_if_absent(&self, account: &Account) -> Result<(), AccountError> {
+        {
+            let _guard = ERASURE_POLICY_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.account(&account.localpart)?.is_some() {
+                return Err(AccountError::UserInUse);
+            }
+            self.store
+                .put(&account_key(&account.localpart), &encode(account)?)?;
+        }
+        // After the lock is released, so a sync does not serialise
+        // registrations (#810).
+        self.durable()
     }
 
     /// Register a new account whose password hash the caller already holds.
@@ -315,9 +335,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             erased: false,
             service_owned: false,
         };
-        self.store
-            .put(&account_key(localpart), &encode(&account)?)?;
-        self.durable()?;
+        self.create_if_absent(&account)?;
         Ok(account)
     }
 

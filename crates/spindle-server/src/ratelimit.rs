@@ -493,6 +493,11 @@ pub const LIVEKIT_TOKEN_PER_REMOTE_SERVER: Limit = Limit::new(60, Duration::from
 /// server's mail to strangers.
 pub const EMAIL_PER_USER: Limit = Limit::new(5, Duration::from_secs(60 * 60));
 
+/// Built-in OIDC client registrations per source address (#833). The
+/// endpoint takes no credential, and each call stores a row. A client
+/// registers once per install, so twenty an hour covers a shared address.
+pub const OIDC_REGISTER_PER_SOURCE: Limit = Limit::new(20, Duration::from_secs(60 * 60));
+
 /// Forgot-password requests per source address (#608).
 pub const RESET_REQUEST_PER_SOURCE: Limit = Limit::new(5, Duration::from_secs(15 * 60));
 
