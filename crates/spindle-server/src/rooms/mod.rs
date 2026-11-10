@@ -160,7 +160,8 @@ mod unread;
 pub use admin::AdminTimelineEntry;
 pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS, PartialJoinState};
 pub use read::{ReadScope, RoomReader};
-pub use retention::TruncationReport;
+pub use retention::{PassReport, RoomPolicy, TruncationReport};
+pub use retention::{RETENTION_EVENT_TYPE, effective_max_lifetime_ms, retention_loop};
 pub use synapse_positions::SynapseGap;
 
 pub use unread::{Receipt, Scored, Unread, Unscored};

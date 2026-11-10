@@ -108,6 +108,40 @@ A server from before this change cannot load a truncated room. Its chain
 check fails at the first kept entry. Do not run an older binary on a store
 that has a truncated room.
 
+### Retention policy
+
+The server can truncate history on a schedule (#817). It is off by default,
+because it deletes history. Turn it on in `[retention]`:
+
+```toml
+[retention]
+enabled = true
+max_lifetime_days = 365
+min_lifetime_days = 7
+interval_minutes = 60
+```
+
+Each pass reads every room and finds the newest event older than the
+room's lifetime. It truncates the room below the entry after that event.
+The floor rules above still apply, so a pass can truncate less than the
+lifetime says.
+
+A room sets its own maximum with an `m.room.retention` state event
+(MSC1763). Its `max_lifetime` and `min_lifetime` are in milliseconds. A
+room without the event takes `max_lifetime_days`. A room can shorten its
+lifetime and cannot pass `max_lifetime_days`. The lifetime is never below
+`min_lifetime_days` or the room's own `min_lifetime`. Without a server
+maximum, a room that sets none keeps everything.
+
+A pass logs its totals and moves the `spindle_retention_*` metrics. A room
+that fails is logged and counted, and the pass goes on. A pass opens each
+room, so it reads every room into memory once.
+
+An operator can also truncate one room at once. Send `"truncate": true` in
+the body of `purge_history`. Without it, the call keeps the spine as before.
+The answer has a `truncated` object that names the floor that took effect
+and the reason, if the server refused.
+
 ## Collecting unreachable state
 
 ```

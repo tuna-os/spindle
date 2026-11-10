@@ -388,6 +388,26 @@ impl RoomAdmin<'_> {
         Ok(doomed.len() as u64)
     }
 
+    /// [`Self::purge_history`], then remove the log below `before_li` too
+    /// ([`Rooms::truncate_room_log`], #817).
+    ///
+    /// The bodies below the cutoff go first, as an ordinary purge does. The
+    /// truncation then lowers its floor to what is safe, so the part
+    /// between that floor and `before_li` is purged and not truncated.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::purge_history`].
+    pub fn truncate_history(
+        &self,
+        room_id: &str,
+        before_li: i64,
+    ) -> Result<(u64, super::TruncationReport), RoomError> {
+        let purged = self.purge_history(room_id, before_li)?;
+        let report = self.rooms.truncate_room_log(room_id, before_li)?;
+        Ok((purged, report))
+    }
+
     /// One state event's content, read as an operator.
     ///
     /// The client-facing spelling of this is on

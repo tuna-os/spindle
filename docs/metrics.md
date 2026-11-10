@@ -41,6 +41,9 @@ the incident it was supposed to explain.
 | `spindle_sync_subscribers` | gauge | — | Clients currently blocked in a long-polling `/sync`. |
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
+| `spindle_retention_runs_total` | counter | | Passes of the history retention job (#817). Zero while `[retention]` is off. |
+| `spindle_retention_rooms_total` | counter | `result` = `truncated`\|`refused`\|`failed` | Rooms the job handled. `refused` means a hub, partial-state or forked room. |
+| `spindle_retention_deleted_total` | counter | `kind` = `entries`\|`bodies` | Log rows and event bodies the job deleted. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
 | `spindle_federation_gaps_remaining` | gauge | — | Recorded federation gaps whose history is not backfilled yet (SPEC §6.6). Should fall to `0` within minutes of a gap acceptance. |
 | `spindle_federation_recovery_attempts_total` | counter | `result` = `recovered`\|`budget_exceeded`\|`peer_error`\|`rate_limited`\|`timeout`\|`invalid`\|`negative_cached` | Tries to get the missing dependencies of a received event from one peer. `negative_cached` is an event that this server refused at once, with no request to a peer: it names a dependency that failed verification in the last `[federation] dependency_failure_ttl_secs`. A high rate tells you that peers send many events that depend on one event that this server cannot verify. |

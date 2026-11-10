@@ -47,6 +47,9 @@ pub struct Config {
     pub registration: RegistrationConfig,
     #[serde(default)]
     pub rooms: RoomsConfig,
+    /// History retention (#817). Off unless `enabled`.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
@@ -372,6 +375,47 @@ const fn default_max_per_room() -> usize {
 
 const fn default_max_per_user() -> usize {
     crate::delayed::DEFAULT_MAX_PER_USER
+}
+
+/// `[retention]`: truncating old history (#817, MSC1763).
+///
+/// With `enabled`, a background job truncates each room's log below the
+/// newest event older than the room's maximum lifetime
+/// ([`crate::rooms::retention`]). A room sets its own with an
+/// `m.room.retention` event. These limits clamp it.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Run the job at all. Off by default: truncation deletes history.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long, in days, any room keeps events. It is the default for a
+    /// room without an `m.room.retention` event and the most a room may
+    /// ask for. Absent, rooms without a policy keep everything.
+    #[serde(default)]
+    pub max_lifetime_days: Option<u32>,
+    /// The fewest days any room keeps events: a room's maximum lifetime is
+    /// raised to this when it is lower.
+    #[serde(default)]
+    pub min_lifetime_days: Option<u32>,
+    /// Minutes between two runs of the job.
+    #[serde(default = "default_retention_interval_minutes")]
+    pub interval_minutes: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lifetime_days: None,
+            min_lifetime_days: None,
+            interval_minutes: default_retention_interval_minutes(),
+        }
+    }
+}
+
+const fn default_retention_interval_minutes() -> u64 {
+    60
 }
 
 /// `[rooms]`: keeping rooms' forward extremities merged (#626).

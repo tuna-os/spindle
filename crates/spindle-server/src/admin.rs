@@ -1751,6 +1751,10 @@ fn hex(bytes: [u8; 32]) -> String {
 struct PurgeRequest {
     before_li: Option<i64>,
     before_ts: Option<u64>,
+    /// Also remove the log entries and indexes below the cutoff (#817).
+    /// Off by default: the old purge keeps the spine.
+    #[serde(default)]
+    truncate: bool,
 }
 
 /// `POST /rooms/{roomId}/purge_history` — `{before_li}` or `{before_ts}`.
@@ -1761,6 +1765,10 @@ struct PurgeRequest {
 /// from "never existed". State event bodies survive — current state and
 /// `state_at` keep folding from the log. The one audit record names how
 /// far and how many.
+///
+/// With `"truncate": true` it also removes the log, its indexes and the
+/// old state below a safe floor (#817), and the answer says how far that
+/// went and why it stopped short.
 async fn purge_history(
     State(state): State<AppState>,
     actor: AdminActor,
@@ -1787,21 +1795,40 @@ async fn purge_history(
             ));
         }
     };
-    let purged = state
-        .rooms
-        .admin(&actor)
-        .purge_history(&room_id, before_li)
-        .map_err(crate::routes::room_error)?;
+    let admin = state.rooms.admin(&actor);
+    let (purged, truncation) = if request.truncate {
+        let (purged, report) = admin
+            .truncate_history(&room_id, before_li)
+            .map_err(crate::routes::room_error)?;
+        (purged, Some(report))
+    } else {
+        let purged = admin
+            .purge_history(&room_id, before_li)
+            .map_err(crate::routes::room_error)?;
+        (purged, None)
+    };
+    let mut answer = json!({ "purged_up_to": before_li, "events_purged": purged });
+    if let Some(report) = truncation {
+        answer["truncated"] = json!({
+            "floor": report.floor,
+            "refused": report.refused,
+            "entries_removed": report.entries,
+            "bodies_removed": report.bodies,
+            "index_rows_removed": report.index_rows,
+        });
+    }
+    let mut detail = json!({ "before_li": before_li, "events_purged": purged });
+    if let Some(truncated) = answer.get("truncated") {
+        detail["truncated"] = truncated.clone();
+    }
     audit(
         &state,
         &actor.identity().user_id,
         "purge_history",
         &room_id,
-        &json!({ "before_li": before_li, "events_purged": purged }),
+        &detail,
     )?;
-    Ok(Json(
-        json!({ "purged_up_to": before_li, "events_purged": purged }),
-    ))
+    Ok(Json(answer))
 }
 
 /// The body of Synapse's room deletion, v1 and v2 alike.

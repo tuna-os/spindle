@@ -1127,6 +1127,57 @@ async fn purge_keeps_the_spine_and_the_chain_still_verifies() {
     assert_chain_verifies(&timeline().await);
 }
 
+/// The opt-in `truncate` flag removes the log below the cutoff, where the
+/// plain purge keeps it (#817). The default is covered by the test above.
+#[tokio::test]
+async fn purge_with_truncate_removes_the_log_and_the_room_still_works() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let timeline = || {
+        let server = &server;
+        let token = admin_token.clone();
+        let ops = ops.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms/{ops}/timeline"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            body["chunk"].as_array().unwrap().len()
+        }
+    };
+    let before = timeline().await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/purge_history"),
+            Some(&admin_token),
+            Some(&json!({ "before_li": i64::MAX, "truncate": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["truncated"]["refused"].is_null(), "{body}");
+    assert!(
+        body["truncated"]["entries_removed"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+    assert!(timeline().await < before);
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{ops}/send/m.room.message/after-truncate"),
+            Some(&admin_token),
+            Some(&json!({ "msgtype": "m.text", "body": "life goes on" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test]
 async fn purge_resolves_time_and_refuses_ambiguity() {
     let server = Instance::start().await;
