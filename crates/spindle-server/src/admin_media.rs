@@ -1,13 +1,14 @@
 //! Synapse's media admin API, as far as this server's media store can
-//! answer it: a user's uploads, one item's details, and deletion.
+//! answer it: a user's uploads, one item's details, deletion, quarantine
+//! of one item, a user's uploads or a room's media, and a purge of the
+//! remote media cache.
 //!
-//! Quarantine and protection are not routed. This store has no quarantine
-//! flag, and an endpoint that answered `{}` without quarantining anything
-//! would tell the operator that offending media is gone when it is not.
+//! Protection (`protect`/`unprotect`) is not routed: nothing here deletes
+//! local media on a timer, so there is nothing for it to protect from.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,6 +28,26 @@ pub fn routes() -> Router<AppState> {
             .route(
                 &format!("{prefix}/media/{{server_name}}/{{media_id}}"),
                 get(media_info).delete(delete_media),
+            )
+            .route(
+                &format!("{prefix}/media/quarantine/{{server_name}}/{{media_id}}"),
+                post(quarantine_media),
+            )
+            .route(
+                &format!("{prefix}/media/unquarantine/{{server_name}}/{{media_id}}"),
+                post(unquarantine_media),
+            )
+            .route(
+                &format!("{prefix}/room/{{room_id}}/media/quarantine"),
+                post(quarantine_room_media),
+            )
+            .route(
+                &format!("{prefix}/user/{{user_id}}/media/quarantine"),
+                post(quarantine_user_media),
+            )
+            .route(
+                &format!("{prefix}/purge_media_cache"),
+                post(purge_media_cache),
             )
     };
     group("/_synapse/admin/v1").merge(group("/_spindle/admin/v1"))
@@ -65,16 +86,16 @@ fn uploads_of(state: &AppState, user_id: &str) -> Result<Vec<(String, MediaRecor
 }
 
 /// One upload as Synapse's user media listing shows it. When it was
-/// uploaded and last read are not recorded here, and are `null`.
+/// last read is not recorded here, and is `null`.
 fn upload_json(media_id: &str, record: &MediaRecord) -> Value {
     json!({
         "media_id": media_id,
         "media_type": record.content_type,
         "media_length": record.size,
         "upload_name": record.filename,
-        "created_ts": null,
+        "created_ts": record.created_ts,
         "last_access_ts": null,
-        "quarantined_by": null,
+        "quarantined_by": record.quarantined_by,
         "safe_from_quarantine": false,
     })
 }
@@ -195,9 +216,9 @@ async fn media_info(
             "media_type": record.content_type,
             "media_length": record.size,
             "upload_name": record.filename,
-            "created_ts": null,
+            "created_ts": record.created_ts,
             "last_access_ts": null,
-            "quarantined_by": null,
+            "quarantined_by": record.quarantined_by,
             "authenticated": null,
             "safe_from_quarantine": false,
             "sha256": null,
@@ -235,4 +256,199 @@ async fn delete_media(
         &json!({}),
     )?;
     Ok(Json(json!({ "deleted_media": [media_id], "total": 1 })))
+}
+
+fn not_found(message: &'static str) -> MatrixError {
+    MatrixError::new(StatusCode::NOT_FOUND, "M_NOT_FOUND", message)
+}
+
+/// `POST /media/quarantine/{serverName}/{mediaId}`. Remote media is
+/// quarantined whether or not it is cached; an unknown local ID is a 404,
+/// because `{}` for media that is not there would say the report was dealt
+/// with.
+async fn quarantine_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path((server_name, media_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let by = actor.identity().user_id.clone();
+    if state.media.is_ours(&server_name) {
+        if !state
+            .media
+            .set_quarantine(&media_id, Some(&by))
+            .map_err(|error| media_error(&error))?
+        {
+            return Err(not_found("Unknown media"));
+        }
+    } else {
+        state
+            .media
+            .quarantine_remote(&server_name, &media_id, &by)
+            .map_err(|error| media_error(&error))?;
+    }
+    crate::admin::audit(
+        &state,
+        &by,
+        "quarantine_media",
+        &format!("mxc://{server_name}/{media_id}"),
+        &json!({}),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `POST /media/unquarantine/{serverName}/{mediaId}`.
+async fn unquarantine_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path((server_name, media_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    if !state
+        .media
+        .set_quarantine(&stored_id(&state, &server_name, &media_id), None)
+        .map_err(|error| media_error(&error))?
+    {
+        return Err(not_found("Unknown media"));
+    }
+    crate::admin::audit(
+        &state,
+        &actor.identity().user_id,
+        "unquarantine_media",
+        &format!("mxc://{server_name}/{media_id}"),
+        &json!({}),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `POST /user/{userId}/media/quarantine` — every upload the user made.
+async fn quarantine_user_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    local_user(&state, &user_id)?;
+    let by = actor.identity().user_id.clone();
+    let mut count = 0_usize;
+    for (media_id, _) in uploads_of(&state, &user_id)? {
+        if state
+            .media
+            .set_quarantine(&media_id, Some(&by))
+            .map_err(|error| media_error(&error))?
+        {
+            count += 1;
+        }
+    }
+    crate::admin::audit(
+        &state,
+        &by,
+        "quarantine_user_media",
+        &user_id,
+        &json!({ "num_quarantined": count }),
+    )?;
+    Ok(Json(json!({ "num_quarantined": count })))
+}
+
+/// Every `mxc://` URI anywhere in `value`: `url`, `file.url`,
+/// `info.thumbnail_url`, `info.thumbnail_file.url`, and whatever else an
+/// event carries, since a reported attachment can sit in any of them.
+fn collect_mxc(value: &Value, out: &mut std::collections::BTreeSet<(String, String)>) {
+    match value {
+        Value::String(text) => {
+            if let Some((server, id)) = text
+                .strip_prefix("mxc://")
+                .and_then(|rest| rest.split_once('/'))
+                .filter(|(server, id)| !server.is_empty() && !id.is_empty() && !id.contains('/'))
+            {
+                out.insert((server.to_owned(), id.to_owned()));
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_mxc(item, out)),
+        Value::Object(map) => map.values().for_each(|item| collect_mxc(item, out)),
+        _ => {}
+    }
+}
+
+/// `POST /room/{roomId}/media/quarantine` — every item the room's events
+/// point at, local or remote.
+async fn quarantine_room_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(room_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut uris = std::collections::BTreeSet::new();
+    let mut from = None;
+    loop {
+        let (events, next) = state
+            .rooms
+            .admin(&actor)
+            .admin_timeline(&room_id, from, 500, true)
+            .map_err(crate::routes::room_error)?;
+        for entry in &events {
+            if let Some(event) = &entry.json {
+                collect_mxc(&event["content"], &mut uris);
+            }
+        }
+        match next {
+            Some(token) => from = Some(token),
+            None => break,
+        }
+    }
+    let by = actor.identity().user_id.clone();
+    let mut count = 0_usize;
+    for (server, id) in &uris {
+        if state.media.is_ours(server) {
+            // A URI naming an upload that is gone is not an item to hold.
+            if !state
+                .media
+                .set_quarantine(id, Some(&by))
+                .map_err(|error| media_error(&error))?
+            {
+                continue;
+            }
+        } else {
+            state
+                .media
+                .quarantine_remote(server, id, &by)
+                .map_err(|error| media_error(&error))?;
+        }
+        count += 1;
+    }
+    crate::admin::audit(
+        &state,
+        &by,
+        "quarantine_room_media",
+        &room_id,
+        &json!({ "num_quarantined": count }),
+    )?;
+    Ok(Json(json!({ "num_quarantined": count })))
+}
+
+#[derive(Deserialize)]
+struct PurgeQuery {
+    before_ts: Option<u64>,
+}
+
+/// `POST /purge_media_cache?before_ts=` — delete cached remote media
+/// cached before the timestamp (milliseconds). Local uploads and
+/// quarantined items stay.
+async fn purge_media_cache(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Query(query): Query<PurgeQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    let before_ts = query
+        .before_ts
+        .ok_or_else(|| MatrixError::missing_param("Missing integer query parameter before_ts"))?;
+    let purged = state
+        .media
+        .purge_remote(before_ts)
+        .await
+        .map_err(|error| media_error(&error))?;
+    crate::admin::audit(
+        &state,
+        &actor.identity().user_id,
+        "purge_media_cache",
+        "remote media cache",
+        &json!({ "before_ts": before_ts, "deleted": purged.len() }),
+    )?;
+    Ok(Json(json!({ "deleted": purged.len() })))
 }

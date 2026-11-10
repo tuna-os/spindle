@@ -61,7 +61,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-157 routes the pinned spec does not define: MSC surfaces under
+167 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -105,10 +105,14 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/federation/destinations/{}`
 - `/_spindle/admin/v1/federation/destinations/{}/reset_connection`
 - `/_spindle/admin/v1/federation/destinations/{}/rooms`
+- `/_spindle/admin/v1/media/quarantine/{}/{}`
+- `/_spindle/admin/v1/media/unquarantine/{}/{}`
 - `/_spindle/admin/v1/media/{}/{}`
+- `/_spindle/admin/v1/purge_media_cache`
 - `/_spindle/admin/v1/registration_tokens`
 - `/_spindle/admin/v1/registration_tokens/new`
 - `/_spindle/admin/v1/registration_tokens/{}`
+- `/_spindle/admin/v1/room/{}/media/quarantine`
 - `/_spindle/admin/v1/rooms`
 - `/_spindle/admin/v1/rooms/{}`
 - `/_spindle/admin/v1/rooms/{}/block`
@@ -122,6 +126,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/scheduled_tasks`
 - `/_spindle/admin/v1/send_server_notice`
 - `/_spindle/admin/v1/server_version`
+- `/_spindle/admin/v1/user/{}/media/quarantine`
 - `/_spindle/admin/v1/username_available`
 - `/_spindle/admin/v1/users`
 - `/_spindle/admin/v1/users/{}`
@@ -146,13 +151,17 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/federation/destinations/{}`
 - `/_synapse/admin/v1/federation/destinations/{}/reset_connection`
 - `/_synapse/admin/v1/federation/destinations/{}/rooms`
+- `/_synapse/admin/v1/media/quarantine/{}/{}`
+- `/_synapse/admin/v1/media/unquarantine/{}/{}`
 - `/_synapse/admin/v1/media/{}/{}`
 - `/_synapse/admin/v1/purge_history/{}`
+- `/_synapse/admin/v1/purge_media_cache`
 - `/_synapse/admin/v1/register`
 - `/_synapse/admin/v1/registration_tokens`
 - `/_synapse/admin/v1/registration_tokens/new`
 - `/_synapse/admin/v1/registration_tokens/{}`
 - `/_synapse/admin/v1/reset_password/{}`
+- `/_synapse/admin/v1/room/{}/media/quarantine`
 - `/_synapse/admin/v1/rooms`
 - `/_synapse/admin/v1/rooms/{}`
 - `/_synapse/admin/v1/rooms/{}/block`
@@ -166,6 +175,7 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/scheduled_tasks`
 - `/_synapse/admin/v1/send_server_notice`
 - `/_synapse/admin/v1/server_version`
+- `/_synapse/admin/v1/user/{}/media/quarantine`
 - `/_synapse/admin/v1/username_available`
 - `/_synapse/admin/v1/users`
 - `/_synapse/admin/v1/users/{}`
