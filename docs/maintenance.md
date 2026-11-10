@@ -1,15 +1,15 @@
 # Maintenance
 
-How this repository stays current with the Matrix specification, the
-proposals it serves ahead of the spec, and the clients and suites it is
-measured against — and what a maintainer does when one of them moves.
+This page says how the repository stays current. It tracks the Matrix
+specification, the proposals that Spindle serves ahead of the spec, and the
+clients and suites that test it. It also says what a maintainer does when one
+of them moves.
 
-The principle throughout: **every claim is held to the code by a gate, and
-every upstream is watched by a job.** Nothing here is a checklist a person
-remembers; each item is a script that runs in CI or on a schedule, prints
-what it found, and fails or files an issue. What remains for a person is the
-judgement — whether to bump a pin, whether a new endpoint is in scope, what
-to do when a proposal dies.
+The principle throughout: **a gate holds every claim to the code, and a job
+watches every upstream.** Nothing here is a checklist that a person must
+remember. Each item is a script. It runs in CI or on a schedule, prints what it found,
+and fails or files an issue. A person still makes the judgement calls. These are whether to bump a pin,
+whether a new endpoint is in scope, and what to do when a proposal dies.
 
 ## 1. The gates, per pull request
 
@@ -29,7 +29,8 @@ artefact still tell the truth about the code":
 | `untested-routes.py` | (report) routes nothing names in a test, rig or evidence page | write the test |
 | `tests/surface.rs` | `/versions` advertises nothing unbuilt | build it, then advertise it |
 
-`just lint`, `just test` and `just regen` before pushing reproduce the lot.
+Run `just lint`, `just test` and `just regen` before you push. Together they
+reproduce all of it.
 
 ## 2. The ratchets, nightly
 
@@ -45,27 +46,28 @@ Each run has an allowlist that may only grow:
 | Element Call Playwright | `contrib/element-call/run.sh` | `contrib/element-call/allowlist.txt` | `scripts/element-call-check.py` |
 | Element Call Playwright, Synapse peer | `contrib/element-call/run.sh` | `contrib/element-call/allowlist-synapse-peer.txt` | `scripts/element-call-check.py` |
 
-A test that passes and is not listed is printed as a **candidate**. Promoting
-it is a reviewed commit that names the run it passed in, never automatic —
-so a flaky test cannot teach everyone to ignore the gate. A listed test that
-fails is a **regression** and fails the job. The procedure:
+The job prints a test that passes but is not on the list as a **candidate**.
+A reviewed commit promotes it, and the commit names the run it passed in.
+Promotion is never automatic, so people do not learn to ignore the gate
+because of one flaky run. A listed test that fails is a **regression** and fails the
+job. The procedure:
 
 1. Read the job's tail: the `candidate` and `REGRESSED` lines.
-2. For a regression, the fix goes in first; the allowlist is not edited to
-   make it pass. (A test that upstream changed under the same name is the
+2. For a regression, fix the code first. Do not edit the allowlist to make
+   the test pass. (A test that upstream changed under the same name is the
    one exception, and the commit says so.)
 3. For candidates, add them under a header naming the run id and the
    Spindle commit, one pull request per run.
 
-The remaining failures in each suite are triaged on the tracking issue
-(#112 for the SDK suite). Each is a real gap or a real defect; the
+The maintainers triage the remaining failures in each suite on one issue per
+suite (#112 for the SDK suite). Each is a real gap or a real defect; the
 `sdk_findings` tests in `crates/spindle-server/tests/` are the unit-sized
 reproductions of what the suite found.
 
 ## 3. The weekly upkeep report
 
-`upkeep.yml` runs on Mondays and edits one issue labelled `upkeep`. Locally,
-`just upkeep` prints the same four reports:
+`upkeep.yml` runs on Mondays and edits one issue with the label `upkeep`.
+Locally, `just upkeep` prints the same four reports:
 
 **Pins behind upstream** (`upstream-pins.py --upstream`). Every upstream
 this repository pins by hand, read from the file that uses it, against the
