@@ -182,6 +182,19 @@ impl<'a, S: Store> Accounts<'a, S> {
         }
     }
 
+    /// Make the writes of this call survive a power loss (#810).
+    ///
+    /// `Store::put` and `Store::delete` reach the journal and no further, so
+    /// without this a registration, a login or a logout becomes durable only
+    /// when some unrelated room commit next syncs the journal: a logged-out
+    /// token could work again after a crash, and a client could hold a token
+    /// for an account that no longer exists. It is the grouped barrier the
+    /// room log uses, so concurrent callers share one sync.
+    fn durable(&self) -> Result<(), AccountError> {
+        self.store.sync(spindle_store::Durability::Group)?;
+        Ok(())
+    }
+
     /// `@localpart:server.name`
     #[must_use]
     pub fn user_id(&self, localpart: &str) -> String {
@@ -229,6 +242,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(account)
     }
 
@@ -267,6 +281,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         };
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(account)
     }
 
@@ -289,6 +304,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.deactivated = deactivated;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(())
     }
 
@@ -442,6 +458,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         let row = serde_json::json!({ "localpart": localpart, "expires_at": expires_at });
         self.store
             .put(&keys::login_token(&token), row.to_string().as_bytes())?;
+        self.durable()?;
         Ok((token, LOGIN_TOKEN_TTL_MS))
     }
 
@@ -459,6 +476,8 @@ impl<'a, S: Store> Accounts<'a, S> {
         // Spent on sight, whether or not it is still good: a lapsed token
         // is not one to leave lying around.
         self.store.delete(&key)?;
+        // A login token is one-use: a spend that a crash undoes is a second use.
+        self.durable()?;
         let row: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| AccountError::Codec(error.to_string()))?;
         let live = row["expires_at"]
@@ -514,6 +533,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         } else {
             None
         };
+        self.durable()?;
 
         Ok(Session {
             access_token,
@@ -554,6 +574,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             &token_key(Keyspace::RefreshToken, &replacement),
             &encode(&record)?,
         )?;
+        self.durable()?;
 
         Ok(Session {
             access_token,
@@ -593,6 +614,7 @@ impl<'a, S: Store> Accounts<'a, S> {
     pub fn logout(&self, token: &str) -> Result<(), AccountError> {
         self.store
             .delete(&token_key(Keyspace::AccessToken, token))?;
+        self.durable()?;
         Ok(())
     }
 
@@ -651,6 +673,7 @@ impl<'a, S: Store> Accounts<'a, S> {
             .put(&device_key(localpart, device_id), &encode(&device)?)?;
         self.store
             .delete(&revoked_device_key(localpart, device_id))?;
+        self.durable()?;
         Ok(())
     }
 
@@ -666,6 +689,7 @@ impl<'a, S: Store> Accounts<'a, S> {
     pub fn revoke_device(&self, localpart: &str, device_id: &str) -> Result<(), AccountError> {
         self.store
             .put(&revoked_device_key(localpart, device_id), &[])?;
+        self.durable()?;
         Ok(())
     }
 
@@ -702,6 +726,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.admin = admin;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -723,6 +748,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.locked = locked;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -744,6 +770,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.suspended = suspended;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -768,6 +795,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.password_scheme = None;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -802,6 +830,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.password_scheme = None;
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -843,6 +872,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         account.imported_hash_digest = Some(hash_digest(password_hash));
         self.store
             .put(&account_key(localpart), &encode(&account)?)?;
+        self.durable()?;
         Ok(true)
     }
 
@@ -863,6 +893,7 @@ impl<'a, S: Store> Accounts<'a, S> {
                 }
             }
         }
+        self.durable()?;
         Ok(())
     }
 
@@ -906,6 +937,7 @@ impl<'a, S: Store> Accounts<'a, S> {
                 }
             }
         }
+        self.durable()?;
         Ok(())
     }
 }
@@ -1589,5 +1621,67 @@ mod password_hash_tests {
             Err(AccountError::InvalidHash(_))
         ));
         assert!(accounts.verify_password("fay", "a new one").unwrap());
+    }
+}
+
+/// #810: `Store::put` and `Store::delete` reach the journal and no further, so
+/// each write that starts or ends a session has to ask for a barrier itself.
+/// Counted, not crashed: a barrier is what `barriers()` measures, and a time
+/// or a power cut is not stable on a test host.
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use spindle_store::FjallStore;
+
+    /// Run `step` and require that the store performed at least one barrier.
+    fn barrier_during<T>(store: &FjallStore, what: &str, step: impl FnOnce() -> T) -> T {
+        let before = store.barriers();
+        let out = step();
+        assert!(
+            store.barriers() > before,
+            "{what} returned without a barrier: a crash can undo it"
+        );
+        out
+    }
+
+    #[test]
+    fn writes_that_start_or_end_a_session_reach_a_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let accounts = Accounts::new(&store, "example.org");
+
+        barrier_during(&store, "register", || {
+            accounts.register("alice", "correct horse battery").unwrap();
+        });
+        let session = barrier_during(&store, "create_session", || {
+            accounts.create_session("alice", None, None, true).unwrap()
+        });
+        let refreshed = barrier_during(&store, "refresh", || {
+            accounts
+                .refresh(session.refresh_token.as_deref().unwrap())
+                .unwrap()
+        });
+        barrier_during(&store, "logout", || {
+            accounts.logout(&refreshed.access_token).unwrap();
+        });
+        let (token, _) = barrier_during(&store, "issue_login_token", || {
+            accounts.issue_login_token("alice").unwrap()
+        });
+        barrier_during(&store, "redeem_login_token", || {
+            accounts.redeem_login_token(&token).unwrap();
+        });
+        barrier_during(&store, "set_password", || {
+            accounts
+                .set_password("alice", "another passphrase")
+                .unwrap();
+        });
+        barrier_during(&store, "delete_device", || {
+            accounts
+                .delete_device("alice", &refreshed.device.device_id)
+                .unwrap();
+        });
+        barrier_during(&store, "logout_everywhere", || {
+            accounts.logout_everywhere("alice").unwrap();
+        });
     }
 }

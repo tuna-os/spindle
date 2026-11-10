@@ -176,6 +176,9 @@ impl Devices {
             return Ok(None);
         };
         Store::delete(self.store.as_ref(), &key)?;
+        // Before the key is handed out: a claim that a crash undoes would
+        // serve the same one-time key to a second sender (#810).
+        Store::sync(self.store.as_ref(), spindle_store::Durability::Group)?;
         let device_prefix = keys::device_scoped(Keyspace::OneTimeKeys, user_id, device_id, &[]);
         let key_id = String::from_utf8(key[device_prefix.len()..].to_vec()).unwrap_or_default();
         Ok(Some((

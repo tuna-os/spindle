@@ -342,6 +342,7 @@ impl RoomAdmin<'_> {
             &spindle_core::keys::purge_watermark(room_id),
             &mark.to_be_bytes(),
         )?;
+        spindle_store::Store::sync(self.rooms.store.as_ref(), spindle_store::Durability::Group)?;
         // A filled federation gap's segment sits just below its anchor, so
         // a cutoff at or above the anchor takes the segment's bodies too.
         let mut victims = victims;
