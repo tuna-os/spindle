@@ -88,7 +88,7 @@ across a migration in either direction.
 | `GET /media/v1/download` and `.../thumbnail` of another server's media | requesting account | `remote_media`: burst 100, 2/s | none | only when the media is not cached yet, before the fetch; media already cached is free |
 
 Synapse has no limit for either of the two last rows, so the defaults are
-this server's own. A preview costs up to two outbound fetches. A download of remote media costs one fetch and leaves the bytes behind. Each is spent by the
+this server's own. A preview costs up to two outbound fetches. Each remote download needs one fetch and leaves the bytes behind. Each is spent by the
 account that asks, so one account's flood does not use up the budget of
 another. The unauthenticated media routes never fetch and are not limited.
 
