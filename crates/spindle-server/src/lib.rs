@@ -88,6 +88,7 @@ pub mod telemetry;
 pub mod threepid;
 pub mod timeline_routes;
 pub mod tokens;
+pub mod txn_replay;
 pub mod typing;
 pub mod upstream;
 pub mod voip_routes;

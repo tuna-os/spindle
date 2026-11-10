@@ -574,7 +574,7 @@ pub(crate) async fn send_transaction(
     // redelivery idempotent on our side.
     let txn_key = spindle_core::keys::federation_txn(&origin, &txn_id);
     if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &txn_key)
-        && let Ok(response) = serde_json::from_slice::<Value>(&stored)
+        && let Ok(response) = serde_json::from_slice::<Value>(crate::txn_replay::decode(&stored).1)
     {
         return Ok(Json(response));
     }
@@ -671,12 +671,25 @@ pub(crate) async fn send_transaction(
     }
 
     let response = json!({ "pdus": results });
+    let received_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
     spindle_store::Store::put(
         state.store.as_ref(),
         &txn_key,
-        response.to_string().as_bytes(),
+        &crate::txn_replay::encode(received_ms, response.to_string().as_bytes()),
     )
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // The table is bounded by this origin's own traffic (#814). A failed
+    // sweep is a missed cleanup, not a failed transaction.
+    if crate::txn_replay::sweep_due(&origin, received_ms)
+        && let Err(error) =
+            crate::txn_replay::sweep_origin(state.store.as_ref(), &origin, received_ms)
+    {
+        tracing::warn!(%origin, %error, "sweeping the transaction replay table failed");
+    }
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
 }
