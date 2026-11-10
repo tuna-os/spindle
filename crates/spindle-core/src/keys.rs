@@ -1691,6 +1691,18 @@ pub fn federation_txn(origin: &str, txn_id: &str) -> Vec<u8> {
     key
 }
 
+/// The scan prefix covering every [`Keyspace::FederationTxn`] row one origin
+/// wrote, and no other origin's: the origin is length-framed, so a name that
+/// is a prefix of another does not match it (#814).
+#[must_use]
+pub fn federation_txn_origin(origin: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationTxn as u8];
+    let (len, bytes) = framed(origin.as_bytes());
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(bytes);
+    key
+}
+
 /// The scan prefix covering every user's [`Keyspace::DeviceListChange`] row.
 #[must_use]
 pub fn device_list_change_prefix() -> Vec<u8> {
