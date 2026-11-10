@@ -304,6 +304,7 @@ property linear_fold_matches_state_res:
     for arbitrary chain DAG D:
         assert fold_state(D) == ruma_state_res_v2(D)
 
+# ADR 0005 retired the depth cap: the resolver now runs at any depth.
 property window_bounded_matches_full:
     for arbitrary forked DAG D, fork depth ≤ max_fork_window:
         assert window_state_res(D) == ruma_state_res_v2(D)

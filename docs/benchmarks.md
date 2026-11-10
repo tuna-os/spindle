@@ -1410,7 +1410,7 @@ in the case Spindle claims to handle without state resolution.
 | 4 | 91.1 µs | **29.4 µs** | 3.10× |
 | 16 | 347 µs | **121 µs** | 2.87× |
 | 64 | 1.43 ms | **604 µs** | 2.37× |
-| 256 (a full `max_fork_window`) | 6.34 ms | **2.67 ms** | 2.37× |
+| 256 (a full 512-event fork window) | 6.34 ms | **2.67 ms** | 2.37× |
 
 We are consistently faster, by between two and three times. **Both sides scale
 linearly in the size of the fork, and per-event cost is flat for both** — about
@@ -1419,7 +1419,7 @@ is not the one SPEC §18.1's complexity table leads a reader to expect.
 
 #34 asks specifically for the deep case, on the grounds that it is where the
 advantage should shrink. It does not: 256 events a side fills SPEC §9.1's
-512-event `max_fork_window` entirely, and the ratio there is the same 2.4× as at
+512-event fork window entirely (ADR 0005 later retired that cap), and the ratio there is the same 2.4× as at
 64. Whatever the advantage is, it is not something that erodes as the fork
 grows — but it is also not something that grows.
 
