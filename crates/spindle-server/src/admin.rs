@@ -150,6 +150,7 @@ pub fn routes() -> Router<AppState> {
             )
     };
     group("/_spindle/admin/v1")
+        .route("/_spindle/admin/v1/backup/stream", get(stream_backup))
         .merge(group("/_synapse/admin/v1"))
         .merge(synapse_spellings())
 }
@@ -397,7 +398,7 @@ async fn create_backup(
     // enough to run on a live server. The slot frees itself on drop, so a
     // panic cannot wedge it.
     let Some(slot) = state.metrics.begin_backup() else {
-        return Err(MatrixError::limit_exceeded(60_000));
+        return Err(backup_busy());
     };
     let started = now_ms();
     let path = dir.join(format!("spindle-{started}.backup"));
@@ -429,6 +430,62 @@ async fn create_backup(
     Ok(Json(
         json!({ "path": path.display().to_string(), "rows": rows }),
     ))
+}
+
+/// The error for a backup asked for while another runs, file or stream.
+fn backup_busy() -> MatrixError {
+    MatrixError::new(
+        StatusCode::CONFLICT,
+        "M_CONFLICT",
+        "another backup is running; only one backup, file or stream, runs at a time",
+    )
+}
+
+/// `GET /backup/stream` (#813)
+///
+/// Streams the same bytes `POST /backup` writes to a file, as the response
+/// body, from one store snapshot. Memory stays bounded: a blocking task writes
+/// through a small channel, so a slow client slows the scan. A client that
+/// disconnects stops it. The stream ends with the digest `spindle restore`
+/// checks, so a client must treat a body that ends early as no backup.
+/// `[storage] backup_dir` is not needed. The last-backup metric is not set,
+/// since the server cannot know the client kept the bytes.
+async fn stream_backup(
+    State(state): State<AppState>,
+    actor: AdminActor,
+) -> Result<axum::response::Response, MatrixError> {
+    let Some(slot) = state.metrics.begin_backup_owned() else {
+        return Err(backup_busy());
+    };
+    let actor_id = actor.identity().user_id.clone();
+    let audit_state = state.clone();
+    let stream = crate::backup_stream::BackupStream::start(
+        state.store.clone(),
+        slot,
+        crate::backup_stream::Limits::default(),
+        move |result, stats| {
+            // Audited when the write ends, as `POST /backup` is: the record
+            // says what happened. A failed or abandoned stream is not a backup.
+            let Ok(rows) = result else {
+                tracing::warn!("a streamed backup did not finish");
+                return;
+            };
+            let detail = json!({ "rows": rows, "bytes": stats.total_sent() });
+            if let Err(error) = audit(&audit_state, &actor_id, "backup_stream", "stream", &detail) {
+                tracing::error!(%error.error, "could not audit a streamed backup");
+            }
+        },
+    );
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"spindle-{}.backup\"", now_ms()),
+        )
+        .header("cache-control", "no-store")
+        .body(stream.into_body())
+        .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
 /// Append one audit record. Every mutating handler calls this after the

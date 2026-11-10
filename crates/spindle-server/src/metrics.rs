@@ -25,8 +25,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Which of §9.2's three cases an append took.
@@ -934,6 +934,17 @@ impl Metrics {
 pub struct BackupSlot<'a>(&'a Metrics);
 
 impl Drop for BackupSlot<'_> {
+    fn drop(&mut self) {
+        self.0.backup_running.store(false, Ordering::Release);
+    }
+}
+
+/// The backup slot, owned so a blocking task can hold it past the request
+/// that took it (#813). The streaming endpoint needs this: the handler
+/// returns while the backup is still being written.
+pub struct OwnedBackupSlot(Arc<Metrics>);
+
+impl Drop for OwnedBackupSlot {
     fn drop(&mut self) {
         self.0.backup_running.store(false, Ordering::Release);
     }
@@ -1938,6 +1949,12 @@ impl Metrics {
     /// Claim the single backup slot, or `None` if a backup is running.
     pub fn begin_backup(&self) -> Option<BackupSlot<'_>> {
         (!self.backup_running.swap(true, Ordering::AcqRel)).then_some(BackupSlot(self))
+    }
+
+    /// Claim the single backup slot for a task that outlives the request.
+    pub fn begin_backup_owned(self: &Arc<Self>) -> Option<OwnedBackupSlot> {
+        (!self.backup_running.swap(true, Ordering::AcqRel))
+            .then(|| OwnedBackupSlot(Arc::clone(self)))
     }
 
     /// Unix time of the last successful backup, `0` if none since start.

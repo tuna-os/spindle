@@ -89,6 +89,29 @@ impl Instance {
         )
     }
 
+    async fn stream(&self, token: &str) -> reqwest::Response {
+        self.client
+            .get(format!(
+                "http://{}/_spindle/admin/v1/backup/stream",
+                self.name
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn fill(&self, rows: u32, value_len: usize) {
+        for index in 0..rows {
+            self.store
+                .commit(
+                    &[(pair("a", index), vec![7; value_len])],
+                    Durability::Relaxed,
+                )
+                .unwrap();
+        }
+    }
+
     async fn admin(&self) -> String {
         let token = self.register("root").await;
         assert!(
@@ -219,4 +242,220 @@ async fn only_an_admin_may_back_up_and_it_needs_a_directory() {
     let off = Instance::start(false).await;
     let admin = off.admin().await;
     assert_eq!(off.backup(&admin).await.0, 400);
+}
+
+/// The streamed body is the file format: it verifies, restores to one moment
+/// while writes continue, and the stream is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_backup_restores_to_one_moment_during_writes() {
+    let instance = Instance::start(false).await;
+    let token = instance.admin().await;
+    for index in 0..30_000 {
+        instance
+            .store
+            .commit(
+                &[
+                    (pair("a", index), vec![0; 64]),
+                    (pair("b", index), vec![0; 64]),
+                ],
+                Durability::Relaxed,
+            )
+            .unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (store, stop) = (Arc::clone(&instance.store), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut index = 30_000;
+            while !stop.load(Ordering::Relaxed) {
+                store
+                    .commit(
+                        &[
+                            (pair("a", index), vec![0; 64]),
+                            (pair("b", index), vec![0; 64]),
+                        ],
+                        Durability::Relaxed,
+                    )
+                    .unwrap();
+                index += 1;
+            }
+            index
+        })
+    };
+
+    let response = instance.stream(&token).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    let body = response.bytes().await.unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let written = writer.join().unwrap();
+    assert!(written > 30_000, "the writer ran while the stream did");
+
+    spindle_store::backup::verify_backup(&mut &body[..]).unwrap();
+    let restored_dir = TempDir::new().unwrap();
+    let restored = FjallStore::open(restored_dir.path()).unwrap();
+    spindle_store::backup::read_backup(&mut &body[..], &restored).unwrap();
+    let (a, b) = (count(&restored, "a"), count(&restored, "b"));
+    assert_eq!(a, b, "the restore holds one moment, not a smear");
+    let expected: Vec<u32> = (0..u32::try_from(a.len()).unwrap()).collect();
+    assert_eq!(a, expected, "and that moment is a prefix of the writes");
+    assert!(
+        Accounts::new(&restored, &instance.name)
+            .account("root")
+            .unwrap()
+            .is_some()
+    );
+
+    // The audit record is written as the write ends, which can follow the
+    // last byte by a moment.
+    let prefix = spindle_core::keys::keyspace_prefix(spindle_core::keys::Keyspace::AuditLog);
+    for _ in 0..100 {
+        let audit = instance.store.scan_prefix(&prefix).unwrap();
+        if audit
+            .iter()
+            .any(|(_, value)| String::from_utf8_lossy(value).contains("backup_stream"))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the streamed backup is not in the audit log");
+}
+
+#[tokio::test]
+async fn the_stream_is_admin_only_and_one_backup_runs_at_a_time() {
+    let instance = Instance::start(true).await;
+    let admin = instance.admin().await;
+    let user = instance.register("alice").await;
+    assert_eq!(instance.stream(&user).await.status(), 403);
+    assert_eq!(
+        instance
+            .client
+            .get(format!(
+                "http://{}/_synapse/admin/v1/backup/stream",
+                instance.name
+            ))
+            .header("authorization", format!("Bearer {admin}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "Synapse has no such endpoint, so only /_spindle serves it"
+    );
+
+    let held = instance.metrics.begin_backup().expect("the slot is free");
+    let response = instance.stream(&admin).await;
+    assert_eq!(response.status(), 409);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("another backup"));
+    assert_eq!(instance.backup(&admin).await.0, 409);
+    drop(held);
+    assert_eq!(instance.stream(&admin).await.status(), 200);
+}
+
+/// A client that leaves mid-stream stops the writer and frees the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_disconnects_frees_the_backup_slot() {
+    let instance = Instance::start(false).await;
+    let token = instance.admin().await;
+    // Far more than the channel holds, so the writer is waiting when the
+    // client leaves.
+    instance.fill(20_000, 1024);
+    let mut response = instance.stream(&token).await;
+    assert!(response.chunk().await.unwrap().is_some());
+    drop(response);
+    for _ in 0..100 {
+        if instance.metrics.begin_backup().is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the writer kept the slot after the client left");
+}
+
+/// The channel never holds more than its bound, whatever is streamed, and
+/// the slow reader does not make it grow.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stream_buffers_no_more_than_its_bound() {
+    use spindle_server::backup_stream::{BackupStream, Limits};
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    for index in 0..4_000 {
+        store
+            .commit(&[(pair("a", index), vec![3; 2048])], Durability::Relaxed)
+            .unwrap();
+    }
+    let metrics = Arc::new(Metrics::new());
+    let limits = Limits {
+        chunk_bytes: 4096,
+        queued_chunks: 2,
+    };
+    let slot = metrics.begin_backup_owned().unwrap();
+    let mut stream = BackupStream::start(Arc::clone(&store), slot, limits, |_, _| {});
+    let stats = stream.stats();
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.next_chunk().await {
+        let chunk = chunk.unwrap();
+        assert!(chunk.len() <= limits.chunk_bytes);
+        received.extend_from_slice(&chunk);
+        // Reading slowly lets the writer fill the channel to its bound.
+        tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+    }
+    assert!(received.len() > 8_000_000, "about 8 MB went through");
+    assert!(
+        received.len() > 100 * limits.max_buffered(),
+        "far more than the bound was streamed"
+    );
+    assert_eq!(stats.total_sent(), received.len() as u64);
+    assert!(
+        stats.peak_buffered() <= limits.max_buffered(),
+        "peak {} exceeded the bound {}",
+        stats.peak_buffered(),
+        limits.max_buffered()
+    );
+    spindle_store::backup::verify_backup(&mut &received[..]).unwrap();
+}
+
+/// Dropping the reader stops the writer within a few chunks: it does not scan
+/// on to the end of the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_reader_stops_the_writer_early() {
+    use spindle_server::backup_stream::{BackupStream, Limits};
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    for index in 0..4_000 {
+        store
+            .commit(&[(pair("a", index), vec![3; 2048])], Durability::Relaxed)
+            .unwrap();
+    }
+    let metrics = Arc::new(Metrics::new());
+    let limits = Limits {
+        chunk_bytes: 4096,
+        queued_chunks: 2,
+    };
+    let slot = metrics.begin_backup_owned().unwrap();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let mut stream = BackupStream::start(Arc::clone(&store), slot, limits, move |result, _| {
+        let _ = done_tx.send(result.is_err());
+    });
+    let stats = stream.stats();
+    assert!(stream.next_chunk().await.is_some());
+    drop(stream);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(10), done_rx)
+        .await
+        .expect("the writer stopped")
+        .unwrap();
+    assert!(failed, "an abandoned stream is not a finished backup");
+    assert!(
+        stats.total_sent() <= 8 * limits.max_buffered() as u64,
+        "it stopped after {} bytes, not at the end of 8 MB",
+        stats.total_sent()
+    );
+    assert!(metrics.begin_backup().is_some(), "and it freed the slot");
 }

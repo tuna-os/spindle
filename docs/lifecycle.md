@@ -39,6 +39,43 @@ means a restore is only half done when the rows are in.
 The command writes the rows from the snapshot to the file one at a time. Thus
 a backup needs memory for one row, not for the full store (#743).
 
+### Backup while the server runs
+
+Two admin endpoints take a backup while the server runs. Both need an admin
+token. Both read one store snapshot, so the backup shows one moment, whatever
+writes land while it runs. Both write the same format as `spindle backup`.
+`spindle restore` reads either.
+
+`POST /_spindle/admin/v1/backup` writes a file to `[storage] backup_dir` and
+returns its path. Use it for a nightly job on the disk of the server. It sets
+the `spindle_last_successful_backup_timestamp_seconds` metric. The alert for a
+late backup covers it.
+
+`GET /_spindle/admin/v1/backup/stream` sends the backup as the response body
+(`application/octet-stream`). Use it to pull the backup to another host with no
+file on the server. For example:
+`curl -H "Authorization: Bearer $TOKEN" -o spindle.backup .../backup/stream`.
+
+It needs no `backup_dir`. It does not set the metric, because the server cannot
+know that the client kept the bytes. The body ends with a digest. A body that
+stops early is not a backup. `spindle restore` checks the digest before it
+writes anything, so it rejects a short file.
+
+The stream uses bounded memory. A background task writes through a channel of
+four 64 KiB chunks. A slow client slows the backup and does not fill
+memory. If the client disconnects, the backup stops and frees its slot.
+
+One backup runs at a time, file or stream. A second request gets 409. Both
+endpoints write an audit record when they succeed. Synapse has no equivalent,
+so the stream exists only under `/_spindle`.
+
+Take the store backup first, then copy the media. The store names the blobs. A
+blob that arrives after the snapshot is in your media copy but not in the store
+backup, which is harmless. A copy taken before the snapshot could miss a blob
+that the store names, and `spindle verify-media` would report it as missing.
+
+Incremental backups are not available. Each backup holds the whole store.
+
 ## Restore
 
 ```
