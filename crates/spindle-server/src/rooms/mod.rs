@@ -4267,6 +4267,14 @@ impl Rooms {
             if self.is_forgotten(user_id, &room_id)? {
                 continue;
             }
+            // Leaving a room is not proof of having been in it: a withdrawn
+            // knock, a refused invite or a pre-emptive ban all end in
+            // `leave` or `ban`. The window `since` opens is the client's
+            // choice, so what it may carry is bounded by what the user was
+            // allowed to read, not just by when they left.
+            let Some(scope) = self.leave_read_scope(user_id, &room_id)? else {
+                continue;
+            };
             let (events, prev_batch) = match slice {
                 None => {
                     let Some((departure, departed_at)) =
@@ -4274,13 +4282,21 @@ impl Rooms {
                     else {
                         continue;
                     };
+                    if !scope.admits(departed_at) {
+                        continue;
+                    }
                     (vec![departure], Some(departed_at))
                 }
                 Some(slice) => {
                     let Some(departed_at) = self.membership_li(&room_id, user_id)? else {
                         continue;
                     };
-                    let events = self.timeline_of(&room_id, &slice, Some(departed_at))?;
+                    let readable: Vec<i64> = slice
+                        .iter()
+                        .copied()
+                        .filter(|li| scope.admits(*li))
+                        .collect();
+                    let events = self.timeline_of(&room_id, &readable, Some(departed_at))?;
                     // Everything in the window came after the departure.
                     if events.is_empty() {
                         continue;
@@ -4299,6 +4315,20 @@ impl Rooms {
         }
         out.sort_by(|a, b| a.room_id.cmp(&b.room_id));
         Ok(out)
+    }
+
+    /// What a user who has left `room_id` may be told of it in `/sync`:
+    /// their read scope, or `None` when they have none (never joined).
+    fn leave_read_scope(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> Result<Option<ReadScope>, RoomError> {
+        match self.read_scope(user_id, room_id) {
+            Ok(scope) => Ok(Some(scope)),
+            Err(RoomError::Forbidden(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `user_id`'s current membership event in `room_id`, and its `li`.
