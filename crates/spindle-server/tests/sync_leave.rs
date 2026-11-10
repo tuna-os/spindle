@@ -490,3 +490,183 @@ async fn one_users_departure_is_not_anothers() {
         "carol is still in the room"
     );
 }
+
+/// A user who only knocked and withdrew, was invited and refused, or was
+/// banned before ever joining, with `since` chosen to cover the room's
+/// history: `rooms.leave` still names the room and carries exactly their
+/// own departure event (clients wait on it), and none of the history,
+/// under either `shared` or `joined` visibility, incremental or initial.
+#[tokio::test]
+async fn someone_who_never_joined_is_told_only_how_they_left() {
+    for visibility in ["shared", "joined"] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let banned = harness.register("banned").await;
+        let refuser = harness.register("refuser").await;
+        let knocker = harness.register("knocker").await;
+        let mut since = Vec::new();
+        for user in [&banned, &refuser, &knocker] {
+            since.push(
+                harness.sync(user, None).await["next_batch"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        let (status, body) = harness
+            .request(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                &alice,
+                &json!({
+                    "preset": "private_chat",
+                    "initial_state": [
+                        { "type": "m.room.history_visibility", "state_key": "",
+                          "content": { "history_visibility": visibility } },
+                        { "type": "m.room.join_rules", "state_key": "",
+                          "content": { "join_rule": "knock" } },
+                    ],
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room = body["room_id"].as_str().unwrap().to_owned();
+        harness.say(&room, &alice, "TOPSECRETBODY", "t1").await;
+        let post = |user: &'static str, verb: &'static str| {
+            let path = format!("/_matrix/client/v3/rooms/{room}/{verb}");
+            let body = json!({ "user_id": format!("@{user}:example.org") });
+            (path, body)
+        };
+        let (path, body) = post("banned", "ban");
+        assert_eq!(
+            harness.request("POST", &path, &alice, &body).await.0,
+            StatusCode::OK
+        );
+        let (path, body) = post("refuser", "invite");
+        assert_eq!(
+            harness.request("POST", &path, &alice, &body).await.0,
+            StatusCode::OK
+        );
+        harness
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                &refuser,
+                &json!({}),
+            )
+            .await;
+        let (status, body) = harness
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/knock/{room}"),
+                &knocker,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        harness
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                &knocker,
+                &json!({}),
+            )
+            .await;
+
+        let users = [
+            (&banned, "banned"),
+            (&refuser, "refuser"),
+            (&knocker, "knocker"),
+        ];
+        for ((user, name), since) in users.into_iter().zip(&since) {
+            for token in [Some(since.as_str()), None] {
+                let sync = harness.sync(user, token).await;
+                assert_only_departure(&sync, &room, name, visibility);
+            }
+        }
+    }
+}
+
+/// `rooms.leave` names `room` and holds exactly `name`'s own departure.
+fn assert_only_departure(sync: &Value, room: &str, name: &str, visibility: &str) {
+    assert_eq!(
+        left_rooms(sync),
+        vec![room.to_owned()],
+        "{visibility}: {sync}"
+    );
+    let events = sync["rooms"]["leave"][room]["timeline"]["events"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 1, "{visibility}: {sync}");
+    assert_eq!(events[0]["type"], "m.room.member", "{sync}");
+    assert_eq!(
+        events[0]["state_key"],
+        format!("@{name}:example.org"),
+        "{sync}"
+    );
+    assert!(
+        matches!(
+            events[0]["content"]["membership"].as_str(),
+            Some("leave" | "ban")
+        ),
+        "{sync}"
+    );
+    assert!(!sync.to_string().contains("TOPSECRET"), "{sync}");
+}
+
+/// A real former member of a `joined` room gets, in `rooms.leave`, only
+/// the stint they were in, however early `since` reaches; under `shared`
+/// they get everything up to the departure.
+#[tokio::test]
+async fn a_former_members_leave_timeline_is_their_own_stints() {
+    for (visibility, sees_before) in [("joined", false), ("shared", true)] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let bob = harness.register("bob").await;
+        let since = harness.sync(&bob, None).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (status, body) = harness
+            .request(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                &alice,
+                &json!({
+                    "preset": "private_chat",
+                    "initial_state": [{ "type": "m.room.history_visibility", "state_key": "",
+                          "content": { "history_visibility": visibility } }],
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room = body["room_id"].as_str().unwrap().to_owned();
+        harness.say(&room, &alice, "BEFOREBOB", "t1").await;
+        harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+        harness.say(&room, &alice, "WHILEBOB", "t2").await;
+        harness
+            .request(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/leave"),
+                &bob,
+                &json!({}),
+            )
+            .await;
+        harness.say(&room, &alice, "AFTERBOB", "t3").await;
+
+        let bodies = left_bodies(&harness.sync(&bob, Some(&since)).await, &room);
+        assert!(
+            bodies.contains(&"WHILEBOB".to_owned()),
+            "{visibility}: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.contains(&"BEFOREBOB".to_owned()),
+            sees_before,
+            "{visibility}: {bodies:?}"
+        );
+        assert!(
+            !bodies.contains(&"AFTERBOB".to_owned()),
+            "{visibility}: {bodies:?}"
+        );
+    }
+}

@@ -133,7 +133,19 @@ impl Rooms {
         };
         let visibility = self.history_visibility_at(room_id, departure)?;
         match visibility.as_str() {
-            "shared" | "world_readable" => Ok(ReadScope::UpTo(departure)),
+            "shared" | "world_readable" => {
+                // Leaving is not the same as having been in: a knock
+                // withdrawn, an invite refused and a ban placed on someone
+                // who never joined all leave a `leave` or `ban` as the
+                // current membership, and none of them ever saw the room.
+                if self
+                    .membership_intervals(room_id, user_id, false)?
+                    .is_empty()
+                {
+                    return Err(refused());
+                }
+                Ok(ReadScope::UpTo(departure))
+            }
             "joined" | "invited" => {
                 let stints =
                     self.membership_intervals(room_id, user_id, visibility == "invited")?;

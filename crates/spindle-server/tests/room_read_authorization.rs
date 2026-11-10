@@ -230,6 +230,10 @@ fn every_read_route(room: &str, event: &str) -> Vec<(&'static str, String)> {
             format!("/_matrix/client/v1/rooms/{room}/threads"),
         ),
         (
+            "members",
+            format!("/_matrix/client/v3/rooms/{room}/members"),
+        ),
+        (
             "joined members",
             format!("/_matrix/client/v3/rooms/{room}/joined_members"),
         ),
@@ -880,4 +884,137 @@ async fn the_member_list_is_the_roster_a_caller_may_see() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(!serde_json::to_string(&body).unwrap().contains("@alice"));
+}
+
+/// Every read route, and `/search`, refuse `user` and leak nothing.
+async fn assert_reads_nothing(harness: &Harness, room: &str, event: &str, user: &str, why: &str) {
+    for (label, uri) in every_read_route(room, event) {
+        let (status, body) = harness.get(&uri, user).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label} answered {status} to {why}: {body}"
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(
+            !rendered.contains("TOPSECRET"),
+            "{label} leaked: {rendered}"
+        );
+    }
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/search",
+            user,
+            &json!({ "search_categories": { "room_events": { "search_term": "TOPSECRETBODY" } } }),
+        )
+        .await;
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert!(
+        !rendered.contains("TOPSECRETBODY"),
+        "search leaked to {why} ({status}): {rendered}"
+    );
+}
+
+/// Leaving is not the same as having been in. A `leave` or `ban` as the
+/// current membership used to be enough to read the room up to that event,
+/// for someone who never joined: a ban placed before they ever came, an
+/// invite they refused, a knock they withdrew.
+#[tokio::test]
+async fn someone_who_never_joined_reads_nothing_however_they_left() {
+    for visibility in ["shared", "joined"] {
+        let harness = Harness::new();
+        let alice = harness.register("alice").await;
+        let banned = harness.register("banned").await;
+        let refuser = harness.register("refuser").await;
+        let knocker = harness.register("knocker").await;
+        let room = harness
+            .create_room(
+                &alice,
+                json!({
+                    "name": "TOPSECRETNAME",
+                    "preset": "private_chat",
+                    "initial_state": [
+                        { "type": "m.room.history_visibility", "state_key": "",
+                          "content": { "history_visibility": visibility } },
+                        { "type": "m.room.join_rules", "state_key": "",
+                          "content": { "join_rule": "knock" } },
+                    ],
+                }),
+            )
+            .await;
+        let event = harness.say(&room, &alice, "TOPSECRETBODY").await;
+
+        // Banned before ever joining.
+        let (status, body) = harness
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/ban"),
+                &alice,
+                &json!({ "user_id": "@banned:example.org" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Invited, and said no.
+        let (status, body) = harness
+            .post(
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                &alice,
+                &json!({ "user_id": "@refuser:example.org" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        harness.leave(&room, &refuser).await;
+        // Knocked, and took it back.
+        let (status, body) = harness
+            .post(
+                &format!("/_matrix/client/v3/knock/{room}"),
+                &knocker,
+                &json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        harness.leave(&room, &knocker).await;
+
+        for (user, why) in [
+            (&banned, "a user banned before joining"),
+            (&refuser, "a user who refused an invite"),
+            (&knocker, "a user who withdrew a knock"),
+        ] {
+            let why = format!("{why} ({visibility})");
+            assert_reads_nothing(&harness, &room, &event, user, &why).await;
+        }
+    }
+}
+
+/// The other half: a real former member of a `shared` room still reads up
+/// to the departure through every route that bound applies to, with the
+/// stint requirement in force.
+#[tokio::test]
+async fn a_real_former_member_still_reads_every_route_up_to_the_departure() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness
+        .create_room(&alice, json!({ "preset": "private_chat" }))
+        .await;
+    harness.admit(&room, &alice, &bob, "@bob:example.org").await;
+    let event = harness.say(&room, &alice, "WHILEBOBWASHERE").await;
+    harness.leave(&room, &bob).await;
+    for (label, uri) in every_read_route(&room, &event) {
+        // Aliases and the member roster are membership questions, and
+        // relations and threads read for current members only; none of
+        // those are what this change touches.
+        if label == "aliases"
+            || label == "joined members"
+            || label == "threads"
+            || label.starts_with("relations")
+        {
+            continue;
+        }
+        let (status, body) = harness.get(&uri, &bob).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label} refused a former member: {body}"
+        );
+    }
 }
