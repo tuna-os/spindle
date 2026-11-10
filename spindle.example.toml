@@ -18,6 +18,12 @@ name = "example.org"
 # deliberately.
 bind = "127.0.0.1:8008"
 
+# Reverse proxies whose X-Forwarded-For header is believed, as addresses or
+# CIDR networks. Behind a proxy, set this: otherwise every client has the
+# proxy's address and shares one login and registration limit. The header is
+# ignored from any other peer. The proxy must append the address it sees.
+# trusted_proxies = ["127.0.0.1", "::1"]
+
 # What `.well-known` tells clients to connect to, when that differs from
 # `name`. Delegation is the ordinary case — it exists so the server name need
 # not be the hostname.

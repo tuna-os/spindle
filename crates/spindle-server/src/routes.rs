@@ -150,6 +150,10 @@ pub fn router(state: AppState) -> Router {
             federation_gate,
         ))
         .layer(axum::middleware::from_fn(cors))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            resolve_client_addr,
+        ))
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state);
     // The prefix rewrite has to run *before* routing, and a layer on a
@@ -436,13 +440,12 @@ pub(crate) fn internal(error: &AccountError) -> MatrixError {
 
 /// The caller's address, as far as it can be known.
 ///
-/// Behind a reverse proxy every request appears to come from the proxy, which
-/// would collapse the per-source limit onto a single key and make it useless.
-/// Reading a forwarding header instead is worse: any client can set it, so the
-/// limit becomes opt-out. Until the deployment can say which proxies it trusts,
-/// the peer address is the only value that is not attacker-controlled — and the
-/// per-account limit is the one that still bites in that case, which is why
-/// both exist.
+/// The peer address, unless the peer is in `[server] trusted_proxies`; then
+/// the address that proxy reports ([`crate::client_addr`] says how far that
+/// is believed). Without it every client behind a reverse proxy shares one
+/// source key (#831). `resolve_client_addr` does the work once per request,
+/// so a handler only reads the answer.
+#[derive(Clone)]
 pub struct ClientAddr(String);
 
 impl std::fmt::Display for ClientAddr {
@@ -458,13 +461,41 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map_or_else(|| "unknown".to_owned(), |info| info.0.ip().to_string()),
-        ))
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self("unknown".to_owned())))
     }
+}
+
+/// Work out the [`ClientAddr`] of a request, before any handler runs.
+async fn resolve_client_addr(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let key = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or_else(
+            || "unknown".to_owned(),
+            |info| {
+                let forwarded: Vec<&str> = request
+                    .headers()
+                    .get_all("x-forwarded-for")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .collect();
+                crate::client_addr::source_key(
+                    info.0.ip(),
+                    &forwarded,
+                    &state.config.server.trusted_proxies,
+                )
+            },
+        );
+    request.extensions_mut().insert(ClientAddr(key));
+    next.run(request).await
 }
 
 /// The longest transaction id `federation_send` accepts.

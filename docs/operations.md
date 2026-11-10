@@ -7,7 +7,9 @@ A format migration can need an offline maintenance window; see [lifecycle.md](li
 
 Use [spindle.example.toml](../spindle.example.toml) as the complete setting
 reference. Choose the permanent server name before you register accounts.
-Keep the client listener on loopback behind a TLS reverse proxy. Use
+Keep the client listener on loopback behind a TLS reverse proxy. Set
+`[server] trusted_proxies` to the proxy address, or every client shares one
+source limit. Use
 federation HTTPS. Disable exceptions for outbound access to private addresses.
 Expose only the intended listeners; protect the configuration and signature
 key.

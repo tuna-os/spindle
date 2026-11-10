@@ -44,6 +44,39 @@ struct Window {
     started: Instant,
     expires: Instant,
     count: u32,
+    /// The limit this counter was opened under, so saturation can tell a
+    /// counter that is refusing someone from one that is only counting.
+    max: u32,
+}
+
+/// How many partly spent counters one saturation pass reclaims.
+///
+/// A pass costs a scan and a sort of the whole map. Reclaiming a batch
+/// pays for that once per batch instead of once per new key.
+const EVICTION_BATCH: usize = 1_024;
+
+/// Free room in a full counter map for a key that has none.
+///
+/// Counters that have run out are dropped first. If that is not enough, the
+/// oldest counters that are still under their limit go: forgetting those
+/// forgives some guesses, but refusing every new key instead would let one
+/// flood of made-up keys lock every new caller out of login (#831). A
+/// counter that is refusing someone is never dropped, so a lockout cannot
+/// be reset this way.
+fn make_room(windows: &mut HashMap<String, Window>, now: Instant) {
+    windows.retain(|_, window| window.expires > now);
+    if windows.len() < MAX_TRACKED_KEYS {
+        return;
+    }
+    let mut spent: Vec<(Instant, String)> = windows
+        .iter()
+        .filter(|(_, window)| window.count < window.max)
+        .map(|(key, window)| (window.started, key.clone()))
+        .collect();
+    spent.sort_unstable();
+    for (_, key) in spent.into_iter().take(EVICTION_BATCH) {
+        windows.remove(&key);
+    }
 }
 
 /// One limit: `max` events per `window`.
@@ -145,10 +178,8 @@ impl RateLimiter {
             poisoned.into_inner()
         });
 
-        // Preserve existing budgets at saturation: evicting a live counter
-        // would let an attacker reset it by flooding distinct identifiers.
         if windows.len() >= MAX_TRACKED_KEYS && !windows.contains_key(key) {
-            windows.retain(|_, window| window.expires > now);
+            make_room(&mut windows, now);
             if windows.len() >= MAX_TRACKED_KEYS {
                 return Err(RetryAfter(limit.window));
             }
@@ -157,6 +188,7 @@ impl RateLimiter {
             started: now,
             expires: now + limit.window,
             count: 0,
+            max: limit.max,
         });
 
         if now.duration_since(entry.started) >= limit.window {
@@ -164,6 +196,7 @@ impl RateLimiter {
                 started: now,
                 expires: now + limit.window,
                 count: 0,
+                max: limit.max,
             };
         }
 
@@ -490,6 +523,25 @@ mod capacity_tests {
                 .is_err()
         );
         assert_eq!(limiter.tracked(), 1);
+    }
+
+    /// A flood of made-up keys must not lock every new caller out (#831),
+    /// and must not forgive a counter that is already refusing someone.
+    #[test]
+    fn saturation_admits_new_keys_and_keeps_lockouts() {
+        let limiter = RateLimiter::new();
+        let now = Instant::now();
+        let limit = Limit::new(2, Duration::from_secs(60));
+        assert!(limiter.check_at("locked", limit, now).is_ok());
+        assert!(limiter.check_at("locked", limit, now).is_ok());
+        assert!(limiter.check_at("locked", limit, now).is_err());
+        for number in 1..MAX_TRACKED_KEYS {
+            assert!(limiter.check_at(&number.to_string(), limit, now).is_ok());
+        }
+        assert_eq!(limiter.tracked(), MAX_TRACKED_KEYS);
+        assert!(limiter.check_at("new", limit, now).is_ok());
+        assert!(limiter.tracked() <= MAX_TRACKED_KEYS);
+        assert!(limiter.check_at("locked", limit, now).is_err());
     }
 
     /// `burst` at once, then one per interval; the wait reported is the

@@ -24,6 +24,7 @@ pub mod authorize;
 pub mod backups;
 pub mod blobs;
 pub mod blocking;
+pub mod client_addr;
 pub mod config;
 pub mod dehydrated;
 pub mod delayed;
