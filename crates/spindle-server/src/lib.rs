@@ -24,6 +24,7 @@ pub mod authorize;
 pub mod backups;
 pub mod blobs;
 pub mod blocking;
+pub mod captcha;
 pub mod client_addr;
 pub mod config;
 pub mod dehydrated;
@@ -68,6 +69,7 @@ pub mod pushers;
 pub mod ratelimit;
 pub mod receipts;
 pub mod recovery;
+pub mod registration_stages;
 pub mod registration_terms;
 pub mod registration_tokens;
 pub mod remote_space;
@@ -143,6 +145,8 @@ pub struct AppState {
     /// The push gateway client, and the judgement on which gateways it
     /// reaches; `set_pusher` asks it before storing a URL.
     pub push: Arc<push::Gateway>,
+    /// The CAPTCHA check, when `[registration.captcha]` is set.
+    pub captcha: Option<Arc<captcha::Verifier>>,
     /// Single-use challenges for Synapse-compatible shared-secret account
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
@@ -182,6 +186,7 @@ pub enum AppError {
     PreviewConfig(String),
     FederationConfig(String),
     PushConfig(String),
+    Captcha(String),
     Appservice(String),
     Email(String),
     Upstream(String),
@@ -196,6 +201,7 @@ impl std::fmt::Display for AppError {
             Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
+            Self::Captcha(why) => write!(formatter, "captcha: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
             Self::Email(why) => write!(formatter, "email: {why}"),
             Self::Upstream(why) => write!(formatter, "upstream identity provider: {why}"),
@@ -474,6 +480,17 @@ fn open_rooms(
     Ok(Arc::new(rooms))
 }
 
+fn captcha_for(config: &Config) -> Result<Option<Arc<captcha::Verifier>>, AppError> {
+    config
+        .registration
+        .captcha
+        .as_ref()
+        .map(captcha::Verifier::new)
+        .transpose()
+        .map(|verifier| verifier.map(Arc::new))
+        .map_err(AppError::Captcha)
+}
+
 fn app_state_with(
     config: Config,
     store: Arc<FjallStore>,
@@ -531,6 +548,7 @@ fn app_state_with(
         .map(Arc::new);
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
+    let captcha = captcha_for(&config)?;
     let delayed = delayed_for(&config, &store);
     let dependency_failure_ttl =
         std::time::Duration::from_secs(config.federation.dependency_failure_ttl_secs);
@@ -562,6 +580,7 @@ fn app_state_with(
         federation,
         delayed,
         push,
+        captcha,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
         recovery: Arc::new(inbound::RecoveryGate::new(dependency_failure_ttl)),

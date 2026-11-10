@@ -29,6 +29,16 @@ The v0.1 deployment envelope needs these controls:
 - To ask new accounts to accept a policy, set `[registration] terms_url`. The server adds
   the `m.login.terms` stage to registration. It warns at start-up when registration is open and
   the bind address is not loopback.
+- We recommend `require_token = true` for any server that binds to a non-loopback address.
+  Spindle does not turn it on by itself, because that would close registration on upgrade.
+  A CAPTCHA only slows bots. A token lets you choose who joins.
+- To ask new accounts to solve a CAPTCHA, set `[registration.captcha]`. The provider is
+  `recaptcha`, `hcaptcha` or `turnstile`. The server adds the `m.login.recaptcha` stage after
+  the policy stage. It posts the client's token to the provider with a short timeout. If the
+  provider does not answer, the registration fails. Keep the secret key in `secret_key_file`.
+  The server never logs it.
+- The built-in OIDC provider has no sign-up page, so these stages apply to the client
+  registration API only.
 - Leave `[ratelimit] enabled = true`. Limit the number of ingress connections,
   requests per source, request body size and timeouts in the reverse proxy.
   Allow uploads up to the configured size. Do not

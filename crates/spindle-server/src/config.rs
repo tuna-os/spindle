@@ -212,6 +212,120 @@ impl RegistrationConfig {
     }
 }
 
+/// Which service checks the CAPTCHA token. All three take the same request
+/// and give the same answer, so the choice only sets the default URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptchaProvider {
+    Recaptcha,
+    Hcaptcha,
+    Turnstile,
+}
+
+impl CaptchaProvider {
+    /// The provider's public verification endpoint.
+    #[must_use]
+    pub const fn verify_url(self) -> &'static str {
+        match self {
+            Self::Recaptcha => "https://www.google.com/recaptcha/api/siteverify",
+            Self::Hcaptcha => "https://api.hcaptcha.com/siteverify",
+            Self::Turnstile => "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        }
+    }
+}
+
+/// `[registration.captcha]`.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptchaConfig {
+    pub provider: CaptchaProvider,
+    /// The public key a client shows the widget with.
+    pub site_key: String,
+    /// The secret key, inline. Prefer `secret_key_file`.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// A file holding the secret key (trailing newline ignored).
+    #[serde(default)]
+    pub secret_key_file: Option<PathBuf>,
+    /// Verify against this URL instead of the provider's. For tests and
+    /// for a proxy in front of the provider.
+    #[serde(default)]
+    pub verify_url: Option<String>,
+    /// CIDR ranges `verify_url` may sit in although they are not routable,
+    /// e.g. `["127.0.0.0/8"]` for a test stub. Same judgement as
+    /// `[push] allow_internal`.
+    #[serde(default)]
+    pub allow_internal: Vec<String>,
+}
+
+impl std::fmt::Debug for CaptchaConfig {
+    /// Everything but the secret key, which is never printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptchaConfig")
+            .field("provider", &self.provider)
+            .field("site_key", &self.site_key)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secret_key_file", &self.secret_key_file)
+            .field("verify_url", &self.verify_url)
+            .field("allow_internal", &self.allow_internal)
+            .finish()
+    }
+}
+
+impl CaptchaConfig {
+    /// The secret key, from wherever it was configured.
+    ///
+    /// # Errors
+    ///
+    /// When `secret_key_file` cannot be read. The message names the file,
+    /// never its contents.
+    pub fn resolve_secret(&self) -> Result<String, String> {
+        if let Some(path) = &self.secret_key_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| {
+                    format!(
+                        "registration.captcha.secret_key_file {}: {}",
+                        path.display(),
+                        error.kind()
+                    )
+                });
+        }
+        Ok(self.secret_key.clone().unwrap_or_default())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, message: &str| {
+            Err(ConfigError::Invalid {
+                field,
+                message: message.to_owned(),
+            })
+        };
+        if self.site_key.trim().is_empty() {
+            return invalid("registration.captcha.site_key", "must not be empty");
+        }
+        if self.secret_key.is_some() == self.secret_key_file.is_some() {
+            return invalid(
+                "registration.captcha.secret_key",
+                "set exactly one of secret_key and secret_key_file",
+            );
+        }
+        if let Some(url) = &self.verify_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return invalid(
+                "registration.captcha.verify_url",
+                "must be an http or https URL",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Who may register.
 ///
 /// Registration is open unless a token is required: an operator who
@@ -233,6 +347,10 @@ pub struct RegistrationConfig {
     /// The policy's name as a client shows it.
     #[serde(default = "default_terms_name")]
     pub terms_name: String,
+    /// A CAPTCHA every new account solves (`m.login.recaptcha`, the legacy
+    /// registration flow). Absent, registration asks for none.
+    #[serde(default)]
+    pub captcha: Option<CaptchaConfig>,
     /// Enable Synapse's shared-secret admin registration compatibility API.
     ///
     /// Absent by default: this secret can create administrator accounts, so
@@ -2072,6 +2190,9 @@ impl Config {
                 field: "media.remote_retention_days",
                 message: "must be greater than zero; omit it to keep the cache".to_owned(),
             });
+        }
+        if let Some(captcha) = &self.registration.captcha {
+            captcha.validate()?;
         }
         if let Some(url) = &self.registration.terms_url
             && !(url.starts_with("https://") || url.starts_with("http://"))
