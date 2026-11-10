@@ -39,6 +39,42 @@ means a restore is only half done when the rows are in.
 The command writes the rows from the snapshot to the file one at a time. Thus
 a backup needs memory for one row, not for the full store (#743).
 
+### Backup while the server runs
+
+Two admin endpoints take a backup without stopping the server. Both need an
+admin token. Both read one store snapshot, so the backup is of one moment
+however many writes land while it runs. Both write the same format as
+`spindle backup`, and `spindle restore` reads either.
+
+`POST /_spindle/admin/v1/backup` writes a file to `[storage] backup_dir` and
+returns its path. Use it for a nightly job on the server's own disk. It sets
+the `spindle_last_successful_backup_timestamp_seconds` metric, so the stale
+backup alert covers it.
+
+`GET /_spindle/admin/v1/backup/stream` sends the backup as the response body
+(`application/octet-stream`). Use it to pull the backup to another host
+without a file on the server, for example
+`curl -H "Authorization: Bearer $TOKEN" -o spindle.backup .../backup/stream`.
+It needs no `backup_dir`. It does not set the metric, because the server
+cannot know the client kept the bytes. The body ends with a digest. A body
+that stops early is not a backup. `spindle restore` checks the digest
+before it writes anything, so a short file is refused.
+
+The stream uses bounded memory. A blocking task writes through a channel of
+four 64 KiB chunks, so a slow client slows the backup instead of filling
+memory. If the client disconnects, the backup stops and frees its slot.
+
+One backup runs at a time, file or stream. A second request gets 409. Both
+endpoints write an audit record when they succeed. Synapse has no equivalent,
+so the stream exists only under `/_spindle`.
+
+Take the store backup first, then copy media. The store names blobs. A blob
+uploaded after the snapshot is then in your media copy but not in the store
+backup, which is harmless. A copy taken before the snapshot could miss a blob
+the store names, and `spindle verify-media` would report it missing.
+
+Incremental backups are not available. Each backup holds the whole store.
+
 ## Restore
 
 ```

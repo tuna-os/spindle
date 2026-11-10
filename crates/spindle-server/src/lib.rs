@@ -21,6 +21,7 @@ pub mod appservice_routes;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;
+pub mod backup_stream;
 pub mod backups;
 pub mod blobs;
 pub mod blocking;
