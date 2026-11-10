@@ -88,8 +88,7 @@ across a migration in either direction.
 | `GET /media/v1/download` and `.../thumbnail` of another server's media | requesting account | `remote_media`: burst 100, 2/s | none | only when the media is not cached yet, before the fetch; media already cached is free |
 
 Synapse has no limit for either of the two last rows, so the defaults are
-this server's own. A preview costs up to two outbound fetches. A remote
-download costs one fetch and leaves the bytes behind. Each is spent by the
+this server's own. A preview costs up to two outbound fetches. A download of remote media costs one fetch and leaves the bytes behind. Each is spent by the
 account that asks, so one account's flood does not use up the budget of
 another. The unauthenticated media routes never fetch and are not limited.
 
@@ -158,18 +157,18 @@ write, and a config that quietly disables a feature is worse than one that
 will not load. `password_hashes_waiting` is the exception. A zero there
 means no queue: a login gets a 429 when all workspaces are in use.
 
-Previews are not charged to the account that asked. A preview is the
-server's own copy and its image is shared by everyone who sees the link,
-so a per-user quota would charge the wrong person. The preview cache has
-its own cap above, and the per-account rate bounds how fast one account can
-fill it. A cached preview is dropped when it is replaced after an hour, so
-a refresh does not keep the old image.
+Previews do not count against the quota of the account that asked. A preview
+is a copy that the server owns. Everyone who sees the link shares its image,
+so a per-user quota would charge the wrong person. The preview cache has its
+own cap above, and the per-account rate limits how fast one account can fill
+it. After an hour the server replaces a cached preview and deletes its old
+image.
 
-The cap on remote media removes by size and by age of arrival, oldest first.
-A purge by age (`[media] remote_retention_days`, #847) removes from the same
-end. The two can both be on. The cap bounds the disk whatever the age
-setting is, and the age setting frees bytes before the cap is reached.
-Neither removes quarantined media. It stays as evidence.
+The cap on remote media removes the oldest items first. A purge by age
+(`[media] remote_retention_days`, #847) removes from the same end. You can turn
+on both. The cap bounds the disk whatever you set for the age, and the age
+setting frees bytes before the cap applies. Neither removes quarantined media,
+which stays as evidence.
 
 ## Account-driven storage growth
 
