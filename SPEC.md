@@ -392,6 +392,26 @@ Anything else is rehydrated from `state_nodes` by its root, which is `O(log n)`
 in the size of the state. The bound is asserted rather than assumed: a room
 whose resident count tracks its length has lost it.
 
+**Status.** The number of resident rooms is bounded. The number of events kept
+per resident room is not.
+
+- `[storage] max_resident_rooms` (default 4096, `0` for no limit) caps the
+  open rooms. When a load or a new room takes the count past it, the rooms
+  untouched for longest are dropped. The metrics are
+  `spindle_rooms_resident` and `spindle_rooms_evicted_total`.
+- A room is dropped only when nothing holds it: no reader, writer or
+  federation task has its lock, no load is in flight for it, it is not
+  mid-resync (partial state), and it has no unmerged fork. A busy room
+  keeps the count above the limit until it is idle.
+- A dropped room loads from the store like a restart. Every cache kept for
+  it is cleared with it. Only `receipt_marks` and the extremity merge
+  bookkeeping stay, because the store cannot rebuild them.
+- A resident room still keeps its whole log index in memory (`entries` and
+  `positions` in `RoomLog`). Memory per resident room is `O(events)`. A tail
+  window over `EventIndex` is not built.
+- The retention rule in the first paragraph is therefore only half true
+  today: rooms evict, but the log index of a room that stays open does not.
+
 ### 6.5 Backfilled history
 
 Backfilled events have `li <= 0` and their state must be established backwards.

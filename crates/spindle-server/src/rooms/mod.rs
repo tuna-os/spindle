@@ -175,7 +175,11 @@ pub struct Rooms {
     /// Where appends, lock acquisitions and sync waits are counted; the
     /// server's one registry, shared with everything else that records.
     metrics: Arc<crate::metrics::Metrics>,
-    open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
+    open: RwLock<HashMap<String, Slot>>,
+    /// Most rooms to hold open; `0` is no limit ([`Self::enforce_resident_budget`]).
+    resident_limit: std::sync::atomic::AtomicUsize,
+    /// Orders room touches for the eviction pick; see [`Slot`].
+    touch_clock: std::sync::atomic::AtomicU64,
     /// Cold loads in flight, one per room: every other caller for a room
     /// being loaded waits for that load rather than starting its own
     /// ([`Self::room_or_load`]). Taken on its own, briefly, and never held
@@ -593,6 +597,8 @@ impl Rooms {
             server_name: server_name.into(),
             metrics,
             open: RwLock::new(HashMap::new()),
+            resident_limit: std::sync::atomic::AtomicUsize::new(0),
+            touch_clock: std::sync::atomic::AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
@@ -709,8 +715,8 @@ impl Rooms {
                 .open
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(room) = open.get(room_id) {
-                Arc::clone(room)
+            if let Some(slot) = open.get(room_id) {
+                Arc::clone(&slot.room)
             } else {
                 let log = RoomStore::new(self.store.as_ref(), room_id)
                     .load()?
@@ -719,7 +725,7 @@ impl Rooms {
                         |restored| restored.log,
                     );
                 let room = Arc::new(RwLock::new(log));
-                open.insert(room_id.to_owned(), Arc::clone(&room));
+                open.insert(room_id.to_owned(), self.slot(Arc::clone(&room)));
                 room
             }
         };
@@ -1090,7 +1096,7 @@ impl Rooms {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+            .insert(room_id.to_owned(), self.slot(Arc::new(RwLock::new(log))));
     }
 
     /// Store event bodies for [`Self::install_replay_log`].
@@ -1272,7 +1278,8 @@ impl Rooms {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.clone(), Arc::new(RwLock::new(log)));
+            .insert(room_id.clone(), self.slot(Arc::new(RwLock::new(log))));
+        self.enforce_resident_budget();
         Ok(room_id)
     }
 
@@ -5540,7 +5547,10 @@ impl Rooms {
 
     /// The room's lock if this process holds it open, without loading it.
     fn resident(&self, room_id: &str) -> Option<Arc<RwLock<RoomLog>>> {
-        self.registry_read().get(room_id).map(Arc::clone)
+        let open = self.registry_read();
+        let slot = open.get(room_id)?;
+        self.touch(slot);
+        Some(Arc::clone(&slot.room))
     }
 
     /// A room's lock, loading the room if need be, for tests that must hold
@@ -5586,10 +5596,19 @@ impl Rooms {
     /// loaded is skipped: the caller that needs it will meet the error
     /// itself, where it can say what it means.
     pub fn warm_all(&self, rooms: &[String], parallelism: usize) {
-        let cold: Vec<&String> = rooms
+        let mut cold: Vec<&String> = rooms
             .iter()
             .filter(|room| !self.is_resident(room))
             .collect();
+        // Past the limit a warmed room would only push out one warmed
+        // before it, so warm as many as fit.
+        let limit = self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if limit != 0 {
+            let room = usize::try_from(self.resident_count().unwrap_or(0)).unwrap_or(usize::MAX);
+            cold.truncate(limit.saturating_sub(room));
+        }
         match cold.as_slice() {
             [] => {}
             [room] => {
@@ -5681,9 +5700,7 @@ impl Rooms {
     }
 
     /// The registry, shared, with the wait timed.
-    fn registry_read(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<RoomLog>>>> {
+    fn registry_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Slot>> {
         self.metrics.record_registry_lock(false);
         let started = std::time::Instant::now();
         let open = self
@@ -5805,9 +5822,11 @@ impl Rooms {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.metrics
             .observe_lock_wait(crate::metrics::LockKind::Registry, true, started.elapsed());
-        let room = Arc::clone(open.entry(room_id.to_owned()).or_insert(room));
+        let slot = self.slot(room);
+        let room = Arc::clone(&open.entry(room_id.to_owned()).or_insert(slot).room);
         drop(open);
         leader.outcome = Some(Arc::clone(&room));
+        self.enforce_resident_budget();
         Ok(room)
     }
 
@@ -5914,23 +5933,185 @@ impl Rooms {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if open
                 .get(room_id)
-                .is_some_and(|held| Arc::ptr_eq(held, room))
+                .is_some_and(|held| Arc::ptr_eq(&held.room, room))
             {
                 open.remove(room_id);
             }
         }
-        self.unread_index
+        self.forget_room_caches(room_id);
+    }
+
+    /// Drop every cache this registry keeps for `room_id`, so the memory
+    /// is returned and a reload starts from the store alone.
+    ///
+    /// Each one is a function of the room's stored log, so a miss is
+    /// rebuilt on demand and nothing here is the only copy of anything.
+    /// `state_heads` must go with the room, not merely be allowed to:
+    /// appends keep it current only while it is present, so one that
+    /// outlived a log it was built from would name stale parents.
+    ///
+    /// Two per-room tables are kept on purpose, because the store cannot
+    /// rebuild them. `receipt_marks` is the only record that a receipt
+    /// moved at a stream position, which a syncing client may still ask
+    /// about. The extremity tracker holds a queue of rooms owed a merge
+    /// and the time of the last try, which keeps an unmergeable room from
+    /// being retried in a loop. Both are small.
+    fn forget_room_caches(&self, room_id: &str) {
+        fn clear<V>(cache: &Mutex<HashMap<String, V>>, room_id: &str) {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(room_id);
+        }
+        clear(&self.unread_index, room_id);
+        clear(&self.last_activity, room_id);
+        clear(&self.state_heads, room_id);
+        clear(&self.state_render, room_id);
+        clear(&self.member_ids, room_id);
+        clear(&self.destinations, room_id);
+        clear(&self.participants, room_id);
+        clear(&self.room_versions, room_id);
+        clear(&self.auth_graphs, room_id);
+        self.highlights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
-        self.last_activity
+            .retain(|(room, _), _| room != room_id);
+    }
+
+    /// Whether any per-room cache still holds `room_id`, for tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn holds_caches_for(&self, room_id: &str) -> bool {
+        fn has<V>(cache: &Mutex<HashMap<String, V>>, room_id: &str) -> bool {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(room_id)
+        }
+        has(&self.unread_index, room_id)
+            || has(&self.last_activity, room_id)
+            || has(&self.state_heads, room_id)
+            || has(&self.state_render, room_id)
+            || has(&self.member_ids, room_id)
+            || has(&self.destinations, room_id)
+            || has(&self.participants, room_id)
+            || has(&self.room_versions, room_id)
+            || has(&self.auth_graphs, room_id)
+            || self
+                .highlights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .any(|(room, _)| room == room_id)
+    }
+
+    /// Set the most rooms to hold open at once; `0` lifts the limit.
+    /// See [`Self::enforce_resident_budget`].
+    pub fn set_max_resident_rooms(&self, limit: usize) {
+        self.resident_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.enforce_resident_budget();
+    }
+
+    /// A registry entry for a room just opened, as recently touched as
+    /// anything.
+    fn slot(&self, room: Arc<RwLock<RoomLog>>) -> Slot {
+        let slot = Slot {
+            room,
+            touched: std::sync::atomic::AtomicU64::new(0),
+        };
+        self.touch(&slot);
+        slot
+    }
+
+    /// Mark a room as just used. Skipped without a limit, so a server that
+    /// sets none pays nothing on the hot path.
+    fn touch(&self, slot: &Slot) {
+        if self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+        {
+            let tick = self
+                .touch_clock
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            slot.touched
+                .store(tick, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drop the rooms untouched for longest while more than
+    /// `max_resident_rooms` are open.
+    ///
+    /// A room is dropped only if nothing could notice. The registry is
+    /// held for writing, so no one can take a new handle on any room, and
+    /// a room whose `Arc` has a count above one is held by a reader, a
+    /// writer, a federation task or the load that just published it, and is
+    /// skipped. Also skipped are rooms with a load in flight, rooms
+    /// mid-resync (`partial`) and rooms with an unmerged fork, which the
+    /// merge pass finds only among open rooms. The count may therefore
+    /// stay above the limit while rooms are busy; the next load tries
+    /// again. The state of a room that is dropped is in the store, so the
+    /// next ask loads it as a restart would.
+    fn enforce_resident_budget(&self) {
+        let limit = self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if limit == 0
+            || self
+                .resident_count()
+                .is_some_and(|open| open <= limit as u64)
+        {
+            return;
+        }
+        // Taken before the registry: `claim_load` takes `loading` and then
+        // the registry, and the order is not to be reversed here.
+        let loading: HashSet<String> = self
+            .loading
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
-        self.state_heads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
+            .keys()
+            .cloned()
+            .collect();
+        let dropped: Vec<String> = {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(excess) = open.len().checked_sub(limit).filter(|excess| *excess > 0) else {
+                return;
+            };
+            let mut idle: Vec<(u64, String)> = open
+                .iter()
+                .filter(|(room_id, slot)| {
+                    Arc::strong_count(&slot.room) == 1
+                        && !loading.contains(*room_id)
+                        && !self.is_partial_state(room_id)
+                        && !slot
+                            .room
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_forked()
+                })
+                .map(|(room_id, slot)| {
+                    (
+                        slot.touched.load(std::sync::atomic::Ordering::Relaxed),
+                        room_id.clone(),
+                    )
+                })
+                .collect();
+            idle.sort_unstable();
+            idle.truncate(excess);
+            for (_, room_id) in &idle {
+                open.remove(room_id);
+            }
+            idle.into_iter().map(|(_, room_id)| room_id).collect()
+        };
+        for room_id in &dropped {
+            self.forget_room_caches(room_id);
+            self.metrics.observe_room_evicted();
+        }
     }
 
     /// Build, sign, append and persist one event.
@@ -7500,6 +7681,14 @@ struct TailEntry {
     rejected: bool,
     /// A state event, which is never a dummy event.
     state: bool,
+}
+
+/// One open room in the registry, with when it was last used.
+struct Slot {
+    room: Arc<RwLock<RoomLog>>,
+    /// A tick of `touch_clock` at the last use; the smallest is the room
+    /// idle the longest. Only kept while a limit is set.
+    touched: std::sync::atomic::AtomicU64,
 }
 
 /// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it
@@ -9487,7 +9676,7 @@ mod cold_registry_tests {
             .open
             .write()
             .unwrap()
-            .insert("!same:test".to_owned(), Arc::clone(&published));
+            .insert("!same:test".to_owned(), rooms.slot(Arc::clone(&published)));
         published
             .write()
             .unwrap()

@@ -56,6 +56,8 @@ the incident it was supposed to explain.
 | `spindle_emails_sent_total` | counter | `kind` = `password_reset`\|`verification`, `result` = `sent`\|`failed` | Mail handed to the SMTP transport. `failed` is the relay refusing or unreachable. |
 | `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset`\|`recovery_codes` | Changes made through the account-management pages (`recovery_codes`: a fresh set generated). |
 | `spindle_password_recoveries_total` | counter | `method` = `reset_link`\|`recovery_code`, `result` = `success`\|`rejected`\|`rate_limited` | Forgotten-password recoveries: a reset link (mailed or administrator-issued) or a recovery code. `rejected` is a dead link or a code that did not match. |
+| `spindle_rooms_resident` | gauge | — | Rooms held open in memory. Each one keeps its whole log index until it is evicted, so this is the number that bounds resident memory. |
+| `spindle_rooms_evicted_total` | counter | — | Rooms dropped from memory because more than `[storage] max_resident_rooms` were open. An evicted room loads from the store the next time anything asks for it. A fast climb means the budget is below the working set and rooms reload often (see `spindle_room_cold_loads_total`). |
 | `spindle_reset_links_issued_total` | counter | — | Reset links issued through the admin API (the offline CLI cannot count into a running server). |
 
 ## Alert rules, a scrape target and a dashboard

@@ -1624,6 +1624,17 @@ pub struct StorageConfig {
     /// up every other.
     #[serde(default = "default_warm_concurrency")]
     pub warm_concurrency: usize,
+    /// How many rooms may be open in memory at once. Past it, the rooms
+    /// untouched for longest are dropped and load again from the store when
+    /// something asks for them. A room in use, mid-load or mid-resync is
+    /// never dropped, so the count can run over while those are busy. `0`
+    /// means no limit.
+    #[serde(default = "default_max_resident_rooms")]
+    pub max_resident_rooms: usize,
+}
+
+fn default_max_resident_rooms() -> usize {
+    4096
 }
 
 fn default_warm_concurrency() -> usize {
@@ -1681,6 +1692,7 @@ impl Default for StorageConfig {
             path: default_data_dir(),
             s3: None,
             warm_concurrency: default_warm_concurrency(),
+            max_resident_rooms: default_max_resident_rooms(),
         }
     }
 }
