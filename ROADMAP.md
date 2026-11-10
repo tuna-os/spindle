@@ -1,9 +1,10 @@
 # Spindle Roadmap
 
-**Last updated**: 2026-11-05 | **Status**: Experiment under construction — not a deployment
+**Last updated**: 2026-11-10 | **Status**: Prerelease. `v0.1.x` is the supported line, and one production deployment uses it
 
-Part of the [TunaOS](https://tunaos.org) ecosystem. A Matrix homeserver that
-stores rooms as a linear log, so state resolution never runs on the hot path.
+Part of the [TunaOS](https://tunaos.org) ecosystem. One binary for Matrix
+chat, login and calls: a homeserver that stores rooms as a linear log, so
+state resolution never runs on the hot path.
 
 ## What this file is, and is not
 
@@ -32,8 +33,13 @@ experiment, and what is deliberately not being built yet.
   FluffyChat work unmodified against ordinary room version 11 rooms
 - Federation interoperating with real Synapse in both directions, and
   Spindle-to-Spindle remote joins proven by a two-instance test
-- Published benchmarks against Synapse, Continuwuity and Tuwunel — including the
-  cells Spindle lost and two claims retracted after publication
+- Published benchmarks against Synapse, Dendrite, Continuwuity and Tuwunel —
+  including the cells Spindle lost and two claims retracted after publication
+- A built-in OIDC provider and a built-in LiveKit JWT service, so Element X
+  login and Element Call need no MAS and no `lk-jwt-service`
+- A Synapse importer and a fenced cutover procedure, which carried the
+  reilly.asia migration from Synapse on ESS
+  ([#563](https://github.com/tuna-os/spindle/issues/563))
 - CI gates: the Complement ratchet, config drift, dashboard drift, pinned
   actions, and a semgrep rule for the authorization-shaped defect
 
@@ -102,17 +108,33 @@ org-wide contribution guidance is in
 
 Recorded so that absence reads as a decision rather than an oversight:
 
-- **Horizontal scale-out** — deferred until after a single-node production gate
-  ([#24](https://github.com/tuna-os/spindle/issues/24))
+- **Horizontal scale-out** — deferred until the single-node ceilings are
+  published ([#693](https://github.com/tuna-os/spindle/issues/693)); the design
+  questions are [#694](https://github.com/tuna-os/spindle/issues/694) and
+  [#695](https://github.com/tuna-os/spindle/issues/695)
 - **MLS** — evaluated after Megolm compatibility shipped, and a no-go until a
   stable MSC, a maintained client and hub mode exist
   ([#23](https://github.com/tuna-os/spindle/issues/23), [docs/mls.md](docs/mls.md))
-- **Hub mode (MSC3995)** — the differentiator, behind a feature flag, after the
-  ordinary-federation path is proven ([#22](https://github.com/tuna-os/spindle/issues/22))
-- **Synapse importer** — parked behind the API surface and MatrixRTC
-  ([#240](https://github.com/tuna-os/spindle/issues/240))
+- **Hub mode (MSC3995) in release builds** — the code is on `main` behind the
+  off-by-default `hub-mode` cargo feature and has tests between Spindle
+  peers. It stays out of the release builds until the ordinary-federation
+  path is proven ([#22](https://github.com/tuna-os/spindle/issues/22))
 - **TURN, push gateway, identity server** — deliberately unbundled services, per
   [#4](https://github.com/tuna-os/spindle/issues/4)'s *what not to build early*
+
+## What the 2026-11 review found
+
+A review of the code and the documents on 2026-11-10 gave these work queues.
+They are the largest distances between Spindle and a server that a stranger
+can operate.
+
+| Area | The gap | Issues |
+|---|---|---|
+| Durability outside the room log | Writes of one key do not sync. Restore is not atomic. The backup file is not synced, and a backup needs downtime | [#810](https://github.com/tuna-os/spindle/issues/810), [#811](https://github.com/tuna-os/spindle/issues/811), [#812](https://github.com/tuna-os/spindle/issues/812), [#813](https://github.com/tuna-os/spindle/issues/813), [#815](https://github.com/tuna-os/spindle/issues/815) |
+| Growth without a bound | Open rooms stay in memory. History and some replay tables have no retention. Garbage collection is offline | [#814](https://github.com/tuna-os/spindle/issues/814), [#816](https://github.com/tuna-os/spindle/issues/816), [#817](https://github.com/tuna-os/spindle/issues/817), [#818](https://github.com/tuna-os/spindle/issues/818), [#821](https://github.com/tuna-os/spindle/issues/821), [#833](https://github.com/tuna-os/spindle/issues/833) |
+| Sync and federation correctness | Clients do not get state that fork resolution changed. An incremental `/sync` has no limit. A refused event is not fetched again | [#819](https://github.com/tuna-os/spindle/issues/819), [#820](https://github.com/tuna-os/spindle/issues/820), [#822](https://github.com/tuna-os/spindle/issues/822), [#823](https://github.com/tuna-os/spindle/issues/823) |
+| Moderation and abuse | No media quarantine, no federation allow or deny list for the server, no CAPTCHA. Rate limits by source address do not work behind a proxy | [#827](https://github.com/tuna-os/spindle/issues/827), [#828](https://github.com/tuna-os/spindle/issues/828), [#829](https://github.com/tuna-os/spindle/issues/829), [#831](https://github.com/tuna-os/spindle/issues/831), [#832](https://github.com/tuna-os/spindle/issues/832) |
+| Deployment and product | No Compose file, systemd unit, Helm chart or packages. The Synapse importer is not in the release builds. Email pushers do not deliver, search has no index, and SPEC.md describes some mechanisms that are not built | [#825](https://github.com/tuna-os/spindle/issues/825), [#826](https://github.com/tuna-os/spindle/issues/826), [#824](https://github.com/tuna-os/spindle/issues/824), [#830](https://github.com/tuna-os/spindle/issues/830), [#834](https://github.com/tuna-os/spindle/issues/834) |
 
 ## Risks to the headline claim
 
