@@ -19,6 +19,18 @@
 //! ten billion reads. **Sweep**: every stored node the mark did not reach is
 //! deleted.
 //!
+//! **Bounded memory, exact marks.** The mark set is a hot set of at most
+//! [`GcOptions::max_marks`] addresses plus a scratch database on disk. When
+//! the hot set fills, it moves to the scratch database and empties. A lookup
+//! asks the hot set, then the scratch database, so the answer is always
+//! exact. A Bloom filter is not an option: one false positive skips a live
+//! subtree, and the sweep then deletes live state. Splitting the work into
+//! hash-prefix passes does not work either: the walk must still pass through
+//! every node outside the pass to reach the ones inside it, and without a
+//! visited set for those the shared-subtree cost returns. The scratch
+//! database is a separate directory, removed when the run ends. A run
+//! clears one that a crashed run left behind before it starts.
+//!
 //! **Offline only.** A node's address is its content, so a writer that
 //! re-derives a node the sweep has judged dead re-puts the same key, and
 //! nothing distinguishes that put from the row the sweep is about to delete.
@@ -36,6 +48,8 @@
 //! mark deletes live state.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use spindle_core::StateRoot;
 use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace, content_addressed, keyspace_prefix};
@@ -51,6 +65,32 @@ use crate::{ReadView, Store, StoreError};
 /// sees: it deletes as it goes, one batch at a time.
 const SWEEP_BATCH: usize = 4096;
 
+/// How many addresses the mark holds in memory before it spills them to disk.
+///
+/// A 32-byte address in a hash set costs about 50 bytes, so this is about
+/// 200 MB.
+pub const DEFAULT_MAX_MARKS: usize = 4_194_304;
+
+/// Settings for one collection.
+#[derive(Clone, Debug)]
+pub struct GcOptions {
+    /// The most marked addresses held in memory at once. At least one.
+    pub max_marks: usize,
+    /// Where the scratch database goes when the mark outgrows memory. `None`
+    /// picks a fresh directory under the system temp directory. The
+    /// directory is removed first if it exists, and again when the run ends.
+    pub scratch: Option<PathBuf>,
+}
+
+impl Default for GcOptions {
+    fn default() -> Self {
+        Self {
+            max_marks: DEFAULT_MAX_MARKS,
+            scratch: None,
+        }
+    }
+}
+
 /// What one collection found, and what it removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
@@ -61,6 +101,11 @@ pub struct GcReport {
     pub marked: u64,
     /// Value bytes of the reachable nodes.
     pub marked_bytes: u64,
+    /// The most marked addresses held in memory at once: at most
+    /// [`GcOptions::max_marks`], however many nodes were live.
+    pub peak_marked: u64,
+    /// Marked addresses moved to the scratch database.
+    pub spilled: u64,
     /// Node rows loaded during the mark. Equal to [`Self::marked`]: a
     /// shared subtree is read once, not once per root that reaches it.
     pub node_reads: u64,
@@ -159,6 +204,20 @@ fn hex(bytes: &[u8]) -> String {
 /// [`GcError`] when anything the mark depends on cannot be read; the store
 /// is untouched in that case.
 pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcReport, GcError> {
+    collect_state_nodes_with(store, dry_run, &GcOptions::default())
+}
+
+/// [`collect_state_nodes`] with explicit memory and scratch settings.
+///
+/// # Errors
+///
+/// As [`collect_state_nodes`], and [`GcError::Store`] when the scratch
+/// database cannot be created or read.
+pub fn collect_state_nodes_with<S: Store>(
+    store: &S,
+    dry_run: bool,
+    options: &GcOptions,
+) -> Result<GcReport, GcError> {
     let snapshot = store.snapshot();
     let view: &dyn ReadView = snapshot.as_deref().unwrap_or(store);
 
@@ -173,7 +232,7 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
     let mut marker = Marker {
         view,
         empty: spindle_core::StateSnapshot::new(view.key_table()).root(),
-        marked: HashSet::new(),
+        marked: MarkSet::new(options),
         stack: Vec::new(),
         report: GcReport::default(),
         dropped: Vec::new(),
@@ -208,7 +267,9 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
         dropped,
         ..
     } = marker;
-    report.marked = marked.len() as u64;
+    report.marked = marked.len();
+    report.peak_marked = marked.peak;
+    report.spilled = marked.spilled;
 
     let prefix = keyspace_prefix(Keyspace::StateNode);
     let mut sweep = Sweep {
@@ -226,18 +287,22 @@ pub fn collect_state_nodes<S: Store>(store: &S, dry_run: bool) -> Result<GcRepor
         else {
             return Ok(());
         };
-        if marked.contains(&StateRoot::from_bytes(address)) {
+        let live = marked.contains(&address).map_err(|error| {
+            failure = Some(error);
+            StoreError::Backend("state collection stopped".to_owned())
+        })?;
+        if live {
             return Ok(());
         }
         report.swept += 1;
         report.swept_bytes += (key.len() + value.len()) as u64;
         sweep.add(key.to_vec(), &mut report).map_err(|error| {
-            failure = Some(error);
+            failure = Some(GcError::Store(error));
             // Only stops the scan; `failure` is what is reported.
             StoreError::Backend("state collection stopped".to_owned())
         })
     })
-    .map_err(|error| failure.take().unwrap_or(error))?;
+    .map_err(|error| failure.take().unwrap_or(GcError::Store(error)))?;
     drop(snapshot);
     sweep.drain(&mut report)?;
     report.dropped_cache_rows = dropped.len() as u64;
@@ -295,7 +360,7 @@ struct Marker<'a> {
     view: &'a dyn ReadView,
     /// The empty state's root, which names no stored node.
     empty: StateRoot,
-    marked: HashSet<StateRoot>,
+    marked: MarkSet,
     stack: Vec<StateRoot>,
     report: GcReport,
     /// Keys of the [`Unreadable::Drop`] rows that did not decode.
@@ -349,7 +414,7 @@ impl Marker<'_> {
         }
         self.stack.push(root);
         while let Some(address) = self.stack.pop() {
-            if !self.marked.insert(address) {
+            if !self.marked.insert(address.as_bytes())? {
                 continue;
             }
             let bytes = self
@@ -363,4 +428,118 @@ impl Marker<'_> {
         }
         Ok(())
     }
+}
+
+/// The set of reachable addresses: exact, with a bounded part in memory.
+struct MarkSet {
+    hot: HashSet<[u8; 32]>,
+    max: usize,
+    scratch: PathBuf,
+    cold: Option<Cold>,
+    /// Addresses in `hot` and in `cold` together.
+    total: u64,
+    peak: u64,
+    spilled: u64,
+}
+
+struct Cold {
+    // Held so the database closes before its directory is removed.
+    _db: fjall::Database,
+    marks: fjall::Keyspace,
+}
+
+static SCRATCH_RUNS: AtomicU64 = AtomicU64::new(0);
+
+impl MarkSet {
+    fn new(options: &GcOptions) -> Self {
+        let scratch = options.scratch.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "spindle-gc-{}-{}",
+                std::process::id(),
+                SCRATCH_RUNS.fetch_add(1, Ordering::Relaxed)
+            ))
+        });
+        // What a crashed run left is not this run's marks: reading it would
+        // skip nodes that are no longer live, so it is cleared unread.
+        remove_scratch(&scratch);
+        Self {
+            hot: HashSet::new(),
+            max: options.max_marks.max(1),
+            scratch,
+            cold: None,
+            total: 0,
+            peak: 0,
+            spilled: 0,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.total
+    }
+
+    fn contains(&self, address: &[u8; 32]) -> Result<bool, GcError> {
+        if self.hot.contains(address) {
+            return Ok(true);
+        }
+        match &self.cold {
+            Some(cold) => Ok(cold
+                .marks
+                .get(address)
+                .map_err(|error| GcError::Store(error.into()))?
+                .is_some()),
+            None => Ok(false),
+        }
+    }
+
+    /// Add `address`; false when it was already marked.
+    fn insert(&mut self, address: &[u8; 32]) -> Result<bool, GcError> {
+        if self.contains(address)? {
+            return Ok(false);
+        }
+        self.hot.insert(*address);
+        self.total += 1;
+        self.peak = self.peak.max(self.hot.len() as u64);
+        if self.hot.len() >= self.max {
+            self.spill()?;
+        }
+        Ok(true)
+    }
+
+    fn spill(&mut self) -> Result<(), GcError> {
+        let cold = match &mut self.cold {
+            Some(cold) => cold,
+            slot => slot.insert(Cold::open(&self.scratch)?),
+        };
+        for address in self.hot.drain() {
+            cold.marks
+                .insert(address, [])
+                .map_err(|error| GcError::Store(error.into()))?;
+            self.spilled += 1;
+        }
+        Ok(())
+    }
+}
+
+impl Cold {
+    fn open(path: &Path) -> Result<Self, GcError> {
+        let db = fjall::Database::open(fjall::Config::new(path))
+            .map_err(|error| GcError::Store(error.into()))?;
+        let marks = db
+            .keyspace("marks", fjall::KeyspaceCreateOptions::default)
+            .map_err(|error| GcError::Store(error.into()))?;
+        Ok(Self { _db: db, marks })
+    }
+}
+
+impl Drop for MarkSet {
+    fn drop(&mut self) {
+        self.cold = None;
+        remove_scratch(&self.scratch);
+    }
+}
+
+fn remove_scratch(path: &Path) {
+    // Best effort: the next run clears it again, and a failure here must not
+    // hide the collection's own result.
+    let _ = std::fs::remove_dir_all(path);
 }

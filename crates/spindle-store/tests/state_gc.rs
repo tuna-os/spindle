@@ -10,7 +10,9 @@ use spindle_core::keys::{Keyspace, content_addressed, keyspace_prefix, room_pref
 use spindle_core::{
     EventId, RoomLog, Sideline, SidelinedEntry, StateKey, StateRoot, StateSnapshot,
 };
-use spindle_store::gc::{GcError, GcReport, collect_state_nodes};
+use spindle_store::gc::{
+    GcError, GcOptions, GcReport, collect_state_nodes, collect_state_nodes_with,
+};
 use spindle_store::{Durability, FjallStore, ReadView, RoomStore, Store};
 use tempfile::TempDir;
 
@@ -385,4 +387,98 @@ fn the_sweep_batches_its_deletes_and_holds_one_batch() {
     assert_eq!(store.unbatched(), unbatched, "no delete went unbatched");
     assert_eq!(store.written() - written, planted);
     assert_eq!(node_count(&store), report.marked);
+}
+
+fn node_keys(store: &FjallStore) -> Vec<Vec<u8>> {
+    store
+        .scan_prefix(&keyspace_prefix(Keyspace::StateNode))
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// A store with live rooms, one deleted room and planted garbage.
+fn store_with_garbage(dir: &TempDir) -> FjallStore {
+    let store = FjallStore::open(dir.path()).unwrap();
+    seed(&store, "!kept:example.org", 90);
+    seed(&store, "!gone:example.org", 90);
+    delete_room_records(&store, "!gone:example.org");
+    for tag in 0..6 {
+        plant_garbage(&store, &format!("g{tag}x"));
+    }
+    store
+}
+
+/// The mark set is bounded and exact: with room for 16 addresses it holds
+/// at most 16 however many nodes are live, and deletes exactly the nodes an
+/// unbounded run deletes.
+#[test]
+fn a_bounded_mark_set_sweeps_exactly_what_an_unbounded_one_does() {
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (unbounded, bounded) = (store_with_garbage(&dir_a), store_with_garbage(&dir_b));
+    assert_eq!(node_keys(&unbounded), node_keys(&bounded));
+    let scratch = TempDir::new().unwrap();
+    let scratch_path = scratch.path().join("marks");
+
+    let wide = collect_state_nodes(&unbounded, false).unwrap();
+    let narrow = collect_state_nodes_with(
+        &bounded,
+        false,
+        &GcOptions {
+            max_marks: 16,
+            scratch: Some(scratch_path.clone()),
+        },
+    )
+    .unwrap();
+
+    assert!(wide.swept > 0 && wide.marked > 200, "{wide:?}");
+    assert_eq!(wide.peak_marked, wide.marked, "unbounded holds every mark");
+    assert_eq!(wide.spilled, 0);
+    assert!(narrow.peak_marked <= 16, "{narrow:?}");
+    assert_eq!(narrow.spilled, narrow.marked - narrow.marked % 16);
+    assert_eq!((narrow.marked, narrow.swept), (wide.marked, wide.swept));
+    assert_eq!(
+        node_keys(&unbounded),
+        node_keys(&bounded),
+        "same nodes deleted"
+    );
+    assert!(!scratch_path.exists(), "the scratch database is removed");
+    for store in [&unbounded, &bounded] {
+        RoomStore::new(store, "!kept:example.org")
+            .load_exhaustive()
+            .unwrap()
+            .expect("the kept room loads");
+    }
+}
+
+/// A scratch database a crashed run left behind is cleared, not read: here
+/// it claims every node is live, which would sweep nothing.
+#[test]
+fn a_leftover_scratch_set_is_cleared_unread() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with_garbage(&dir);
+    let scratch = TempDir::new().unwrap();
+    let scratch_path = scratch.path().join("marks");
+    {
+        let db = fjall::Database::open(fjall::Config::new(&scratch_path)).unwrap();
+        let marks = db
+            .keyspace("marks", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let prefix = keyspace_prefix(Keyspace::StateNode).len();
+        for key in node_keys(&store) {
+            marks.insert(&key[prefix..], []).unwrap();
+        }
+    }
+    let report = collect_state_nodes_with(
+        &store,
+        false,
+        &GcOptions {
+            max_marks: 16,
+            scratch: Some(scratch_path.clone()),
+        },
+    )
+    .unwrap();
+    assert!(report.swept > 0, "stale marks were not trusted: {report:?}");
+    assert!(!scratch_path.exists());
 }

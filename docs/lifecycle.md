@@ -81,7 +81,7 @@ error, not as a missing node. The server must be stopped.
 ## Collecting unreachable state
 
 ```
-spindle gc <config> [--dry-run]
+spindle gc <config> [--dry-run] [--max-marks N]
 ```
 
 This command deletes the state-trie nodes that no stored record reaches
@@ -107,7 +107,26 @@ The one exception is a current-state cache row that does not decode. A room
 load already ignores such a row, so the command deletes it.
 
 The sweep deletes in batches of 4096 nodes. It does not hold all dead nodes
-in memory. It still holds the set of reachable nodes.
+in memory.
+
+The set of reachable nodes has a memory bound. `--max-marks N` sets how many
+addresses stay in memory, 4194304 by default, about 200 MB. When that many
+are held, the command moves them to a scratch database in a directory next to
+the store, named like the storage path with `.gc-scratch` added. The command
+removes the directory when it ends, and clears one that a crashed run left
+before it starts. Keep free disk for it: it holds one 32-byte address for each
+reachable node that did not fit in memory. The answer is exact for every `N`.
+A Bloom filter would not be: one false positive keeps a live node out of the
+mark and the sweep then deletes it. The report shows the peak number of
+addresses held in memory and how many went to disk.
+
+**Intern rows stay.** The command does not delete `StateKeyIntern` rows. The
+server loads the whole table at start, and a room that sends many unique state
+keys makes it grow. The rows cannot be removed one by one. The table must stay
+dense, because the store refuses to open onto an id sequence with a gap. The
+ids sit inside the content of state nodes, so renumbering would rewrite every
+node and change its address. That is a migration, not a sweep. #818 stays open
+for it.
 
 **Offline only**, and not available as a background task. The key of a node
 is its content. When a server makes a node again, it writes the same key
