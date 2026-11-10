@@ -2073,6 +2073,11 @@ async fn room_hierarchy(
     // the same 403 as for a room the caller may not see, so the status is no
     // oracle for whether the room exists. A root this server does hold is
     // judged by its own state only: a peer's claim never widens it.
+    // `held` only says whether this server has the room: nothing from the room
+    // is read or returned. A held room is checked against the caller on the
+    // next line, and a room this server does not hold takes the remote path
+    // and ends in the same 403 as a room the caller may not see.
+    // nosemgrep: room-read-without-authorization
     let held = state.rooms.summary(&room_id).is_ok();
     if held && hierarchy_visible(&state, &identity.user_id, &room_id).is_none() {
         return Err(denied());
