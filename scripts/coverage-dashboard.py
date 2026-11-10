@@ -87,8 +87,8 @@ MILESTONES = [
      "feature: `spindle import-synapse` reads a Synapse PostgreSQL "
      "database, and the migration workspace and the ESS/Kubernetes driver "
      "(`docs/migration-workspace.md`, `docs/ess-kubernetes-driver.md`) "
-     "carried the reilly.asia cutover (#563). The release artifacts do not "
-     "have the feature yet (#826). `backups.rs` is M2's "
+     "carried the reilly.asia cutover (#563). The release artifacts carry "
+     "the feature (#826). `backups.rs` is M2's "
      "E2EE key backup and not this. #42's parity gate vs Synapse and "
      "Tuwunel remains part of the definition of done."),
     ("M6", "Optional differentiators", "In progress",
