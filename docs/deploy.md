@@ -2,7 +2,9 @@
 
 This page lists the ready-made files under `deploy/`. Choose one of Compose, systemd or Helm. Each one runs a single Spindle process over one store. Read [operations.md](operations.md) for the controls that every deployment needs.
 
-CI checks these files on every change with `scripts/check-deploy.py`. Nobody has yet run each file against a live server in CI. Test your own setup before you rely on it.
+CI checks these files on every change with `scripts/check-deploy.py`. A second CI job, `scripts/deploy-smoke.sh`, builds the image, starts the Compose file's Spindle service and registers a user. It then logs in, creates a room and sends a message. It does not start Caddy, and CI has not run the systemd unit or the Helm chart against a live server. Test your own setup before you rely on it.
+
+Run the smoke test yourself with `scripts/deploy-smoke.sh`. It needs Docker, `curl` and `jq`. Set `SPINDLE_IMAGE` to test a published image instead of a local build.
 
 ## Before you start
 
@@ -44,6 +46,14 @@ The config stays readable by root only. systemd gives the service a copy.
 
 The unit has the usual sandbox settings. Nobody has yet run it on a live host in CI. If your setup needs more access, relax one setting at a time.
 
+### Packages
+
+Each release may also carry a `.deb` and an `.rpm` for amd64 and arm64. They hold the binary in `/usr/bin/spindle`, the unit, the licences and the example config as `/etc/spindle/spindle.toml`. Your edits to the config survive an upgrade.
+
+The unit uses `DynamicUser`, so the package creates no account. The package does not enable the service. Edit the config, then run `systemctl enable --now spindle`.
+
+The release job builds the packages apart from the tarballs and the image. If that job fails, the release ships without them. Verify a package with `gh attestation verify` like a tarball.
+
 ## Kubernetes with Helm
 
 Use `deploy/helm/spindle`. It makes one StatefulSet replica, a volume claim, a Service and optional Ingress and ServiceMonitor objects.
@@ -79,5 +89,6 @@ Federation also needs a valid certificate on the public host name.
 
 ## What is not here
 
-- `.deb` and `.rpm` packages, and a Nix flake.
-- A CI test that starts the Compose stack and registers a user.
+- A Nix flake.
+- A CI test of the systemd unit and the Helm chart on a live host.
+- Package repositories. The packages are release assets only.
