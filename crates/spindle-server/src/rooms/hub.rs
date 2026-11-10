@@ -199,7 +199,7 @@ impl Rooms {
                         &transaction.rows(event_id),
                     )?;
                 }
-                return rooms.enqueue_outbound(log, room_id, json);
+                return rooms.enqueue_outbound(log, room_id, event_id, json);
             }
             rooms.ingest_checked(log, room_id, event_id, json, true, false, transaction)
         })
