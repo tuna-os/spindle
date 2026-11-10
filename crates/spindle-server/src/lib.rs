@@ -460,13 +460,14 @@ fn open_rooms(
     store: &Arc<FjallStore>,
     metrics: &Arc<metrics::Metrics>,
 ) -> Result<Arc<rooms::Rooms>, AppError> {
-    rooms::Rooms::try_with_metrics(
+    let rooms = rooms::Rooms::try_with_metrics(
         Arc::clone(store),
         config.server.name.clone(),
         Arc::clone(metrics),
     )
-    .map(Arc::new)
-    .map_err(|error| AppError::Store(error.to_string()))
+    .map_err(|error| AppError::Store(error.to_string()))?;
+    rooms.set_max_resident_rooms(config.storage.max_resident_rooms);
+    Ok(Arc::new(rooms))
 }
 
 fn app_state_with(

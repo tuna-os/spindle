@@ -1779,7 +1779,9 @@ impl Rooms {
             self.index_membership(room_id, Some(&user), &event["content"], li)?;
         }
 
-        open.insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+        open.insert(room_id.to_owned(), self.slot(Arc::new(RwLock::new(log))));
+        drop(open);
+        self.enforce_resident_budget();
         Ok(())
     }
 

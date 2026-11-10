@@ -259,7 +259,7 @@ impl Rooms {
         let open: Vec<(String, Arc<std::sync::RwLock<spindle_core::RoomLog>>)> = self
             .registry_read()
             .iter()
-            .map(|(room_id, room)| (room_id.clone(), Arc::clone(room)))
+            .map(|(room_id, slot)| (room_id.clone(), Arc::clone(&slot.room)))
             .collect();
         let forked = self.extremities.take_forked();
         let stale_before =

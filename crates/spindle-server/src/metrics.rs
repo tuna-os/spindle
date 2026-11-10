@@ -376,6 +376,8 @@ pub struct Metrics {
     /// How the server counts the rooms it holds open, and the last
     /// answer it gave (served when the registry is busy at scrape time).
     resident_rooms: ResidentProbe,
+    /// Rooms dropped from memory by the resident-room budget.
+    rooms_evicted: AtomicU64,
     /// Time spent waiting to acquire `[registry exclusive, registry shared,
     /// room exclusive, room shared]`.
     lock_waits: [Histogram; 4],
@@ -470,6 +472,7 @@ impl Default for Metrics {
             cold_loads: Default::default(),
             cold_load_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             resident_rooms: ResidentProbe::default(),
+            rooms_evicted: AtomicU64::new(0),
             lock_waits: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             sync_phases: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             blocking_in_flight: Default::default(),
@@ -710,6 +713,17 @@ impl Metrics {
             .iter()
             .map(|size| self.cold_loads(*size))
             .sum()
+    }
+
+    /// Count one room dropped from memory by the resident-room budget.
+    pub fn observe_room_evicted(&self) {
+        self.rooms_evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rooms the resident-room budget has dropped so far.
+    #[must_use]
+    pub fn rooms_evicted(&self) -> u64 {
+        self.rooms_evicted.load(Ordering::Relaxed)
     }
 
     /// Say how to count resident rooms. The probe answers `None` when it
@@ -1346,6 +1360,12 @@ impl Metrics {
              # TYPE spindle_rooms_resident gauge\n",
         );
         let _ = writeln!(out, "spindle_rooms_resident {}", self.resident_rooms());
+        out.push_str(
+            "# HELP spindle_rooms_evicted_total Rooms dropped from memory because more \
+             than [storage] max_resident_rooms were open.\n\
+             # TYPE spindle_rooms_evicted_total counter\n",
+        );
+        let _ = writeln!(out, "spindle_rooms_evicted_total {}", self.rooms_evicted());
 
         out.push_str(
             "# HELP spindle_lock_wait_seconds Time spent acquiring the room registry \

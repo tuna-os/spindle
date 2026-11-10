@@ -40,6 +40,11 @@ path = "./data"
 # first, so the slowest load starts early; the rest follow newest activity
 # first. 0 turns the warm-up off.
 # warm_concurrency = 2
+# Most rooms held open in memory at once. Each open room keeps an index of
+# every event in it, so this bounds memory. Past it, the rooms untouched for
+# longest are dropped and load again from disk when asked for. A room in use
+# is never dropped. 0 means no limit.
+# max_resident_rooms = 4096
 
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and
 # advertised by both media config endpoints. Match the old server on migration.

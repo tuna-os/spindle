@@ -384,6 +384,13 @@ impl RoomLog {
         }
     }
 
+    /// Whether the log has several forward extremities: a fork nobody has
+    /// merged yet.
+    #[must_use]
+    pub fn is_forked(&self) -> bool {
+        self.forward_extremities.len() > 1
+    }
+
     /// The table this log's snapshots belong to.
     #[must_use]
     pub fn table(&self) -> &Arc<dyn StateKeyTable> {
