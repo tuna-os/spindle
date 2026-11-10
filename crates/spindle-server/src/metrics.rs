@@ -407,6 +407,10 @@ pub struct Metrics {
     federation_listed: [AtomicU64; 2],
     /// Pushed PDUs refused for missing dependencies and owed a retry (a gauge).
     owed_events: AtomicU64,
+    /// Unix time of the last backup the admin endpoint finished, or `0`.
+    last_backup: AtomicU64,
+    /// Whether an admin backup is running now.
+    backup_running: std::sync::atomic::AtomicBool,
     /// Peer signing-key lookups and event signature failures.
     keys: KeyMetrics,
     auth: AuthCounters,
@@ -494,6 +498,8 @@ impl Default for Metrics {
             gaps_remaining: AtomicU64::new(0),
             federation_listed: [AtomicU64::new(0), AtomicU64::new(0)],
             owed_events: AtomicU64::new(0),
+            last_backup: AtomicU64::new(0),
+            backup_running: std::sync::atomic::AtomicBool::new(false),
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
@@ -895,6 +901,15 @@ impl Metrics {
     #[must_use]
     pub fn warmup_loaded_count(&self) -> u64 {
         self.warmup_loaded.load(Ordering::Relaxed)
+    }
+}
+
+/// Holds the one backup slot; frees it when dropped.
+pub struct BackupSlot<'a>(&'a Metrics);
+
+impl Drop for BackupSlot<'_> {
+    fn drop(&mut self) {
+        self.0.backup_running.store(false, Ordering::Release);
     }
 }
 
@@ -1818,6 +1833,22 @@ impl Metrics {
         self.gaps_remaining.store(gaps, Ordering::Relaxed);
     }
 
+    /// Record that a backup has just been written and synced (#813).
+    pub fn set_last_backup(&self, unix_seconds: u64) {
+        self.last_backup.store(unix_seconds, Ordering::Relaxed);
+    }
+
+    /// Claim the single backup slot, or `None` if a backup is running.
+    pub fn begin_backup(&self) -> Option<BackupSlot<'_>> {
+        (!self.backup_running.swap(true, Ordering::AcqRel)).then_some(BackupSlot(self))
+    }
+
+    /// Unix time of the last successful backup, `0` if none since start.
+    #[must_use]
+    pub fn last_backup(&self) -> u64 {
+        self.last_backup.load(Ordering::Relaxed)
+    }
+
     /// Read one counter, for tests that assert a metric actually moved.
     #[must_use]
     pub fn backfill_chunk_count(&self, result: BackfillChunk) -> u64 {
@@ -2032,6 +2063,17 @@ impl Metrics {
          # TYPE spindle_federation_owed_events gauge\n",
         );
         let _ = writeln!(out, "spindle_federation_owed_events {}", self.owed_events());
+        out.push_str(
+            "# HELP spindle_last_successful_backup_timestamp_seconds Unix time of the \
+         last backup written through the admin endpoint since this process \
+         started, or 0 if there is none.\n\
+         # TYPE spindle_last_successful_backup_timestamp_seconds gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_last_successful_backup_timestamp_seconds {}",
+            self.last_backup()
+        );
         out.push_str(
             "# HELP spindle_federation_backfill_duration_seconds Time one gap \
          backfill chunk took, by result.\n\

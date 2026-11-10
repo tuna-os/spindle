@@ -1670,6 +1670,12 @@ pub struct StorageConfig {
     /// the other modes. Must be above zero.
     #[serde(default = "default_relaxed_sync_interval_ms")]
     pub relaxed_sync_interval_ms: u64,
+    /// Where `POST /_spindle/admin/v1/backup` writes backups (#813). Unset
+    /// turns the endpoint off: it answers with an error and writes nothing.
+    /// The endpoint takes no path from the request, so an admin token cannot
+    /// make the server write anywhere else.
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
 }
 
 /// `[storage] durability`: SPEC §8.3's three modes.
@@ -1773,6 +1779,7 @@ impl Default for StorageConfig {
             max_resident_rooms: default_max_resident_rooms(),
             durability: DurabilityMode::default(),
             relaxed_sync_interval_ms: default_relaxed_sync_interval_ms(),
+            backup_dir: None,
         }
     }
 }

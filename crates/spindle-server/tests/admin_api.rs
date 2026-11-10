@@ -246,6 +246,7 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::GET, format!("{prefix}/event_reports")),
             (reqwest::Method::GET, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
+            (reqwest::Method::POST, format!("{prefix}/backup")),
             (
                 reqwest::Method::GET,
                 format!("{prefix}/users/{user}/devices/DEV"),
