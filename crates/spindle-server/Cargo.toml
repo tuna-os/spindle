@@ -65,6 +65,9 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 # tarball puts the binary) to /usr/bin. The unit uses DynamicUser, so no
 # maintainer script creates an account, and nothing enables the service:
 # the operator edits the config first.
+# scripts/build-packages.sh copies every asset into package-staging/ and runs
+# both tools from this directory, so each path below is the same whether a
+# tool reads it relative to the crate or to the working directory.
 [package.metadata.deb]
 name = "spindle"
 section = "net"
@@ -74,22 +77,22 @@ extended-description = "Spindle is a Matrix homeserver in one binary over an emb
 depends = "$auto, ca-certificates"
 conf-files = ["/etc/spindle/spindle.toml"]
 assets = [
-    ["target/release/spindle", "usr/bin/spindle", "755"],
-    ["../../target/pkg/spindle.service", "usr/lib/systemd/system/spindle.service", "644"],
-    ["../../spindle.example.toml", "etc/spindle/spindle.toml", "600"],
-    ["../../LICENSE-MIT", "usr/share/doc/spindle/LICENSE-MIT", "644"],
-    ["../../LICENSE-APACHE", "usr/share/doc/spindle/LICENSE-APACHE", "644"],
+    ["package-staging/spindle", "usr/bin/spindle", "755"],
+    ["package-staging/spindle.service", "usr/lib/systemd/system/spindle.service", "644"],
+    ["package-staging/spindle.example.toml", "etc/spindle/spindle.toml", "600"],
+    ["package-staging/LICENSE-MIT", "usr/share/doc/spindle/LICENSE-MIT", "644"],
+    ["package-staging/LICENSE-APACHE", "usr/share/doc/spindle/LICENSE-APACHE", "644"],
 ]
 
 [package.metadata.generate-rpm]
 name = "spindle"
 summary = "Spindle Matrix homeserver"
 assets = [
-    { source = "target/release/spindle", dest = "/usr/bin/spindle", mode = "755" },
-    { source = "../../target/pkg/spindle.service", dest = "/usr/lib/systemd/system/spindle.service", mode = "644" },
-    { source = "../../spindle.example.toml", dest = "/etc/spindle/spindle.toml", mode = "600", config = "noreplace" },
-    { source = "../../LICENSE-MIT", dest = "/usr/share/doc/spindle/LICENSE-MIT", mode = "644", doc = true },
-    { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/spindle/LICENSE-APACHE", mode = "644", doc = true },
+    { source = "package-staging/spindle", dest = "/usr/bin/spindle", mode = "755" },
+    { source = "package-staging/spindle.service", dest = "/usr/lib/systemd/system/spindle.service", mode = "644" },
+    { source = "package-staging/spindle.example.toml", dest = "/etc/spindle/spindle.toml", mode = "600", config = "noreplace" },
+    { source = "package-staging/LICENSE-MIT", dest = "/usr/share/doc/spindle/LICENSE-MIT", mode = "644", doc = true },
+    { source = "package-staging/LICENSE-APACHE", dest = "/usr/share/doc/spindle/LICENSE-APACHE", mode = "644", doc = true },
 ]
 
 [features]

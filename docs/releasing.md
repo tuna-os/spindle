@@ -88,6 +88,14 @@ SPDX document; `gh attestation verify --predicate-type
 https://spdx.dev/Document` checks that it, too, was attested to the same
 tarball by the same workflow.
 
+## Packages
+
+Two scripts build and check the `.deb` and `.rpm`. `scripts/build-packages.sh` pins `cargo-deb` and `cargo-generate-rpm`. `scripts/check-packages.sh` lists the contents, checks the unit, the conffile and the licences, and runs the binary from an unpacked `.deb`.
+
+The release `packages` job and the `packages` job in `ci.yml` call the same scripts. A pull request that changes the package files runs them on a debug build. To change a tool version, edit the script only.
+
+The asset paths in `crates/spindle-server/Cargo.toml` name files under `package-staging/`. The script fills that directory and runs both tools from the crate directory.
+
 ## What a tag gives the rest of the project
 
 - Benchmarks can name the Spindle they measured, alongside the Synapse,

@@ -282,45 +282,19 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: tarball
-      - name: Install the packaging tools
-        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
-      # The packages carry the tarball's binary, not a second build.
-      - name: Stage the files
-        run: |
-          mkdir -p target/release target/pkg dist
-          tar -xzf "tarball/spindle-${TAG}-${TARGET}.tar.gz" -C tarball
-          install -m 0755 "tarball/spindle-${TAG}-${TARGET}/spindle" target/release/spindle
-          # The tarball unit starts /usr/local/bin/spindle; a package installs /usr/bin.
-          sed 's|^ExecStart=/usr/local/bin/spindle |ExecStart=/usr/bin/spindle |' \
-            deploy/systemd/spindle.service > target/pkg/spindle.service
-          grep -q '^ExecStart=/usr/bin/spindle ' target/pkg/spindle.service
+      - name: Install the tools the check needs
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+      # The packages carry the tarball's binary, not a second build. The
+      # same two scripts run on pull requests (the `packages` job in ci.yml).
       - name: Build the packages
         run: |
-          version="${TAG#v}"
-          cargo deb -p spindle-server --no-build --deb-version "$version" \
-            --output "dist/spindle-${TAG}-${DEB_ARCH}.deb"
-          cargo generate-rpm -p crates/spindle-server \
-            --set-metadata "version = \"$version\"" \
-            --output "dist/spindle-${TAG}-${RPM_ARCH}.rpm"
+          tar -xzf "tarball/spindle-${TAG}-${TARGET}.tar.gz" -C tarball
+          scripts/build-packages.sh "${TAG#v}" "$DEB_ARCH" "$RPM_ARCH" dist \
+            "tarball/spindle-${TAG}-${TARGET}/spindle"
       - name: Check the packages hold what they should
         run: |
-          deb="dist/spindle-${TAG}-${DEB_ARCH}.deb"
-          rpm="dist/spindle-${TAG}-${RPM_ARCH}.rpm"
-          dpkg-deb --contents "$deb" | tee deb.list
-          dpkg-deb --info "$deb"
-          for f in ./usr/bin/spindle ./usr/lib/systemd/system/spindle.service \
-                   ./etc/spindle/spindle.toml ./usr/share/doc/spindle/LICENSE-MIT \
-                   ./usr/share/doc/spindle/LICENSE-APACHE; do
-            grep -q " $f\$" deb.list
-          done
-          dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./conffiles | grep -qx /etc/spindle/spindle.toml
-          rpm -qlp "$rpm" | tee rpm.list
-          for f in /usr/bin/spindle /usr/lib/systemd/system/spindle.service \
-                   /etc/spindle/spindle.toml /usr/share/doc/spindle/LICENSE-MIT \
-                   /usr/share/doc/spindle/LICENSE-APACHE; do
-            grep -qx "$f" rpm.list
-          done
-          rpm -qcp "$rpm" | grep -qx /etc/spindle/spindle.toml
+          scripts/check-packages.sh "${TAG#v}" "dist/spindle-${TAG}-${DEB_ARCH}.deb" \
+            "dist/spindle-${TAG}-${RPM_ARCH}.rpm" "$DEB_ARCH" "$RPM_ARCH"
       - name: Checksum
         run: |
           cd dist
