@@ -108,12 +108,23 @@ async fn set_pusher(
                 .vet_url(url)
                 .map_err(|why| MatrixError::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", why))?;
         }
-        "email" => {}
+        // Refused, not stored: the delivery loop sends to http pushers only,
+        // so accepting an email pusher told the client its notifications
+        // would be mailed and then mailed nothing (#824). The server's
+        // outgoing mail is account mail (confirmation and reset), not a
+        // missed-notification digest.
+        "email" => {
+            return Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "this server does not send email notifications; register an http pusher".to_owned(),
+            ));
+        }
         other => {
             return Err(MatrixError::new(
                 StatusCode::BAD_REQUEST,
                 "M_INVALID_PARAM",
-                format!("unknown pusher kind {other:?}; expected http, email or null"),
+                format!("unknown pusher kind {other:?}; expected http or null"),
             ));
         }
     }
