@@ -681,7 +681,7 @@ pub enum Keyspace {
     /// A load seeds the chain from this row instead of from the domain
     /// seed. The row is written before the first delete, so a crash leaves a
     /// room that reads as already truncated.
-    ChainCheckpoint = 0x66,
+    ChainCheckpoint = 0x67,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
