@@ -17,6 +17,13 @@
 //! the rescan ([`OutboxIndex::rescan`]) the loop runs when the index is
 //! empty and every [`RESCAN_EVERY`].
 //!
+//! A row holds a reference to the event, not a copy of it ([`reference`]):
+//! the room already stores the body once, with the event, and a pass reads
+//! it from there when it builds a transaction ([`resolve`]). One message
+//! into a room of thousands of servers writes thousands of small rows in
+//! one batch. Rows from before that hold the whole PDU and are sent as
+//! they are.
+//!
 //! It also bounds the queue of a destination that has been down a long
 //! time. [`super::retry`] cuts such a queue once, when the outage turns
 //! long, but the rows queued after that grew without limit until the next
@@ -30,7 +37,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use spindle_core::keys;
-use spindle_store::{FjallStore, ReadView, Store, StoreError};
+use spindle_store::{BatchOp, Durability, FjallStore, ReadView, Store, StoreError};
 
 use super::OutboxRow;
 use crate::metrics::Metrics;
@@ -108,6 +115,98 @@ pub(super) fn head(store: &FjallStore, destination: &str, limit: usize) -> Vec<O
     rows
 }
 
+/// The first byte of a row that refers to a stored event. A row from
+/// before #821 holds the whole PDU, a JSON object, which starts with `{`
+/// (0x7b); no JSON document starts with 0x00, so the two shapes cannot be
+/// mistaken for one another.
+const REFERENCE: u8 = 0x00;
+
+/// The value of a row that names an event the room already stores: the tag,
+/// the room ID's length as two bytes, the room ID, then the event ID. The
+/// event body is stored once with the event; every destination's row is
+/// this small.
+#[must_use]
+pub fn reference(room_id: &str, event_id: &str) -> Vec<u8> {
+    let room = room_id.as_bytes();
+    let length = u16::try_from(room.len()).unwrap_or(u16::MAX);
+    let mut row = Vec::with_capacity(3 + room.len() + event_id.len());
+    row.push(REFERENCE);
+    row.extend_from_slice(&length.to_be_bytes());
+    row.extend_from_slice(&room[..usize::from(length)]);
+    row.extend_from_slice(event_id.as_bytes());
+    row
+}
+
+/// The room and event a [`reference`] row names; `None` for a row that
+/// holds a whole PDU.
+fn parse_reference(value: &[u8]) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix(&[REFERENCE])?;
+    let length = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    let room = std::str::from_utf8(rest.get(2..2 + length)?).ok()?;
+    let event = std::str::from_utf8(rest.get(2 + length..)?).ok()?;
+    Some((room, event))
+}
+
+/// The room a queued row is for, in either shape.
+pub(super) fn room_of(value: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Room<'a> {
+        #[serde(borrow)]
+        room_id: Option<std::borrow::Cow<'a, str>>,
+    }
+    if let Some((room, _)) = parse_reference(value) {
+        return Some(room.to_owned());
+    }
+    serde_json::from_slice::<Room<'_>>(value)
+        .ok()?
+        .room_id
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// `rows` with each [`reference`] replaced by the body it names, as the
+/// room stores it now -- the redacted form for a redacted event, which is
+/// what federation sends. A row that holds a whole PDU passes through.
+///
+/// A row whose body is gone (an admin purge) can never be sent: it is
+/// deleted and counted, and the second return value says how many were. A
+/// body that cannot be read for another reason leaves its row for the next
+/// pass.
+pub(super) fn resolve(
+    store: &FjallStore,
+    index: &OutboxIndex,
+    metrics: &Metrics,
+    destination: &str,
+    rows: Vec<OutboxRow>,
+) -> (Vec<OutboxRow>, u64) {
+    let mut sendable = Vec::with_capacity(rows.len());
+    let mut purged = 0_u64;
+    for (key, value) in rows {
+        let Some((room, event)) = parse_reference(&value) else {
+            sendable.push((key, value));
+            continue;
+        };
+        match ReadView::get(store, &keys::event_body(room, event)) {
+            Ok(Some(body)) => sendable.push((key, body)),
+            Ok(None) => {
+                if Store::delete(store, &key).is_ok() {
+                    purged += 1;
+                }
+            }
+            Err(error) => tracing::warn!(destination, "cannot read a queued event: {error}"),
+        }
+    }
+    if purged > 0 {
+        index.release(destination, purged);
+        metrics.record_outbox_body_missing(purged);
+        tracing::warn!(
+            destination,
+            purged,
+            "queued events whose bodies were purged were dropped from the queue"
+        );
+    }
+    (sendable, purged)
+}
+
 impl OutboxIndex {
     /// An index of what `store` holds now, bounding queues at
     /// [`MAX_QUEUED_PER_DESTINATION`].
@@ -167,43 +266,61 @@ impl OutboxIndex {
         self.lock().queues.is_empty()
     }
 
-    /// Queue one PDU for `destination` under outbox sequence `seq`.
+    /// Queue one event for each of `queued` -- `(destination, seq)` pairs --
+    /// as a reference to the room's stored body ([`reference`]), in one
+    /// batch: a crash leaves every destination with the event or none.
     ///
-    /// The count is raised before the row is put, so a pass that runs
-    /// between the two finds the destination and not a hole. When the
+    /// The counts are raised before the rows are put, so a pass that runs
+    /// between the two finds the destination and not a hole. When a
     /// destination's queue is bounded and now past the bound, the oldest
     /// rows go, down to a tenth under the bound so that the cost of finding
     /// them is paid once for many enqueues.
     ///
     /// # Errors
     ///
-    /// Returns the store's error if the row cannot be written; the count is
-    /// undone.
+    /// Returns the store's error if the rows cannot be written; the counts
+    /// are undone.
     pub fn enqueue(
         &self,
         store: &FjallStore,
         metrics: &Metrics,
-        destination: &str,
-        seq: u64,
-        body: &[u8],
+        queued: &[(&str, u64)],
+        row: &[u8],
     ) -> Result<(), StoreError> {
-        let excess = {
+        let excess: Vec<(&str, usize)> = {
             let mut state = self.lock();
-            let bounded = state.shedding.contains(destination);
-            let queue = state.queues.entry(destination.to_owned()).or_insert(Queue {
-                rows: 0,
-                generation: 0,
-            });
-            queue.rows += 1;
-            queue.generation += 1;
-            let rows = usize::try_from(queue.rows).unwrap_or(usize::MAX);
-            (bounded && rows > self.cap).then(|| rows - self.cap + self.cap / 10)
+            let mut excess = Vec::new();
+            for (destination, _) in queued {
+                let bounded = state.shedding.contains(*destination);
+                let queue = state
+                    .queues
+                    .entry((*destination).to_owned())
+                    .or_insert(Queue {
+                        rows: 0,
+                        generation: 0,
+                    });
+                queue.rows += 1;
+                queue.generation += 1;
+                let rows = usize::try_from(queue.rows).unwrap_or(usize::MAX);
+                if bounded && rows > self.cap {
+                    excess.push((*destination, rows - self.cap + self.cap / 10));
+                }
+            }
+            excess
         };
-        if let Err(error) = Store::put(store, &keys::federation_outbox(destination, seq), body) {
-            self.release(destination, 1);
+        let ops: Vec<BatchOp> = queued
+            .iter()
+            .map(|(destination, seq)| {
+                BatchOp::Put(keys::federation_outbox(destination, *seq), row.to_vec())
+            })
+            .collect();
+        if let Err(error) = Store::commit_ops(store, &ops, Durability::Group) {
+            for (destination, _) in queued {
+                self.release(destination, 1);
+            }
             return Err(error);
         }
-        if let Some(excess) = excess {
+        for (destination, excess) in excess {
             self.shed(store, metrics, destination, excess);
         }
         Ok(())
@@ -310,6 +427,17 @@ mod tests {
     }
 
     #[test]
+    fn the_two_row_shapes_cannot_be_mistaken_for_each_other() {
+        let new = reference("!room:x", "$event");
+        assert_eq!(parse_reference(&new), Some(("!room:x", "$event")));
+        assert_eq!(room_of(&new).as_deref(), Some("!room:x"));
+        let old = br#"{"room_id":"!room:x","type":"m.room.message"}"#;
+        assert_eq!(parse_reference(old), None);
+        assert_eq!(room_of(old).as_deref(), Some("!room:x"));
+        assert_eq!(parse_reference(&[REFERENCE, 0xff]), None);
+    }
+
+    #[test]
     fn rotation_starts_after_the_cursor_and_wraps() {
         let all = names(&["a", "b", "c", "d"]);
         assert_eq!(rotated(all.clone(), None), all);
@@ -368,13 +496,13 @@ mod tests {
         let metrics = Metrics::default();
         let index = OutboxIndex::load(&store);
         index
-            .enqueue(&store, &metrics, "a.example", 1, b"{}")
+            .enqueue(&store, &metrics, &[("a.example", 1)], b"{}")
             .unwrap();
         let seen = index.snapshot()["a.example"];
         // The row is gone behind the index's back.
         Store::delete(&store, &keys::federation_outbox("a.example", 1)).unwrap();
         index
-            .enqueue(&store, &metrics, "a.example", 2, b"{}")
+            .enqueue(&store, &metrics, &[("a.example", 2)], b"{}")
             .unwrap();
         index.found_empty("a.example", seen);
         assert_eq!(index.queued("a.example"), 2, "a newer enqueue keeps it");
@@ -391,7 +519,7 @@ mod tests {
         index.set_shedding(["dead.example".to_owned()]);
         for seq in 1..=25 {
             index
-                .enqueue(&store, &metrics, "dead.example", seq, b"{}")
+                .enqueue(&store, &metrics, &[("dead.example", seq)], b"{}")
                 .unwrap();
         }
         let left = head(&store, "dead.example", 100);
@@ -418,7 +546,7 @@ mod tests {
         let index = OutboxIndex::with_cap(&store, 5);
         for seq in 1..=30 {
             index
-                .enqueue(&store, &metrics, "busy.example", seq, b"{}")
+                .enqueue(&store, &metrics, &[("busy.example", seq)], b"{}")
                 .unwrap();
         }
         assert_eq!(index.queued("busy.example"), 30);

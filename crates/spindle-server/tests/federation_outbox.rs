@@ -1158,3 +1158,233 @@ async fn a_peer_back_from_a_long_outage_is_caught_up_and_keeps_its_to_device_mes
     assert_eq!(bodies, newest);
     assert_eq!(harness.state.metrics.destinations_backing_off(), (0, 0));
 }
+
+impl Harness {
+    /// Every queued outbox row: destination and value.
+    fn outbox_rows(&self) -> Vec<(String, Vec<u8>)> {
+        spindle_store::ReadView::scan_prefix(
+            self.store.as_ref(),
+            &spindle_core::keys::federation_outbox_all(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|(key, value)| {
+            Some((
+                spindle_core::keys::federation_outbox_destination(&key)?,
+                value,
+            ))
+        })
+        .collect()
+    }
+
+    async fn invite(&self, room: &str, token: &str, user: &str) {
+        let (status, body) = self
+            .send(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                token,
+                &json!({ "user_id": user }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Send a message and return its event ID.
+    async fn say_id(&self, room: &str, token: &str, text: &str, txn: &str) -> String {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}"),
+                token,
+                &json!({ "msgtype": "m.text", "body": text }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["event_id"].as_str().unwrap().to_owned()
+    }
+}
+
+/// One message into a room with several servers stores its body once, with
+/// the event, and queues a small reference for each destination (#821). The
+/// check is on what the rows hold, not on time: with the body copied into
+/// each row, the outbox would hold one body for each destination.
+#[tokio::test]
+async fn one_message_to_many_servers_queues_references_not_bodies() {
+    const DESTINATIONS: usize = 5;
+    let mut stubs = Vec::new();
+    for _ in 0..DESTINATIONS {
+        let stub = Stub::start().await;
+        stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+        stubs.push(stub);
+    }
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness
+        .room_with_remote_invite(&alice, &stubs[0].user())
+        .await;
+    for stub in &stubs[1..] {
+        harness.invite(&room, &alice, &stub.user()).await;
+    }
+    let text = "x".repeat(20_000);
+    let event_id = harness.say_id(&room, &alice, &text, "big").await;
+    let rows: Vec<_> = harness.outbox_rows();
+    let big: Vec<_> = rows
+        .iter()
+        .filter(|(_, value)| {
+            value.len() > 1_000 || value.windows(20).any(|w| w == b"xxxxxxxxxxxxxxxxxxxx")
+        })
+        .collect();
+    assert!(big.is_empty(), "{} outbox rows hold the body", big.len());
+    let referring: Vec<_> = rows
+        .iter()
+        .filter(|(_, value)| value.ends_with(event_id.as_bytes()))
+        .collect();
+    assert_eq!(
+        referring.len(),
+        DESTINATIONS,
+        "one small row for each destination"
+    );
+    assert!(referring.iter().all(|(_, value)| value.len() < 200));
+    let bodies = spindle_store::ReadView::scan_prefix(
+        harness.store.as_ref(),
+        &spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::EventIndex, &room),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|(_, value)| value.len() > 20_000)
+    .count();
+    assert_eq!(bodies, 1, "the body is stored once");
+
+    // The body is found again when the peer comes back.
+    for stub in &stubs {
+        stub.refuse.store(0, Ordering::SeqCst);
+    }
+    for stub in &stubs {
+        assert!(
+            stub.wait_for(|stub| stub
+                .pdus()
+                .iter()
+                .any(|pdu| pdu["content"]["body"] == json!(text)))
+                .await,
+            "{} got the body",
+            stub.name
+        );
+    }
+}
+
+/// A row written before #821 holds the whole PDU. It is still delivered,
+/// and in the order of its sequence among the rows that refer to bodies.
+#[tokio::test]
+async fn a_row_from_before_the_change_still_delivers() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let mut harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    harness.say(&room, &alice, "new shape", "n1").await;
+    let old = json!({
+        "room_id": room, "type": "m.room.message", "sender": "@alice:example.org",
+        "content": { "msgtype": "m.text", "body": "old shape" },
+    });
+    spindle_store::Store::put(
+        harness.store.as_ref(),
+        &spindle_core::keys::federation_outbox(&stub.name, 1_000_000),
+        old.to_string().as_bytes(),
+    )
+    .unwrap();
+    harness.restart();
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| {
+            let bodies: Vec<_> = stub
+                .pdus()
+                .iter()
+                .filter_map(|pdu| pdu["content"]["body"].as_str().map(str::to_owned))
+                .collect();
+            bodies.iter().any(|b| b == "new shape") && bodies.iter().any(|b| b == "old shape")
+        })
+        .await,
+        "{:?}",
+        stub.pdus()
+    );
+}
+
+/// An event whose body an admin purge deleted cannot be sent: its row is
+/// dropped and counted, and the events around it still go.
+#[tokio::test]
+async fn a_purged_body_drops_its_row_and_the_rest_still_deliver() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let mut harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    harness.say(&room, &alice, "before", "p1").await;
+    let doomed = harness.say_id(&room, &alice, "purged", "p2").await;
+    harness.say(&room, &alice, "after", "p3").await;
+    spindle_store::Store::delete(
+        harness.store.as_ref(),
+        &spindle_core::keys::event_body(&room, &doomed),
+    )
+    .unwrap();
+    harness.restart();
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| {
+            stub.pdus()
+                .iter()
+                .any(|pdu| pdu["content"]["body"] == json!("after"))
+        })
+        .await,
+        "{:?}",
+        stub.pdus()
+    );
+    let bodies: Vec<_> = stub
+        .pdus()
+        .iter()
+        .filter_map(|pdu| pdu["content"]["body"].as_str().map(str::to_owned))
+        .collect();
+    assert!(bodies.contains(&"before".to_owned()));
+    assert!(!bodies.contains(&"purged".to_owned()));
+    assert_eq!(harness.state.metrics.outbox_body_missing(), 1);
+    assert!(
+        harness
+            .outbox_rows()
+            .iter()
+            .all(|(_, value)| !value.ends_with(doomed.as_bytes())),
+        "the row is gone"
+    );
+}
+
+/// A queued event that was redacted before delivery goes out redacted: the
+/// peer never gets the content.
+#[tokio::test]
+async fn a_redacted_event_is_delivered_in_its_redacted_form() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    let target = harness.say_id(&room, &alice, "secret words", "r1").await;
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/rd1"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| {
+            stub.pdus()
+                .iter()
+                .any(|pdu| pdu["type"] == json!("m.room.redaction"))
+        })
+        .await,
+        "{:?}",
+        stub.pdus()
+    );
+    let sent = serde_json::to_string(&stub.pdus()).unwrap();
+    assert!(!sent.contains("secret words"), "{sent}");
+}

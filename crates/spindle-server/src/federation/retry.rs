@@ -212,21 +212,13 @@ pub(super) fn forget(store: &FjallStore, destination: &str) {
 /// in their order -- and the keys of the rest. A row whose room cannot be
 /// read is kept: nothing is dropped that is not understood.
 pub(super) fn catch_up(rows: Vec<OutboxRow>) -> (Vec<OutboxRow>, Vec<Vec<u8>>) {
-    #[derive(Deserialize)]
-    struct Room<'a> {
-        #[serde(borrow)]
-        room_id: Option<std::borrow::Cow<'a, str>>,
-    }
     let mut per_room: BTreeMap<String, usize> = BTreeMap::new();
     let mut keep = vec![true; rows.len()];
     for (index, (_, value)) in rows.iter().enumerate().rev() {
-        let Some(room) = serde_json::from_slice::<Room<'_>>(value)
-            .ok()
-            .and_then(|parsed| parsed.room_id)
-        else {
+        let Some(room) = super::outbox::room_of(value) else {
             continue;
         };
-        let seen = per_room.entry(room.into_owned()).or_default();
+        let seen = per_room.entry(room).or_default();
         *seen += 1;
         keep[index] = *seen <= CATCH_UP_PER_ROOM;
     }

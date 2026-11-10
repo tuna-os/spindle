@@ -358,6 +358,7 @@ pub struct Metrics {
     /// Queued PDUs dropped because a long-unreachable destination's queue
     /// was full (#821).
     outbox_capped: AtomicU64,
+    outbox_body_missing: AtomicU64,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
     /// Inbound PDUs by what became of them ([`PduOutcome`]): the
@@ -468,6 +469,7 @@ impl Default for Metrics {
             destinations_backing_off: Default::default(),
             catch_up_dropped: AtomicU64::new(0),
             outbox_capped: AtomicU64::new(0),
+            outbox_body_missing: AtomicU64::new(0),
             sync_subscribers: AtomicU64::new(0),
             sync_lag: Family::default(),
             pdu_outcomes: Default::default(),
@@ -854,6 +856,18 @@ impl Metrics {
     /// long-unreachable destination.
     pub fn record_outbox_capped(&self, dropped: u64) {
         self.outbox_capped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Count `dropped` queued events whose stored body was purged.
+    pub fn record_outbox_body_missing(&self, dropped: u64) {
+        self.outbox_body_missing
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Queued events dropped for a purged body, for tests.
+    #[must_use]
+    pub fn outbox_body_missing(&self) -> u64 {
+        self.outbox_body_missing.load(Ordering::Relaxed)
     }
 
     /// Queued PDUs shed from full queues, for tests.
@@ -1327,6 +1341,14 @@ impl Metrics {
              # TYPE spindle_federation_outbox_capped_total counter\n\
              spindle_federation_outbox_capped_total {}",
             self.outbox_capped.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_outbox_body_missing_total Queued events dropped because \
+             an admin purge had deleted their stored body.\n\
+             # TYPE spindle_federation_outbox_body_missing_total counter\n\
+             spindle_federation_outbox_body_missing_total {}",
+            self.outbox_body_missing.load(Ordering::Relaxed)
         );
     }
 
