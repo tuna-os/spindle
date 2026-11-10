@@ -36,6 +36,21 @@ use crate::metrics::{KeyFetchResult, KeySource};
 /// server connect to the same unreachable name as often as they could
 /// send a header (#288). A minute bounds that at one connection per name
 /// per minute, and a peer that was genuinely down retries within it.
+/// `(server, room, suggested_only)`: what one hierarchy answer is for.
+type HierarchyKey = (String, String, bool);
+
+/// How long a remote hierarchy answer is reused, and how long a failure is
+/// remembered. Short, because a space's children change and a client that
+/// just added one expects to see it; the failure entry is shorter still so a
+/// server that comes back is asked again soon.
+const HIERARCHY_TTL: Duration = Duration::from_secs(120);
+const HIERARCHY_FAILURE_TTL: Duration = Duration::from_secs(30);
+const HIERARCHY_CACHE_MAX: usize = 512;
+/// One client request must not wait on a slow peer for the signed-request
+/// default of 30 seconds.
+const HIERARCHY_TIMEOUT: Duration = Duration::from_secs(5);
+const HIERARCHY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 
 /// How soon after a successful fetch an origin is asked again because the
@@ -115,6 +130,10 @@ pub struct Federation {
     allowed: Vec<Cidr>,
     /// Origins whose key fetch failed, and until when not to try again.
     negative: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Recent answers (or failures) of `remote_hierarchy`, so one space
+    /// browsed by many clients costs one request per TTL, and a dead
+    /// server costs one timeout rather than one per page.
+    hierarchy_cache: std::sync::Mutex<HashMap<HierarchyKey, (Instant, Option<Value>)>>,
     key_fetch_slots: tokio::sync::Semaphore,
     /// Ephemeral EDUs waiting for the next transaction to each destination.
     ///
@@ -556,6 +575,7 @@ impl Federation {
             insecure_http,
             allowed,
             negative: std::sync::Mutex::new(HashMap::new()),
+            hierarchy_cache: std::sync::Mutex::new(HashMap::new()),
             key_fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_KEY_FETCHES),
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             durable_edus: edu_outbox::EduOutbox::default(),
@@ -2260,6 +2280,72 @@ impl Federation {
             )));
         }
         Ok(body)
+    }
+
+    /// One level of a space as `server` describes it: the client half of
+    /// `GET /_matrix/federation/v1/hierarchy/{roomId}`. The answer is
+    /// untrusted data; the caller must sanitise it and decide what its own
+    /// user may see.
+    ///
+    /// Answers are cached for [`HIERARCHY_TTL`] and failures for
+    /// [`HIERARCHY_FAILURE_TTL`], and a request is cut off after
+    /// [`HIERARCHY_TIMEOUT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] if the request cannot be signed or sent,
+    /// times out, or the peer refuses.
+    pub async fn remote_hierarchy(
+        &self,
+        server: &str,
+        room_id: &str,
+        suggested_only: bool,
+    ) -> Result<Value, FederationError> {
+        let key = (server.to_owned(), room_id.to_owned(), suggested_only);
+        let now = Instant::now();
+        {
+            let cache = self
+                .hierarchy_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((until, answer)) = cache.get(&key)
+                && *until > now
+            {
+                return answer.clone().ok_or_else(|| {
+                    FederationError::Refused(format!("{server} recently failed hierarchy"))
+                });
+            }
+        }
+        let uri = format!(
+            "/_matrix/federation/v1/hierarchy/{}?suggested_only={suggested_only}",
+            path_segment(room_id)
+        );
+        let fetched = tokio::time::timeout(
+            HIERARCHY_TIMEOUT,
+            self.signed_json_bounded(server, &uri, None, "hierarchy", Some(HIERARCHY_MAX_BYTES)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(FederationError::Refused(format!(
+                "{server} did not answer hierarchy in time"
+            )))
+        });
+        let mut cache = self
+            .hierarchy_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= HIERARCHY_CACHE_MAX {
+            cache.retain(|_, (until, _)| *until > now);
+            if cache.len() >= HIERARCHY_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        let (ttl, stored) = match &fetched {
+            Ok(answer) => (HIERARCHY_TTL, Some(answer.clone())),
+            Err(_) => (HIERARCHY_FAILURE_TTL, None),
+        };
+        cache.insert(key, (Instant::now() + ttl, stored));
+        fetched
     }
 
     /// Ask a peer for one of its users' profiles — the client half of
