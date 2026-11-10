@@ -493,10 +493,11 @@ async fn one_users_departure_is_not_anothers() {
 
 /// A user who only knocked and withdrew, was invited and refused, or was
 /// banned before ever joining, with `since` chosen to cover the room's
-/// history: nothing of the room comes back in `rooms.leave`, under either
-/// `shared` or `joined` visibility, incremental or initial.
+/// history: `rooms.leave` still names the room and carries exactly their
+/// own departure event (clients wait on it), and none of the history,
+/// under either `shared` or `joined` visibility, incremental or initial.
 #[tokio::test]
-async fn someone_who_never_joined_is_told_nothing_of_the_room() {
+async fn someone_who_never_joined_is_told_only_how_they_left() {
     for visibility in ["shared", "joined"] {
         let harness = Harness::new();
         let alice = harness.register("alice").await;
@@ -572,17 +573,45 @@ async fn someone_who_never_joined_is_told_nothing_of_the_room() {
             )
             .await;
 
-        for (user, since) in [&banned, &refuser, &knocker].into_iter().zip(&since) {
+        let users = [
+            (&banned, "banned"),
+            (&refuser, "refuser"),
+            (&knocker, "knocker"),
+        ];
+        for ((user, name), since) in users.into_iter().zip(&since) {
             for token in [Some(since.as_str()), None] {
                 let sync = harness.sync(user, token).await;
-                assert!(
-                    left_rooms(&sync).is_empty(),
-                    "{visibility}, since {token:?}: a user who never joined got the room: {sync}"
-                );
-                assert!(!sync.to_string().contains("TOPSECRET"), "{sync}");
+                assert_only_departure(&sync, &room, name, visibility);
             }
         }
     }
+}
+
+/// `rooms.leave` names `room` and holds exactly `name`'s own departure.
+fn assert_only_departure(sync: &Value, room: &str, name: &str, visibility: &str) {
+    assert_eq!(
+        left_rooms(sync),
+        vec![room.to_owned()],
+        "{visibility}: {sync}"
+    );
+    let events = sync["rooms"]["leave"][room]["timeline"]["events"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 1, "{visibility}: {sync}");
+    assert_eq!(events[0]["type"], "m.room.member", "{sync}");
+    assert_eq!(
+        events[0]["state_key"],
+        format!("@{name}:example.org"),
+        "{sync}"
+    );
+    assert!(
+        matches!(
+            events[0]["content"]["membership"].as_str(),
+            Some("leave" | "ban")
+        ),
+        "{sync}"
+    );
+    assert!(!sync.to_string().contains("TOPSECRET"), "{sync}");
 }
 
 /// A real former member of a `joined` room gets, in `rooms.leave`, only

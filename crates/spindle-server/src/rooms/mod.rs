@@ -4272,8 +4272,15 @@ impl Rooms {
             // `leave` or `ban`. The window `since` opens is the client's
             // choice, so what it may carry is bounded by what the user was
             // allowed to read, not just by when they left.
-            let Some(scope) = self.leave_read_scope(user_id, &room_id)? else {
-                continue;
+            // Someone who never joined is still told how they left -- a
+            // refused invite or withdrawn knock must show up as a leave --
+            // but only that one membership event, and none of the history.
+            let scope = match self.leave_read_scope(user_id, &room_id)? {
+                Some(scope) => scope,
+                None => match self.membership_li(&room_id, user_id)? {
+                    Some(at) => ReadScope::Within(vec![(at, at)]),
+                    None => continue,
+                },
             };
             let (events, prev_batch) = match slice {
                 None => {
@@ -4318,7 +4325,8 @@ impl Rooms {
     }
 
     /// What a user who has left `room_id` may be told of it in `/sync`:
-    /// their read scope, or `None` when they have none (never joined).
+    /// their read scope, or `None` when they have none (never joined), in
+    /// which case the caller shows only their own departure event.
     fn leave_read_scope(
         &self,
         user_id: &str,
