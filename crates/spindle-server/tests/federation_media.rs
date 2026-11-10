@@ -524,3 +524,63 @@ async fn purging_the_cache_removes_only_old_remote_media() {
         "this server's own upload stays"
     );
 }
+
+/// A protected cached item survives the purge and is still served; once
+/// unprotected the same purge removes it. The actions are audited.
+#[tokio::test]
+async fn purging_the_cache_spares_protected_media_until_it_is_unprotected() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    mirror.promote("bob");
+    let plain = origin
+        .upload(&alice, "image/png", "plain.png", &small_png())
+        .await;
+    let kept = origin
+        .upload(&alice, "image/png", "kept.png", &small_png())
+        .await;
+    for id in [&plain, &kept] {
+        assert_eq!(mirror.download(&bob, &origin.name, id).await.0, 200);
+    }
+    let (status, body) = mirror
+        .admin_post(
+            &bob,
+            &format!("/_spindle/admin/v1/media/protect/{}/{kept}", origin.name),
+        )
+        .await;
+    assert_eq!((status, &body), (200, &json!({})));
+    let (status, _) = mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_spindle/admin/v1/media/protect/{}/neverfetched",
+                origin.name
+            ),
+        )
+        .await;
+    assert_eq!(status, 404, "an uncached remote item cannot be protected");
+
+    let purge = "/_synapse/admin/v1/purge_media_cache?before_ts=99999999999999";
+    let (_, body) = mirror.admin_post(&bob, purge).await;
+    assert_eq!(body, json!({ "deleted": 1 }), "only the unprotected copy");
+    assert_eq!(
+        mirror.client_statuses(&bob, &origin.name, &kept).await,
+        [200; 6],
+        "a protected item is still served"
+    );
+
+    let (status, _) = mirror
+        .admin_post(
+            &bob,
+            &format!("/_synapse/admin/v1/media/unprotect/{}/{kept}", origin.name),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, body) = mirror.admin_post(&bob, purge).await;
+    assert_eq!(
+        body,
+        json!({ "deleted": 1 }),
+        "unprotected, it is removable"
+    );
+}

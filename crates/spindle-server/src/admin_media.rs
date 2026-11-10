@@ -3,8 +3,11 @@
 //! of one item, a user's uploads or a room's media, and a purge of the
 //! remote media cache.
 //!
-//! Protection (`protect`/`unprotect`) is not routed: nothing here deletes
-//! local media on a timer, so there is nothing for it to protect from.
+//! Protection (`protect`/`unprotect`) marks an item that purge and the cache
+//! caps never remove. A protected item is still served, and bulk
+//! quarantine of a user's or a room's media skips it, as Synapse's
+//! `safe_from_quarantine` does. Quarantining one item by name still
+//! applies, and a quarantined item is not served whether protected or not.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -36,6 +39,22 @@ pub fn routes() -> Router<AppState> {
             .route(
                 &format!("{prefix}/media/unquarantine/{{server_name}}/{{media_id}}"),
                 post(unquarantine_media),
+            )
+            .route(
+                &format!("{prefix}/media/protect/{{media_id}}"),
+                post(protect_local_media),
+            )
+            .route(
+                &format!("{prefix}/media/unprotect/{{media_id}}"),
+                post(unprotect_local_media),
+            )
+            .route(
+                &format!("{prefix}/media/protect/{{server_name}}/{{media_id}}"),
+                post(protect_media),
+            )
+            .route(
+                &format!("{prefix}/media/unprotect/{{server_name}}/{{media_id}}"),
+                post(unprotect_media),
             )
             .route(
                 &format!("{prefix}/room/{{room_id}}/media/quarantine"),
@@ -96,7 +115,7 @@ fn upload_json(media_id: &str, record: &MediaRecord) -> Value {
         "created_ts": record.created_ts,
         "last_access_ts": null,
         "quarantined_by": record.quarantined_by,
-        "safe_from_quarantine": false,
+        "safe_from_quarantine": record.protected_by.is_some(),
     })
 }
 
@@ -220,7 +239,7 @@ async fn media_info(
             "last_access_ts": null,
             "quarantined_by": record.quarantined_by,
             "authenticated": null,
-            "safe_from_quarantine": false,
+            "safe_from_quarantine": record.protected_by.is_some(),
             "sha256": null,
         }
     })))
@@ -328,11 +347,12 @@ async fn quarantine_user_media(
     local_user(&state, &user_id)?;
     let by = actor.identity().user_id.clone();
     let mut count = 0_usize;
-    for (media_id, _) in uploads_of(&state, &user_id)? {
-        if state
-            .media
-            .set_quarantine(&media_id, Some(&by))
-            .map_err(|error| media_error(&error))?
+    for (media_id, record) in uploads_of(&state, &user_id)? {
+        if record.protected_by.is_none()
+            && state
+                .media
+                .set_quarantine(&media_id, Some(&by))
+                .map_err(|error| media_error(&error))?
         {
             count += 1;
         }
@@ -396,11 +416,17 @@ async fn quarantine_room_media(
     let mut count = 0_usize;
     for (server, id) in &uris {
         if state.media.is_ours(server) {
-            // A URI naming an upload that is gone is not an item to hold.
-            if !state
+            let protected = state
                 .media
-                .set_quarantine(id, Some(&by))
+                .record(id)
                 .map_err(|error| media_error(&error))?
+                .is_some_and(|record| record.protected_by.is_some());
+            // A URI naming an upload that is gone is not an item to hold.
+            if protected
+                || !state
+                    .media
+                    .set_quarantine(id, Some(&by))
+                    .map_err(|error| media_error(&error))?
             {
                 continue;
             }
@@ -422,6 +448,90 @@ async fn quarantine_room_media(
     Ok(Json(json!({ "num_quarantined": count })))
 }
 
+/// Protect or unprotect the record under `id`, and audit it.
+fn set_protection(
+    state: &AppState,
+    actor: &AdminActor,
+    id: &str,
+    uri: &str,
+    protect: bool,
+) -> Result<Json<Value>, MatrixError> {
+    let by = actor.identity().user_id.clone();
+    if !state
+        .media
+        .set_protected(id, protect.then_some(by.as_str()))
+        .map_err(|error| media_error(&error))?
+    {
+        return Err(not_found("Unknown media"));
+    }
+    crate::admin::audit(
+        state,
+        &by,
+        if protect {
+            "protect_media"
+        } else {
+            "unprotect_media"
+        },
+        uri,
+        &json!({}),
+    )?;
+    Ok(Json(json!({})))
+}
+
+/// `POST /media/protect/{mediaId}`, Synapse's form: this server's media.
+async fn protect_local_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(media_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = state.media.mxc(&media_id);
+    set_protection(&state, &actor, &media_id, &uri, true)
+}
+
+/// `POST /media/unprotect/{mediaId}`.
+async fn unprotect_local_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path(media_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    let uri = state.media.mxc(&media_id);
+    set_protection(&state, &actor, &media_id, &uri, false)
+}
+
+/// `POST /media/protect/{serverName}/{mediaId}`. Spindle's extension:
+/// only cached remote media is ever purged or capped, so protection has to
+/// reach it. An uncached remote item is a 404.
+async fn protect_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path((server_name, media_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let id = stored_id(&state, &server_name, &media_id);
+    set_protection(
+        &state,
+        &actor,
+        &id,
+        &format!("mxc://{server_name}/{media_id}"),
+        true,
+    )
+}
+
+/// `POST /media/unprotect/{serverName}/{mediaId}`.
+async fn unprotect_media(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Path((server_name, media_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    let id = stored_id(&state, &server_name, &media_id);
+    set_protection(
+        &state,
+        &actor,
+        &id,
+        &format!("mxc://{server_name}/{media_id}"),
+        false,
+    )
+}
+
 #[derive(Deserialize)]
 struct PurgeQuery {
     before_ts: Option<u64>,
@@ -429,7 +539,7 @@ struct PurgeQuery {
 
 /// `POST /purge_media_cache?before_ts=` — delete cached remote media
 /// cached before the timestamp (milliseconds). Local uploads and
-/// quarantined items stay.
+/// quarantined or protected items stay.
 async fn purge_media_cache(
     State(state): State<AppState>,
     actor: AdminActor,

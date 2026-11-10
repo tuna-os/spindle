@@ -120,7 +120,7 @@ account can make the server *hold*.
 |---|---|---|---|
 | Media upload body | 50 MiB by default | `[media] max_upload_bytes`; advertised by `/media/config` | 413 `M_TOO_LARGE` |
 | Media bytes held per account | none by default | `[media] max_bytes_per_user` | 403 `M_RESOURCE_LIMIT_EXCEEDED`, with `admin_contact` from `[server.support]` when set; checked before any byte is stored; deleting media gives its bytes back; appservice users and admins exempt as from the write budgets |
-| Cached remote media | kept until purged by default | `[media] remote_retention_days`; `POST /_synapse/admin/v1/purge_media_cache?before_ts=` | none; an hourly job removes cache entries older than the setting, and never quarantined items or local uploads |
+| Cached remote media | kept until purged by default | `[media] remote_retention_days`; `POST /_synapse/admin/v1/purge_media_cache?before_ts=` | none; an hourly job removes cache entries older than the setting, and never quarantined or protected items or local uploads |
 | Filters held per user | 1,000 | `[limits] filters_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | Account-data types per user (global + per-room) | 20,000 | `[limits] account_data_per_user` | 400 `M_LIMIT_EXCEEDED`; rewriting an existing type is free |
 | One-time keys held per device | 1,000 | `[limits] one_time_keys_per_device` | 400 `M_LIMIT_EXCEEDED`; counts held plus the batch offered |
