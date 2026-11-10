@@ -403,13 +403,28 @@ fn registration_challenge(
     } else {
         "m.login.dummy"
     };
-    let mut flows = vec![json!({ "stages": [uia_stage] })];
+    let terms = crate::registration_terms::enabled(state);
+    // The policy comes first in every flow, so no stage after it can be
+    // reached around it.
+    let staged = |stage: &'static str| {
+        if terms {
+            json!({ "stages": [crate::registration_terms::STAGE, stage] })
+        } else {
+            json!({ "stages": [stage] })
+        }
+    };
+    let mut flows = vec![staged(uia_stage)];
     if crate::threepid::registration_by_email(state) {
-        flows.push(json!({ "stages": ["m.login.email.identity"] }));
+        flows.push(staged("m.login.email.identity"));
     }
+    let params = if terms {
+        json!({ crate::registration_terms::STAGE: crate::registration_terms::params(state) })
+    } else {
+        json!({})
+    };
     let mut body = json!({
         "flows": flows,
-        "params": {},
+        "params": params,
         "session": "register",
     });
     if let Some((errcode, message)) = error {
@@ -537,6 +552,14 @@ async fn register(
     // dummy stage carries no state a session would tie back to, and
     // Synapse accepts it. Its integration suite was refused here on every
     // test until this did.
+    if crate::registration_terms::enabled(&state)
+        && let Some(refusal) = crate::registration_terms::gate(
+            request.auth.as_ref(),
+            registration_challenge(&state, None),
+        )
+    {
+        return Ok(refusal);
+    }
     let (registration_token, address) = match registration_auth(&state, &request)? {
         Ok(done) => done,
         Err(challenge) => return Ok(challenge),

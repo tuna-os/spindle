@@ -26,6 +26,9 @@ The v0.1 deployment envelope needs these controls:
   enable token-required registration and restart. Mint registration tokens
   through `POST /_spindle/admin/v1/registration_tokens/new`. Grant tokens only to accounts the operator
   can support. See [dashboard.md](dashboard.md) for the admin routes.
+- To ask new accounts to accept a policy, set `[registration] terms_url`. The server adds
+  the `m.login.terms` stage to registration. It warns at start-up when registration is open and
+  the bind address is not loopback.
 - Leave `[ratelimit] enabled = true`. Limit the number of ingress connections,
   requests per source, request body size and timeouts in the reverse proxy.
   Allow uploads up to the configured size. Do not

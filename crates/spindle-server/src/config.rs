@@ -195,6 +195,23 @@ impl EmailConfig {
     }
 }
 
+fn default_terms_version() -> String {
+    "1".to_owned()
+}
+
+fn default_terms_name() -> String {
+    "Terms of Service".to_owned()
+}
+
+impl RegistrationConfig {
+    /// Whether registration is open to anyone who can reach the server: no
+    /// token is required.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        !self.require_token
+    }
+}
+
 /// Who may register.
 ///
 /// Registration is open unless a token is required: an operator who
@@ -206,6 +223,16 @@ pub struct RegistrationConfig {
     /// Require an `m.login.registration_token` stage at registration.
     #[serde(default)]
     pub require_token: bool,
+    /// Policy document a new account must accept (`m.login.terms`). Absent,
+    /// registration asks for no acceptance. An `http` or `https` URL.
+    #[serde(default)]
+    pub terms_url: Option<String>,
+    /// The policy's version. Change it when the policy changes.
+    #[serde(default = "default_terms_version")]
+    pub terms_version: String,
+    /// The policy's name as a client shows it.
+    #[serde(default = "default_terms_name")]
+    pub terms_name: String,
     /// Enable Synapse's shared-secret admin registration compatibility API.
     ///
     /// Absent by default: this secret can create administrator accounts, so
@@ -1829,6 +1856,22 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl Config {
+    /// Whether anyone who can reach the listener may create an account:
+    /// registration needs no token and the bind address is not loopback.
+    /// The server warns at start-up when this holds, because the quick-start
+    /// configuration is exactly this and nothing else limits sign-ups.
+    #[must_use]
+    pub fn open_registration_exposed(&self) -> bool {
+        // `bind` is validated as `address:port`, so a parse failure is not
+        // reachable; treat it as exposed rather than quiet.
+        let loopback = self
+            .server
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| address.ip().is_loopback());
+        self.registration.is_open() && !loopback
+    }
+
     /// Parse and validate configuration from TOML text.
     ///
     /// # Errors
@@ -2021,6 +2064,14 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "media.remote_retention_days",
                 message: "must be greater than zero; omit it to keep the cache".to_owned(),
+            });
+        }
+        if let Some(url) = &self.registration.terms_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(ConfigError::Invalid {
+                field: "registration.terms_url",
+                message: "must be an http or https URL".to_owned(),
             });
         }
         Ok(())
@@ -2518,3 +2569,25 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod open_registration_tests {
+    use super::Config;
+
+    fn exposed(extra: &str) -> bool {
+        Config::parse(&format!("[server]\nname = \"x.org\"\n{extra}"))
+            .unwrap()
+            .open_registration_exposed()
+    }
+
+    #[test]
+    fn open_registration_is_exposed_only_off_loopback_without_a_token() {
+        assert!(!exposed("bind = \"127.0.0.1:8008\"\n"));
+        assert!(!exposed("bind = \"[::1]:8008\"\n"));
+        assert!(exposed("bind = \"0.0.0.0:8008\"\n"));
+        assert!(exposed("bind = \"[::]:8008\"\n"));
+        assert!(!exposed(
+            "bind = \"0.0.0.0:8008\"\n[registration]\nrequire_token = true\n"
+        ));
+    }
+}
