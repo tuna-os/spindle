@@ -152,6 +152,7 @@ mod hub;
 mod partial;
 mod policy;
 mod read;
+mod state_delta;
 mod synapse_positions;
 mod unread;
 
@@ -382,31 +383,9 @@ impl SyncResult {
 }
 
 /// One room's share of an incremental sync: its events, whether they were
-/// limited, where they begin, whether the room is told afresh, and what a
-/// skipped span changed in its state (#820).
-type RoomWindow = (Vec<Value>, bool, Option<i64>, bool, Vec<Value>);
-
-/// The state a window changed, as MSC4222's `state_after` wants it: the
-/// last event in the window for each `(type, state_key)` it touched. The
-/// window runs to the head, so the last event for a key *is* the state
-/// after the window for that key, and every key the window did not touch
-/// is unchanged and stays out.
-fn state_changed_in(events: &[Value]) -> Vec<Value> {
-    let mut latest: Vec<((String, String), Value)> = Vec::new();
-    for event in events {
-        let (Some(event_type), Some(state_key)) =
-            (event["type"].as_str(), event["state_key"].as_str())
-        else {
-            continue;
-        };
-        let key = (event_type.to_owned(), state_key.to_owned());
-        match latest.iter_mut().find(|(seen, _)| *seen == key) {
-            Some((_, slot)) => *slot = event.clone(),
-            None => latest.push((key, event.clone())),
-        }
-    }
-    latest.into_iter().map(|(_, event)| event).collect()
-}
+/// limited, where they begin, whether the room is told afresh, and the
+/// current event of every state key the range touched (#819).
+type RoomWindow = (Vec<Value>, bool, Option<i64>, bool, Vec<String>);
 
 /// One room's share of a stream range, for a sliding-sync connection that
 /// holds the room as of the range's start: see [`Rooms::room_delta`].
@@ -865,8 +844,10 @@ impl Rooms {
                 content: &body["content"],
                 json: body,
                 transaction: None,
+                before: None,
             },
         )
+        .map(|_| ())
     }
 
     /// Store the bodies of the state a seed names, and index its memberships
@@ -4038,7 +4019,7 @@ impl Rooms {
             // takes a `prev_batch` for a room it already knew only when the
             // window is `limited`, so a join sent as a one-event slice left
             // Element unable to page back to anything said before it.
-            let (events, limited, prev_batch, fresh, skipped_state) = match range {
+            let (events, limited, prev_batch, fresh, changed_state) = match range {
                 None => {
                     let (events, limited, prev_batch) =
                         self.timeline_tail(room_id, timeline_limit)?;
@@ -4054,18 +4035,11 @@ impl Rooms {
             if since.is_some() && events.is_empty() {
                 continue;
             }
-            // State only when the client is meeting the room: on an
-            // initial sync, or on the sync that joins it. Otherwise the
-            // state events are in the timeline already, and sending them
-            // twice would make a client apply each one twice.
-            //
-            // Except under MSC4222. `state_after` tells the client *not* to
-            // fold the timeline's state events into its state -- the block
-            // is the whole answer -- so an incremental sync must carry
-            // every key that changed in the window, or the change is lost.
-            // It was: this branch sent an empty block, and matrix-rust-sdk,
-            // which always asks for `state_after`, never saw a room name,
-            // topic, alias or power level change after its first sync.
+            // The room's state as the client is told it: whole when it is
+            // meeting the room (an initial sync, or the sync that joins it),
+            // and otherwise what the current state changed that the
+            // timeline does not carry, or under MSC4222 everything it
+            // changed. See `incremental_state`.
             let (state, cached_state) = if fresh {
                 self.initial_state(
                     room_id,
@@ -4075,17 +4049,11 @@ impl Rooms {
                     prev_batch,
                     state_after,
                 )?
-            } else if state_after {
-                // The block is the whole answer under `state_after`, so it
-                // covers the skipped span as well as the window.
-                let mut changed = skipped_state;
-                changed.extend(events.iter().cloned());
-                (state_changed_in(&changed), false)
             } else {
-                // The state at the start of the timeline: what it was, plus
-                // what the skipped span changed. Empty unless the window was
-                // limited, because otherwise the timeline carries it all.
-                (skipped_state, false)
+                (
+                    self.incremental_state(room_id, &events, &changed_state, state_after)?,
+                    false,
+                )
             };
             rooms.push(SyncRoom {
                 room_id: room_id.clone(),
@@ -4734,44 +4702,52 @@ impl Rooms {
             let skip = slice.len().saturating_sub(timeline_limit);
             let (dropped, kept) = slice.split_at(skip);
             let first = kept.iter().copied().min();
-            // What the skipped span changed in the room's state,
-            // which the client cannot read from a timeline that
-            // no longer carries it.
-            let skipped_state = if dropped.is_empty() {
-                Vec::new()
-            } else {
-                self.state_events_of(room_id, dropped)?
-            };
+            let changed = self.current_state_changes(room_id, &slice, (since, until))?;
             Ok((
                 self.timeline_of(room_id, kept, None)?,
                 !dropped.is_empty(),
                 first,
                 false,
-                skipped_state,
+                changed,
             ))
         }
     }
 
-    /// The state events among `indices`, last one for each `(type,
-    /// state_key)`, oldest first.
+    /// The `state` block of a room an incremental sync does not meet afresh.
     ///
-    /// Which entries are state events is in the log already, so the bodies
-    /// read are the state events' and not every event's: a limited
-    /// incremental sync must not read the span it is skipping (#820).
-    fn state_events_of(&self, room_id: &str, indices: &[i64]) -> Result<Vec<Value>, RoomError> {
-        let state_ids = self.with_room_read(room_id, |_, log| {
-            Ok(indices
+    /// `changed` is the current event of every key the range touched, from
+    /// [`Self::current_state_changes`]. Classic `state` is the state at the
+    /// start of the timeline, and the client folds the timeline onto it, so
+    /// an event the timeline carries is left out: sending it twice would
+    /// have the client apply it twice. What is sent is what the timeline
+    /// cannot say -- a key put back to an older event, a member who joined
+    /// inside a gap, anything in a span the limit skipped (#820, #819).
+    ///
+    /// Under MSC4222 (`state_after`) the client does not fold the timeline,
+    /// so the block is the whole answer: the current event of every key
+    /// the range touched, including those the timeline names. An event that
+    /// lost resolution is in the timeline and not here.
+    fn incremental_state(
+        &self,
+        room_id: &str,
+        timeline: &[Value],
+        changed: &[String],
+        state_after: bool,
+    ) -> Result<Vec<Value>, RoomError> {
+        let in_timeline = |event_id: &str| {
+            timeline
                 .iter()
-                .filter_map(|&li| log.entry_at(li))
-                .filter(|entry| entry.state_key.is_some())
-                .map(|entry| entry.event_id.as_str().to_owned())
-                .collect::<Vec<_>>())
-        })?;
-        let mut events = Vec::with_capacity(state_ids.len());
-        for event_id in &state_ids {
-            events.push(self.event(room_id, event_id)?);
+                .find(|event| event["event_id"].as_str() == Some(event_id))
+        };
+        let mut out = Vec::new();
+        for event_id in changed {
+            match in_timeline(event_id) {
+                Some(event) if state_after => out.push(event.clone()),
+                Some(_) => {}
+                None => out.push(self.event(room_id, event_id)?),
+            }
         }
-        Ok(state_changed_in(&events))
+        Ok(out)
     }
 
     /// Events that entered the global stream in `(since, until]`, in
@@ -5281,6 +5257,14 @@ impl Rooms {
                     .collect())
             })?
         };
+        // Beside the events, the events a key was put back to: a revert or a
+        // gap moves the current state to an event this range did not carry
+        // (#819). Only a room with events in the range can have either.
+        let mut event_ids: HashSet<String> =
+            ids.iter().map(|(_, event_id)| event_id.clone()).collect();
+        if !ids.is_empty() {
+            event_ids.extend(self.state_delta_event_ids(room_id, since, until)?);
+        }
         let mut kept = Vec::new();
         let mut limited = false;
         let mut first = None;
@@ -5303,7 +5287,7 @@ impl Rooms {
             events: kept,
             limited,
             prev_batch: first,
-            event_ids: ids.into_iter().map(|(_, event_id)| event_id).collect(),
+            event_ids: event_ids.into_iter().collect(),
         })
     }
 
@@ -6210,23 +6194,24 @@ impl Rooms {
         }
     }
 
-    /// Bring the room's current state up to date after an append, and the
-    /// membership index with it.
+    /// Bring the room's current state up to date after an append, and say
+    /// what it moved.
     ///
-    /// With one forward extremity the current state is that event's state
-    /// and there is nothing to do. With several it is their resolution,
-    /// computed here. When the append was not the plain linear case -- one
-    /// tip, built on by one event -- the current state may have moved by
-    /// more than the event itself, so every membership it moved is
-    /// re-indexed from the resolved state rather than from the event.
-    fn settle(
+    /// With one forward extremity the current state is that event's state.
+    /// With several it is their resolution, computed here. It runs inside
+    /// [`Self::persist_entry`], after the event is stored -- the resolver
+    /// reads its body -- and before the event's stream id is released, so
+    /// the change it finds is written before any sync can read the event
+    /// (#819).
+    fn resolve_current_state(
         &self,
         log: &mut RoomLog,
         room_id: &str,
-        entry: Option<&LogEntry>,
-        previous_current: Option<StateSnapshot>,
-        previous_tips: &BTreeSet<EventId>,
-    ) -> Result<(), RoomError> {
+        entry: &LogEntry,
+        before: &Before<'_>,
+    ) -> Settling {
+        let (previous_current, previous_tips) = (before.current, before.tips);
+        let mut resolved = false;
         if log.forward_extremities().len() > 1 {
             // Every append to a forked room re-resolves its current state
             // over every extremity. A fork no peer's event merges -- tips this
@@ -6238,9 +6223,7 @@ impl Rooms {
             }) {
                 Ok(current) => {
                     log.set_current(current);
-                    // So a restart reopens the fork already resolved
-                    // rather than paying for this again (#724).
-                    self.record_current(log, room_id);
+                    resolved = true;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -6250,47 +6233,72 @@ impl Rooms {
                 }
             }
         }
-        let linear = entry.is_some_and(|entry| {
-            previous_tips.len() == 1
-                && entry.prev_events.len() == 1
-                && entry
-                    .prev_events
-                    .first()
-                    .is_some_and(|parent| previous_tips.contains(parent))
-        }) && log.forward_extremities().len() == 1;
-        if linear {
-            return Ok(());
+        let linear = previous_tips.len() == 1
+            && entry.prev_events.len() == 1
+            && entry
+                .prev_events
+                .first()
+                .is_some_and(|parent| previous_tips.contains(parent))
+            && log.forward_extremities().len() == 1;
+        let mut moved: BTreeSet<StateKey> = BTreeSet::new();
+        let mut changes = Vec::new();
+        if !linear && let Some(after) = log.current_state() {
+            if let Some(previous) = previous_current {
+                moved.extend(previous.diff(after).into_iter().map(|(key, _, _)| key));
+            }
+            if let Some(key) = entry.state_key.clone() {
+                moved.insert(key);
+            }
+            // The event's own key is listed even when the event lost: the
+            // client was told the event, and must be told what the state is
+            // instead (#819).
+            changes = moved
+                .iter()
+                .filter_map(|key| {
+                    after
+                        .get(key)
+                        .map(|event_id| (key.clone(), event_id.to_owned()))
+                })
+                .collect();
         }
-        let Some(after) = log.current_state().cloned() else {
+        Settling {
+            moved,
+            changes,
+            resolved,
+        }
+    }
+
+    /// Everything an append does to the room after it is persisted: a
+    /// resolved fork is recorded so a restart reopens it, and every
+    /// membership the current state moved is re-indexed from it rather than
+    /// from the event.
+    fn settle(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        settling: &Settling,
+    ) -> Result<(), RoomError> {
+        if settling.resolved {
+            // So a restart reopens the fork already resolved
+            // rather than paying for this again (#724).
+            self.record_current(log, room_id);
+        }
+        let Some(after) = log.current_state() else {
             return Ok(());
         };
-        let mut keys: BTreeSet<StateKey> = previous_current
-            .map(|before| {
-                before
-                    .diff(&after)
-                    .into_iter()
-                    .map(|(key, _, _)| key.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(key) = entry.and_then(|entry| entry.state_key.clone()) {
-            keys.insert(key);
-        }
-        for key in keys {
+        for key in &settling.moved {
             if key.event_type().as_str() != "m.room.member" {
                 continue;
             }
-            let (content, li) = match after.get(&key) {
+            let (content, li) = match after.get(key) {
                 Some(id) => {
                     let id = EventId::new(id);
                     let body = self.read_event(room_id, &id)?;
-                    let li = log.get(&id).or(entry).map_or(0, |entry| entry.li.get());
+                    let li = log.get(&id).unwrap_or(entry).li.get();
                     (body["content"].clone(), li)
                 }
-                None => (
-                    serde_json::json!({ "membership": "leave" }),
-                    entry.map_or(0, |entry| entry.li.get()),
-                ),
+                None => (serde_json::json!({ "membership": "leave" }), entry.li.get()),
             };
             self.index_membership(room_id, Some(key.state_key()), &content, li)?;
         }
@@ -6395,7 +6403,7 @@ impl Rooms {
             case_of(state_key.is_some(), resolved),
         );
 
-        self.persist_entry(
+        let settling = self.persist_entry(
             log,
             room_id,
             &entry,
@@ -6407,9 +6415,13 @@ impl Rooms {
                 content,
                 json: &json,
                 transaction,
+                before: Some(Before {
+                    current: previous_current.as_ref(),
+                    tips: &previous_tips,
+                }),
             },
         )?;
-        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+        self.settle(log, room_id, &entry, &settling)?;
         self.prune_stuck_extremities(log, room_id, &entry.event_id, &json);
         self.enqueue_outbound(log, room_id, &json)?;
         Ok(event_id)
@@ -6801,7 +6813,7 @@ impl Rooms {
         );
 
         let content = json["content"].clone();
-        self.persist_entry(
+        let settling = self.persist_entry(
             log,
             room_id,
             &entry,
@@ -6813,9 +6825,13 @@ impl Rooms {
                 content: &content,
                 json,
                 transaction,
+                before: Some(Before {
+                    current: previous_current.as_ref(),
+                    tips: &previous_tips,
+                }),
             },
         )?;
-        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+        self.settle(log, room_id, &entry, &settling)?;
         self.prune_stuck_extremities(log, room_id, &entry.event_id, json);
         // A federated redaction has the same effect as one authored here.
         // The target's location changed in v11, so it was resolved above
@@ -7039,7 +7055,7 @@ impl Rooms {
         entry: &LogEntry,
         event_id: &str,
         input: &PersistInput<'_>,
-    ) -> Result<(), RoomError> {
+    ) -> Result<Settling, RoomError> {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
@@ -7171,16 +7187,30 @@ impl Rooms {
         // the handler would fold request parsing and authorization into
         // a number the target does not describe.
         let started = std::time::Instant::now();
-        let landed = room_store.journal_entry_with(entry, log, &extra);
+        let landed = room_store.journal_entry_with(entry, log, &extra).map(|()| {
+            // What the append did to the room's current state is settled
+            // and recorded *before* the id is released, so no sync can
+            // read the event without the state it moved (#819). The
+            // resolver reads the event's body, which is why this is not
+            // before the write.
+            let settling = input
+                .before
+                .as_ref()
+                .map_or_else(Settling::default, |before| {
+                    self.resolve_current_state(log, room_id, entry, before)
+                });
+            let recorded = self.record_state_delta(room_id, stream_id, entry, &settling);
+            (settling, recorded)
+        });
         // The id is released on *both* outcomes, before the `?`. An
         // allocated id that is never resolved holds the watermark forever,
         // which does not lose this event -- it makes every later event
         // invisible to every client.
         match &landed {
-            Ok(()) => self.stream.commit(stream_id),
+            Ok(_) => self.stream.commit(stream_id),
             Err(_) => self.stream.abandon(stream_id),
         }
-        landed?;
+        let (settling, recorded) = landed?;
         self.metrics.observe_append("group", started.elapsed());
 
         // The index is derived from the event that just landed, and only from
@@ -7190,6 +7220,27 @@ impl Rooms {
             self.index_membership(room_id, input.state_key, input.content, entry.li.get())?;
         }
         self.appended.notify_waiters();
+        recorded?;
+        Ok(settling)
+    }
+
+    /// Write the change an append made to the room's current state, under
+    /// the event's own stream id. A linear append made none and writes none.
+    fn record_state_delta(
+        &self,
+        room_id: &str,
+        stream_id: u64,
+        entry: &LogEntry,
+        settling: &Settling,
+    ) -> Result<(), RoomError> {
+        if settling.changes.is_empty() {
+            return Ok(());
+        }
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::room_state_delta(room_id, stream_id),
+            &state_delta::encode(entry.li.get(), &settling.changes),
+        )?;
         Ok(())
     }
 
@@ -7547,6 +7598,23 @@ impl Drop for Lead<'_> {
     }
 }
 
+/// What an append did to the room's current state: the keys it moved, the
+/// `(key, event)` each now holds, and whether a fork was resolved on the way.
+/// Empty for a linear append, where the event is the whole change.
+#[derive(Default)]
+struct Settling {
+    moved: BTreeSet<StateKey>,
+    changes: Vec<(StateKey, String)>,
+    resolved: bool,
+}
+
+/// The room's current state and forward extremities as they stood before
+/// an append: what its effect is measured against.
+struct Before<'a> {
+    current: Option<&'a StateSnapshot>,
+    tips: &'a BTreeSet<EventId>,
+}
+
 /// The event-shaped arguments `persist_entry` needs, in one carrier so the
 /// two call sites cannot drift on argument order.
 struct PersistInput<'a> {
@@ -7557,6 +7625,10 @@ struct PersistInput<'a> {
     json: &'a Value,
     /// The client transaction a local send runs under, if any.
     transaction: Option<&'a ClientTransaction<'a>>,
+    /// The room as it stood before the append, so `persist_entry` can
+    /// settle the current state and record what the append moved. `None`
+    /// for an entry seeded rather than appended.
+    before: Option<Before<'a>>,
 }
 
 /// The client transaction (`txnId`) a `PUT /send` or `PUT /redact` runs

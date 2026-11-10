@@ -737,6 +737,26 @@ s{events}_{receipts}_{account_data}_{to_device}_{device_lists}_{presence}
 Each component is an independent stream position, so a burst on one stream
 cannot stall another.
 
+#### Current-state deltas
+
+A client folds the timeline into its state, and the timeline is in arrival
+order. That is wrong when an event is not the newest word on its key. An event
+on a stale parent can lose state resolution. A fork can put a key back to an
+older event. An event accepted across a gap brings the peer's state with it.
+
+When an append moves the room's current state by more than the event itself,
+the server writes a delta row under the event's stream id, keyed
+`(room_id, stream_id)`. It lists each `(type, state_key, event_id)` that
+changed. The row is written before the stream id is released, so a sync that
+reads the event also reads the delta. A linear append has no row.
+
+An incremental `/sync` takes the current event of every key that its events or
+its deltas touched. With `use_state_after` that is the `state_after` block.
+Without it, events the timeline already carries are left out of `state`.
+Sliding sync counts the events a delta names as changed. A classic client still
+folds a losing event that sits inside its own timeline window, because the
+protocol gives it no way to undo that.
+
 ### 10.3 Sync as push, not poll
 
 Every long-polling `/sync` and every sliding-sync connection registers with the

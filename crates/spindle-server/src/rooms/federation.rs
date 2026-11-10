@@ -21,7 +21,7 @@ use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
-    INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
+    Before, INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
     event_body_key, version_in,
 };
 
@@ -552,7 +552,7 @@ impl Rooms {
                 super::case_of(state_key.is_some(), false),
             );
             let content = json["content"].clone();
-            rooms.persist_entry(
+            let settling = rooms.persist_entry(
                 log,
                 room_id,
                 &entry,
@@ -564,12 +564,16 @@ impl Rooms {
                     content: &content,
                     json,
                     transaction: None,
+                    before: Some(Before {
+                        current: previous_current.as_ref(),
+                        tips: &previous_tips,
+                    }),
                 },
             )?;
             // Two extremities now, ours and the peer's: their resolution is
             // the room's current state, and every membership it moved is
             // re-indexed from it.
-            rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+            rooms.settle(log, room_id, &entry, &settling)?;
             rooms.prune_stuck_extremities(log, room_id, &entry.event_id, json);
             if let Some(target) = redaction_target {
                 if log.get(&EventId::new(target.as_str())).is_some()
@@ -1753,7 +1757,7 @@ impl Rooms {
         let content = join_body["content"].clone();
         let sender = join_body["sender"].as_str().unwrap_or_default().to_owned();
         let state_key_owned = join_body["state_key"].as_str().map(str::to_owned);
-        self.persist_entry(
+        let _ = self.persist_entry(
             &mut log,
             room_id,
             &join_entry,
@@ -1765,6 +1769,7 @@ impl Rooms {
                 content: &content,
                 json: &join_body,
                 transaction: None,
+                before: None,
             },
         )?;
 
