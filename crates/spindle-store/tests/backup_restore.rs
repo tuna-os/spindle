@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use spindle_core::{MemStateKeyTable, RoomLog, StateKey, StateKeyTable};
-use spindle_store::backup::{BackupError, read_backup, write_backup};
+use spindle_store::backup::{
+    BackupError, read_backup, verify_backup, write_backup, write_backup_file,
+};
 use spindle_store::{
     Durability, FjallStore, ReadView, Record, RoomStore, RowVisitor, SchemaMarker, Store,
     StoreError,
@@ -407,4 +409,134 @@ fn a_backup_holds_one_row_at_a_time() {
     assert_eq!(rows, u64::from(ROWS));
     assert_eq!(view.at_production.borrow().len(), ROWS as usize);
     assert_eq!(view.max_in_flight(), 1, "rows held at once");
+}
+
+/// #811: a restore writes rows as it reads them and checks the trailer last.
+/// Whatever stops it part of the way must not leave a directory that opens.
+#[test]
+fn a_failed_restore_leaves_a_store_that_will_not_open() {
+    let source_dir = TempDir::new().unwrap();
+    let source = FjallStore::open(source_dir.path()).unwrap();
+    seed(&source, 20);
+    let bytes = backup_of(&source);
+    let cut = &bytes[..bytes.len() - 40];
+
+    let target_dir = TempDir::new().unwrap();
+    {
+        let target = FjallStore::open(target_dir.path()).unwrap();
+        read_backup(&mut &cut[..], &target).expect_err("a truncated backup is refused");
+    }
+
+    // Rows are on disk and the schema marker is valid: without the
+    // in-progress row this open succeeds and serves a partial dataset.
+    let error = FjallStore::open(target_dir.path())
+        .err()
+        .expect("a store left by a failed restore must not open");
+    assert!(
+        error.to_string().contains("did not finish"),
+        "the refusal must say what happened: {error}"
+    );
+}
+
+#[test]
+fn a_finished_restore_opens_and_leaves_no_marker_behind() {
+    let source_dir = TempDir::new().unwrap();
+    let source = FjallStore::open(source_dir.path()).unwrap();
+    seed(&source, 5);
+    let bytes = backup_of(&source);
+
+    let target_dir = TempDir::new().unwrap();
+    {
+        let target = FjallStore::open(target_dir.path()).unwrap();
+        read_backup(&mut &bytes[..], &target).unwrap();
+    }
+    let reopened = FjallStore::open(target_dir.path()).expect("a complete restore opens");
+    assert!(
+        reopened
+            .get(&spindle_core::keys::restore_in_progress())
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The check that runs before a row is written: a bad file is refused while
+/// the target is still empty.
+#[test]
+fn verifying_a_backup_checks_everything_and_writes_nothing() {
+    let source_dir = TempDir::new().unwrap();
+    let source = FjallStore::open(source_dir.path()).unwrap();
+    seed(&source, 5);
+    let bytes = backup_of(&source);
+
+    let rows = verify_backup(&mut &bytes[..]).expect("a good backup verifies");
+    assert!(rows > 0);
+    verify_backup(&mut &bytes[..bytes.len() - 1]).expect_err("a truncated backup does not");
+    let mut altered = bytes.clone();
+    altered[40] ^= 0xff;
+    verify_backup(&mut &altered[..]).expect_err("an altered backup does not");
+}
+
+/// A view that fails its scan, the way a read error mid-backup does.
+struct FailingView<'a>(&'a FjallStore);
+
+impl ReadView for FailingView<'_> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.0.get(key)
+    }
+    fn scan_prefix(&self, _prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
+        Err(StoreError::Backend("injected read failure".to_owned()))
+    }
+    fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
+        self.0.scan_from(prefix, start)
+    }
+    fn scan_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Record>, StoreError> {
+        self.0.scan_until(prefix, start, end)
+    }
+    fn key_table(&self) -> Arc<dyn StateKeyTable> {
+        self.0.key_table()
+    }
+}
+
+/// #812: a backup file that is named is a backup file that is whole.
+#[test]
+fn a_backup_file_is_complete_when_it_has_its_name() {
+    let source_dir = TempDir::new().unwrap();
+    let source = FjallStore::open(source_dir.path()).unwrap();
+    seed(&source, 5);
+    let out = TempDir::new().unwrap();
+    let path = out.path().join("backup.bin");
+
+    let rows = write_backup_file(&source, &path).expect("the backup is written");
+
+    let mut file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+    assert_eq!(verify_backup(&mut file).unwrap(), rows);
+    assert!(
+        !out.path().join("backup.bin.partial").exists(),
+        "the partial file is renamed away"
+    );
+
+    // A second backup to the same name is refused and the first is untouched.
+    let before = std::fs::read(&path).unwrap();
+    write_backup_file(&source, &path).expect_err("an existing backup is never overwritten");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_failed_backup_leaves_no_file_to_block_the_retry() {
+    let source_dir = TempDir::new().unwrap();
+    let source = FjallStore::open(source_dir.path()).unwrap();
+    seed(&source, 5);
+    let out = TempDir::new().unwrap();
+    let path = out.path().join("backup.bin");
+
+    write_backup_file(&FailingView(&source), &path).expect_err("the scan fails");
+
+    assert!(!path.exists(), "a failed backup has no name");
+    assert!(!out.path().join("backup.bin.partial").exists());
+    write_backup_file(&source, &path).expect("the retry is not blocked");
 }

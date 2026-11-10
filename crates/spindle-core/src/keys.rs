@@ -70,6 +70,20 @@ pub fn migration_progress() -> Vec<u8> {
     vec![0x00, 0x02]
 }
 
+/// Present while a `spindle restore` is writing rows, and absent before and
+/// after (#811).
+///
+/// Beside the marker and outside every [`Keyspace`], for the marker's reason.
+/// A restore writes rows as it reads them and checks the trailer last, so a
+/// crash or a failed check leaves a prefix of the backup with a valid schema
+/// marker: a store that opens, looks healthy and misses its tail. This row
+/// is written first and removed only after the last row is synced, and
+/// opening a store that holds it is refused.
+#[must_use]
+pub fn restore_in_progress() -> Vec<u8> {
+    vec![0x00, 0x03]
+}
+
 /// The marker's non-collision is a compile-time property, so it is checked at
 /// compile time: a zero `KEY_SCHEMA_VERSION` would put room keys in the
 /// marker's range, and that must fail the build rather than a test run.

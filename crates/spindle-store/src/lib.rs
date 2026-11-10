@@ -952,6 +952,18 @@ impl FjallStore {
     /// starts serving a room whose entire history it simply cannot see. The
     /// marker turns that silence into a refusal.
     fn check_schema(&self) -> Result<(), StoreError> {
+        // Before the marker: a restore that did not finish has a valid marker
+        // and part of the rows, which is the state that must not be served.
+        if self
+            .get(&spindle_core::keys::restore_in_progress())?
+            .is_some()
+        {
+            return Err(StoreError::Backend(
+                "this store holds the remains of a restore that did not finish; move \
+                 the directory aside and restore the backup into an empty one"
+                    .to_owned(),
+            ));
+        }
         let key = store_marker();
         if let Some(raw) = self.get(&key)? {
             let found = SchemaMarker::decode(&raw)?;

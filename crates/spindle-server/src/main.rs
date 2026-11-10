@@ -1387,18 +1387,13 @@ fn backup(config_path: &str, file: &str) -> ExitCode {
         eprintln!("spindle: {file} already exists — refusing to overwrite a backup");
         return ExitCode::FAILURE;
     }
-    let mut out = match std::fs::File::create(path) {
-        Ok(file) => std::io::BufWriter::new(file),
-        Err(error) => {
-            eprintln!("spindle: cannot write {file}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     // Through a snapshot: every row from one moment, so the backup cannot
     // hold metadata that trails its own log.
     let snapshot = spindle_store::Store::snapshot(&store);
     let view: &dyn spindle_store::ReadView = snapshot.as_deref().unwrap_or(&store);
-    match spindle_store::backup::write_backup(view, &mut out) {
+    // Synced and renamed into place, so "wrote" is true of the disk and a
+    // failure leaves no partial file to block the retry (#812).
+    match spindle_store::backup::write_backup_file(view, path) {
         Ok(rows) => {
             println!("wrote {rows} rows to {file}");
             ExitCode::SUCCESS
@@ -1429,20 +1424,41 @@ async fn restore(config_path: &str, file: &str) -> ExitCode {
     // Counting that as content would refuse every restore, including the only
     // one that is supposed to work.
     let marker = spindle_core::keys::store_marker();
-    match spindle_store::ReadView::scan_prefix(store.as_ref(), &[]) {
-        Ok(rows) => {
-            let existing = rows.iter().filter(|(key, _)| *key != marker).count();
-            if existing > 0 {
-                eprintln!(
-                    "spindle: the store already holds {existing} rows — restore into \
-                     an empty store, so the result is the backup rather than a merge \
-                     of the two"
-                );
+    // A probe that stops at the first row of data, not a scan that copies the
+    // store into memory to count it (#811).
+    let mut found = false;
+    let probed = spindle_store::ReadView::visit_prefix(store.as_ref(), &[], &mut |key, _| {
+        if key == marker.as_slice() {
+            return Ok(());
+        }
+        found = true;
+        // Stops the scan; `found` is the answer.
+        Err(spindle_store::StoreError::Backend("probe done".to_owned()))
+    });
+    if !found && let Err(error) = probed {
+        eprintln!("spindle: cannot read the store: {error}");
+        return ExitCode::FAILURE;
+    }
+    if found {
+        eprintln!(
+            "spindle: the store already holds data — restore into an empty \
+             store, so the result is the backup rather than a merge of the two"
+        );
+        return ExitCode::FAILURE;
+    }
+    // The file is read twice. The first pass checks it end to end and writes
+    // nothing, so a truncated or altered backup is refused while the target
+    // is still empty (#811).
+    match std::fs::File::open(file) {
+        Ok(handle) => {
+            let mut reader = std::io::BufReader::new(handle);
+            if let Err(error) = spindle_store::backup::verify_backup(&mut reader) {
+                eprintln!("spindle: {file} is not a usable backup, nothing was restored: {error}");
                 return ExitCode::FAILURE;
             }
         }
         Err(error) => {
-            eprintln!("spindle: cannot read the store: {error}");
+            eprintln!("spindle: cannot read {file}: {error}");
             return ExitCode::FAILURE;
         }
     }
