@@ -6730,6 +6730,11 @@ impl Rooms {
             .chain(departing)
             .filter(|domain| admitted(domain))
             .collect();
+        // Nothing to queue is not a batch: a room with no remote member
+        // writes nothing, so an event stays one batch (`append_batch.rs`).
+        if destinations.is_empty() {
+            return Ok(());
+        }
         // One batch for every destination, holding only a reference to the
         // body the event's own commit stored. The write guards live until
         // the batch has landed, so no sync passes a sequence whose row is
