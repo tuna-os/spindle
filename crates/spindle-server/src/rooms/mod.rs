@@ -152,6 +152,7 @@ mod hub;
 mod partial;
 mod policy;
 mod read;
+mod retention;
 mod state_delta;
 mod synapse_positions;
 mod unread;
@@ -159,6 +160,7 @@ mod unread;
 pub use admin::AdminTimelineEntry;
 pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS, PartialJoinState};
 pub use read::{ReadScope, RoomReader};
+pub use retention::TruncationReport;
 pub use synapse_positions::SynapseGap;
 
 pub use unread::{Receipt, Scored, Unread, Unscored};

@@ -672,6 +672,16 @@ pub enum Keyspace {
     /// `(room_id, epoch, li)` -> a hub's signed checkpoint: the chain value
     /// and the state root at `li` (SPEC section 13.3).
     HubCheckpoint = 0x72,
+    /// `room_id` -> where a truncated room's hash chain restarts: the first
+    /// `li` the room still holds a chain for (i64 be) and `chain[li - 1]`,
+    /// the value the chain had just before it (32 bytes).
+    ///
+    /// Retention (#817) deletes the log entries below a watermark, and
+    /// `ChainHash::extend` needs the value before the first retained entry.
+    /// A load seeds the chain from this row instead of from the domain
+    /// seed. The row is written before the first delete, so a crash leaves a
+    /// room that reads as already truncated.
+    ChainCheckpoint = 0x67,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -800,6 +810,12 @@ pub fn oidc_client(client_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn purge_watermark(room_id: &str) -> Vec<u8> {
     room_prefix(Keyspace::PurgeWatermark, room_id)
+}
+
+/// A room's chain checkpoint row ([`Keyspace::ChainCheckpoint`]).
+#[must_use]
+pub fn chain_checkpoint(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::ChainCheckpoint, room_id)
 }
 
 /// A room's administrative block row.

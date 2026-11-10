@@ -145,7 +145,7 @@ fn order_preserving_encoding_survives_the_sign_boundary() {
 /// makes two record types collide in the same byte range.
 #[test]
 fn keyspace_discriminants_are_unchanged() {
-    for (keyspace, expected) in [
+    let table = [
         (Keyspace::Log, 0x01_u8),
         (Keyspace::EventIndex, 0x02),
         (Keyspace::StateNode, 0x03),
@@ -227,15 +227,21 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::RevokedDevice, 0x63),
         (Keyspace::CurrentState, 0x64),
         (Keyspace::DestinationRetry, 0x65),
+        (Keyspace::ChainCheckpoint, 0x67),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),
         (Keyspace::RoomStateDelta, 0x66),
-    ] {
+    ];
+    let mut owner = std::collections::BTreeMap::new();
+    for (keyspace, expected) in table {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
             key[1], expected,
             "keyspace {keyspace:?} moved; existing rows are now read as another type"
         );
+        if let Some(other) = owner.insert(expected, keyspace) {
+            panic!("{other:?} and {keyspace:?} share byte {expected:#04x}");
+        }
     }
 }

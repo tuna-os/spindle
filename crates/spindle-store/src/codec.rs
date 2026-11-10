@@ -407,6 +407,45 @@ impl CurrentStateRecord {
     }
 }
 
+/// A truncated room's chain restart point
+/// ([`spindle_core::keys::Keyspace::ChainCheckpoint`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainCheckpointRecord {
+    pub floor: i64,
+    pub chain: [u8; 32],
+}
+
+impl ChainCheckpointRecord {
+    const LEN: usize = 1 + 8 + 32;
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        out.push(RECORD_VERSION);
+        out.extend_from_slice(&self.floor.to_be_bytes());
+        out.extend_from_slice(&self.chain);
+        out
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for an unknown version, a truncated record
+    /// or trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        let version = cursor.byte()?;
+        if version != RECORD_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let floor = i64::from_be_bytes(cursor.array::<8>()?);
+        let chain = cursor.array::<32>()?;
+        if let Some(extra) = bytes.get(cursor.at) {
+            return Err(CodecError::Malformed(*extra));
+        }
+        Ok(Self { floor, chain })
+    }
+}
+
 fn put_len(out: &mut Vec<u8>, len: usize) {
     let len = u32::try_from(len).unwrap_or(u32::MAX);
     out.extend_from_slice(&len.to_be_bytes());
