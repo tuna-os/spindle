@@ -64,6 +64,10 @@ path = "./data"
 # Must be above zero.
 # relaxed_sync_interval_ms = 1000
 
+# Directory for online backups taken with POST /_spindle/admin/v1/backup.
+# Unset turns the endpoint off. Each backup is a new file in this directory.
+# backup_dir = "./backups"
+
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and
 # advertised by both media config endpoints. Match the old server on migration.
 # [media]

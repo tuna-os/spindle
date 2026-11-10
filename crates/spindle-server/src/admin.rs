@@ -125,6 +125,7 @@ pub fn routes() -> Router<AppState> {
                 get(get_event_report).delete(delete_event_report),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
+            .route(&format!("{prefix}/backup"), post(create_backup))
             .route(
                 &format!("{prefix}/registration_tokens"),
                 get(list_registration_tokens),
@@ -373,6 +374,61 @@ impl FromRequestParts<AppState> for AdminActor {
         }
         Ok(Self(identity))
     }
+}
+
+/// `POST /backup` (#813)
+///
+/// Writes a backup of the running store to a new file in
+/// `[storage] backup_dir`, and says where. The rows come from one store
+/// snapshot, so the file is of one moment however many writes land while it
+/// is written. The file name is chosen here: the request carries no path.
+/// Media is not in the file; take the store backup first, then copy media,
+/// so that `verify-media` finds every blob the store names.
+async fn create_backup(
+    State(state): State<AppState>,
+    actor: AdminActor,
+) -> Result<Json<Value>, MatrixError> {
+    let Some(dir) = state.config.storage.backup_dir.clone() else {
+        return Err(MatrixError::bad_json(
+            "online backup is off: set [storage] backup_dir",
+        ));
+    };
+    // Two at once would double the read load of a backup meant to be cheap
+    // enough to run on a live server. The slot frees itself on drop, so a
+    // panic cannot wedge it.
+    let Some(slot) = state.metrics.begin_backup() else {
+        return Err(MatrixError::limit_exceeded(60_000));
+    };
+    let started = now_ms();
+    let path = dir.join(format!("spindle-{started}.backup"));
+    let store = state.store.clone();
+    let target = path.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        // `?` on a missing directory would say nothing useful later.
+        std::fs::create_dir_all(target.parent().unwrap_or(std::path::Path::new(".")))
+            .map_err(spindle_store::backup::BackupError::Io)?;
+        let snapshot = store.snapshot().ok_or_else(|| {
+            spindle_store::backup::BackupError::Io(std::io::Error::other(
+                "the store has no snapshot, so it cannot be backed up while it runs",
+            ))
+        })?;
+        spindle_store::backup::write_backup_file(&*snapshot, &target)
+    })
+    .await
+    .map_err(|error| MatrixError::internal(&error.to_string()))?
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    drop(slot);
+    state.metrics.set_last_backup(started / 1000);
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "backup",
+        &path.display().to_string(),
+        &json!({ "rows": rows }),
+    )?;
+    Ok(Json(
+        json!({ "path": path.display().to_string(), "rows": rows }),
+    ))
 }
 
 /// Append one audit record. Every mutating handler calls this after the
