@@ -30,9 +30,11 @@
 //! anything cleverer would be a second on-disk format to keep compatible.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::codec::CodecError;
-use crate::{ReadView, SchemaMarker, Store, StoreError};
+use crate::{Durability, ReadView, SchemaMarker, Store, StoreError};
+use spindle_core::keys;
 
 /// Identifies the stream, so a wrong file is a clear error rather than a
 /// confusing one.
@@ -120,14 +122,54 @@ fn frame_row<W: Write + ?Sized>(
 ///
 /// Verifies the magic, the format version, the schema marker and the trailing
 /// digest before reporting success. Rows are written as they are read, so a
-/// stream that fails verification may have left rows behind — restore into a
-/// fresh store, which is what a restore is.
+/// stream that fails verification may have left rows behind. That is why the
+/// restore marks the store first (#811): [`keys::restore_in_progress`] is
+/// written and synced before the first row, and removed only after the last
+/// row is synced, and a store that holds it refuses to open. Run
+/// [`verify_backup`] on the same file first, so that a bad file is refused
+/// before a row is written.
 ///
 /// # Errors
 ///
 /// Returns [`BackupError`] if the stream is not a backup, was written under a
 /// schema this binary does not speak, or does not match its own digest.
 pub fn read_backup(source: &mut dyn Read, store: &dyn Store) -> Result<u64, BackupError> {
+    let sentinel = keys::restore_in_progress();
+    store.put(&sentinel, b"1")?;
+    store.sync(Durability::Strict)?;
+
+    let restored = read_stream(source, &mut |key, value| {
+        store.put(key, value).map_err(BackupError::from)
+    })?;
+
+    // The rows are durable before the marker that vouches for them is
+    // removed; the other order is the partial store this exists to prevent.
+    store.flush()?;
+    store.reload_key_table()?;
+    store.delete(&sentinel)?;
+    store.flush()?;
+    Ok(restored)
+}
+
+/// Check a backup stream end to end and write nothing.
+///
+/// The same checks as [`read_backup`] — magic, format, schema marker, row
+/// count and digest — without a store. A restore reads the file twice, this
+/// first, so a truncated or altered file is refused while the target is
+/// still empty (#811).
+///
+/// # Errors
+///
+/// Returns the [`BackupError`] that [`read_backup`] would.
+pub fn verify_backup(source: &mut dyn Read) -> Result<u64, BackupError> {
+    read_stream(source, &mut |_, _| Ok(()))
+}
+
+/// What [`read_stream`] does with each row it has read.
+type OnRow<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), BackupError> + 'a;
+
+/// Parse and verify a backup stream, handing each row to `on_row`.
+fn read_stream(source: &mut dyn Read, on_row: &mut OnRow<'_>) -> Result<u64, BackupError> {
     let mut src = Digesting::new_read(source);
 
     let mut magic = [0_u8; 16];
@@ -160,7 +202,7 @@ pub fn read_backup(source: &mut dyn Read, store: &dyn Store) -> Result<u64, Back
         let key = src.read_framed(key_len as usize)?;
         let value_len = src.read_u32()? as usize;
         let value = src.read_framed(value_len)?;
-        store.put(&key, &value)?;
+        on_row(&key, &value)?;
         restored += 1;
     }
 
@@ -182,9 +224,55 @@ pub fn read_backup(source: &mut dyn Read, store: &dyn Store) -> Result<u64, Back
             found: restored,
         });
     }
-    store.flush()?;
-    store.reload_key_table()?;
     Ok(restored)
+}
+
+/// Write a backup to `path` so that "wrote N rows" means the file is on disk
+/// (#812).
+///
+/// The stream goes to `<path>.partial`, which is synced, renamed over
+/// nothing and followed by a sync of the directory. A failure removes the
+/// partial file, so it neither passes for a backup nor blocks the retry. An
+/// existing `path` is refused: a backup is never overwritten.
+///
+/// # Errors
+///
+/// Returns [`BackupError`] if `path` exists, the scan fails, or the file
+/// cannot be written, synced or renamed.
+pub fn write_backup_file(view: &dyn ReadView, path: &Path) -> Result<u64, BackupError> {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+
+    let written = (|| {
+        if path.exists() {
+            return Err(BackupError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already exists", path.display()),
+            )));
+        }
+        // A leftover from an earlier run is replaced: it is never a backup.
+        let _ = std::fs::remove_file(&partial);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        let mut out = std::io::BufWriter::new(file);
+        let rows = write_backup(view, &mut out)?;
+        out.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        std::fs::rename(&partial, path)?;
+        // The rename is a directory entry: without this a power cut can
+        // leave the synced bytes under no name.
+        let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+        std::fs::File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        Ok(rows)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
 }
 
 /// Wraps a stream and digests everything that passes through it.
