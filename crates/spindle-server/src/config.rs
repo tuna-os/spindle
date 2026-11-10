@@ -1315,6 +1315,17 @@ pub struct FederationConfig {
     /// `enabled = true` is a startup error rather than a silent no-op.
     #[serde(default)]
     pub hub: HubConfig,
+    /// Server names this server federates with, as `*`/`?` globs like a
+    /// room's `m.room.server_acl`. Empty means every server not in `deny`.
+    /// Set, it is a closed federation: any other server is refused in both
+    /// directions -- inbound after its signature verifies, outbound before
+    /// a name is resolved. Changes need a restart.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Server names refused in every room, in both directions, whatever
+    /// `allow` says. Same globs as `allow`. Changes need a restart.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// `[federation.hub]`: Spindle's MSC3995 hub mode, between Spindle peers.
@@ -1534,6 +1545,8 @@ impl Default for FederationConfig {
             dependency_failure_ttl_secs: default_dependency_failure_ttl_secs(),
             trusted_key_servers: None,
             hub: HubConfig::default(),
+            allow: Vec::new(),
+            deny: Vec::new(),
         }
     }
 }

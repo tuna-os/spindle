@@ -413,6 +413,7 @@ fn federation_client(
         client
             .with_peers(&config.federation.peers)
             .with_enabled(config.federation.enabled)
+            .with_server_lists(&config.federation.allow, &config.federation.deny)
             .with_metrics(Arc::clone(metrics)),
     ))
 }
