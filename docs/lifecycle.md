@@ -150,10 +150,10 @@ spindle reindex-search <config>
 
 This command rebuilds the word index for `/search` from the logs. Use it
 after you set `[search] index = true` on a store that holds rooms. Use it
-again after you turned the index off for a while. The server must be
-stopped.
+again after you turned the index off for a while. Stop the server
+first.
 
-The index is derived data. The log is the truth. The command deletes the
+You can always rebuild the index, because the log is the truth. The command deletes the
 old index rows, reads each stored message body and writes the rows again.
 It prints the number of rooms, log entries and rows. A room without an
 index is still searched correctly. The search scans it.
