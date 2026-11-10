@@ -237,6 +237,7 @@ pub struct Settings {
     pub idle: Duration,
     pub retry: Duration,
     pub max_events: u64,
+    caps: super::recovery::GapCaps,
 }
 
 impl Settings {
@@ -248,6 +249,7 @@ impl Settings {
             idle: Duration::from_millis(config.gap_backfill_idle_ms.max(1)),
             retry: Duration::from_millis(config.gap_backfill_retry_ms),
             max_events: u64::try_from(config.gap_backfill_max_events).unwrap_or(u64::MAX),
+            caps: super::recovery::GapCaps::of(config),
         }
     }
 }
@@ -264,6 +266,7 @@ pub struct Sources {
 }
 
 /// The sources, upgraded for one chunk.
+#[derive(Clone)]
 struct Live {
     rooms: Arc<Rooms>,
     federation: Arc<Federation>,
@@ -322,6 +325,39 @@ pub async fn run(sources: Sources, settings: Settings) {
             let Some(live) = sources.upgrade() else {
                 return;
             };
+            // Events refused for missing dependencies are owed a retry (#822);
+            // one per pass, then the loop's pause, like a gap's chunk.
+            let retried = {
+                let server_name = sources.server_name.clone();
+                let live = live.clone();
+                crate::blocking::offload_async(
+                    Arc::clone(&live.metrics),
+                    crate::metrics::BlockingTask::FederationCatchUp,
+                    move || async move {
+                        let peers = Peers {
+                            rooms: &live.rooms,
+                            federation: &live.federation,
+                            key: &live.key,
+                            server_name: &server_name,
+                            metrics: &live.metrics,
+                            recovery: &live.recovery,
+                        };
+                        Box::pin(super::recovery::retry_owed(
+                            &peers,
+                            settings.caps,
+                            settings.retry,
+                            now_ms(),
+                        ))
+                        .await
+                    },
+                )
+                .await
+                .unwrap_or(false)
+            };
+            if retried {
+                tokio::time::sleep(settings.interval).await;
+                continue;
+            }
             let Some(due) = next_due(&live) else {
                 break;
             };

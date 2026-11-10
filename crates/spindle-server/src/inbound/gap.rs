@@ -31,7 +31,6 @@ use ruma::RoomVersionId;
 use serde_json::Value;
 
 use super::recovery::{Endpoint, Failure, Peers, VerifiedPdu, charge, count, verify};
-use crate::AppState;
 use crate::federation::PeerKeys;
 use crate::metrics::FetchKind;
 use crate::rooms::RoomError;
@@ -65,7 +64,7 @@ const FETCH_CONCURRENCY: usize = 16;
 /// closed); a peer that cannot answer gives way to the next one, and the
 /// last peer's failure is returned.
 pub(super) async fn accept(
-    state: &AppState,
+    state: &Peers<'_>,
     origin: &str,
     room_id: &str,
     version: &RoomVersionId,
@@ -85,7 +84,7 @@ pub(super) async fn accept(
             .rooms
             .participating_servers(room_id)?
             .into_iter()
-            .filter(|domain| domain != origin && *domain != state.config.server.name),
+            .filter(|domain| domain != origin && *domain != state.server_name),
     );
     let mut last = None;
     for peer in candidates
@@ -150,7 +149,7 @@ pub(super) async fn accept(
 
 /// Leave a peer that answered 429 alone for this room's `/state_ids`.
 /// Whether it did.
-fn cool(state: &AppState, room_id: &str, peer: &str, failure: &Failure) -> bool {
+fn cool(state: &Peers<'_>, room_id: &str, peer: &str, failure: &Failure) -> bool {
     if let Failure::Peer {
         rate_limited: Some(wait),
         ..
@@ -171,7 +170,7 @@ fn cool(state: &AppState, room_id: &str, peer: &str, failure: &Failure) -> bool 
     reason = "one bounded walk, then one retention and one append"
 )]
 async fn bridge(
-    state: &AppState,
+    state: &Peers<'_>,
     peer: &str,
     room_id: &str,
     version: &RoomVersionId,
@@ -212,16 +211,7 @@ async fn bridge(
             .missing_remote_dependencies(room_id, &event.body)?
             .1,
     );
-    let fetched = fetch_state(
-        &Peers::of(state),
-        peer,
-        room_id,
-        version,
-        roots,
-        &event.id,
-        keys,
-    )
-    .await?;
+    let fetched = fetch_state(state, peer, room_id, version, roots, &event.id, keys).await?;
 
     if !fetched.is_empty() {
         state

@@ -93,6 +93,17 @@ pub(crate) mod band {
     }
 }
 
+/// Events one room may owe at once ([`Rooms::owe_event`]). Bounds what a
+/// server in a room can make this server keep and retry.
+pub(crate) const MAX_OWED_PER_ROOM: usize = 64;
+
+/// The event ID at the end of an owed-event key: the bytes after the
+/// room's prefix.
+fn record_event_id(key: &[u8], room_id: &str) -> Option<String> {
+    let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::OwedEvent, room_id);
+    String::from_utf8(key.strip_prefix(prefix.as_slice())?.to_vec()).ok()
+}
+
 /// One gap's segment: the sequence numbers its events occupy, inclusive.
 pub(crate) type Span = (u32, u32);
 
@@ -657,6 +668,89 @@ impl Rooms {
             self.store.as_ref(),
             &spindle_core::keys::federation_gap(room_id, event_id),
             marker.to_string().as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Remember a pushed PDU refused for missing dependencies, so the
+    /// backfill loop tries it again (#822). The sender does not resend an
+    /// event it was answered 200 for, so without this the event is gone
+    /// until a later one names it. Idempotent: an event already owed keeps
+    /// its retry count. A room holds at most [`MAX_OWED_PER_ROOM`]; past
+    /// that the event is not kept and `false` is returned.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the store cannot be read or written.
+    pub fn owe_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        origin: &str,
+        pdu: &Value,
+    ) -> Result<bool, RoomError> {
+        let key = spindle_core::keys::owed_event(room_id, event_id);
+        if spindle_store::ReadView::get(self.store.as_ref(), &key)?.is_some() {
+            return Ok(true);
+        }
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::OwedEvent, room_id);
+        if spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?.len()
+            >= MAX_OWED_PER_ROOM
+        {
+            return Ok(false);
+        }
+        let record = json!({ "origin": origin, "pdu": pdu, "attempts": 0, "next_ms": 0 });
+        spindle_store::Store::put(self.store.as_ref(), &key, record.to_string().as_bytes())?;
+        Ok(true)
+    }
+
+    /// Every owed event, as `(room_id, event_id, record)`.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the rows cannot be read.
+    pub fn owed_events(&self) -> Result<Vec<(String, String, Value)>, RoomError> {
+        let prefix = vec![
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::OwedEvent as u8,
+        ];
+        Ok(
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let room = spindle_core::keys::room_from_prefixed(&key)?.to_owned();
+                    let event = record_event_id(&key, &room)?;
+                    Some((room, event, serde_json::from_slice(&value).ok()?))
+                })
+                .collect(),
+        )
+    }
+
+    /// Rewrite an owed event's record after a retry that did not settle it.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the row cannot be written.
+    pub fn put_owed_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        record: &Value,
+    ) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::owed_event(room_id, event_id),
+            record.to_string().as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Forget an owed event: applied, or given up on.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the row cannot be deleted.
+    pub fn delete_owed_event(&self, room_id: &str, event_id: &str) -> Result<(), RoomError> {
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::owed_event(room_id, event_id),
         )?;
         Ok(())
     }

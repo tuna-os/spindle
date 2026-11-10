@@ -1241,7 +1241,8 @@ pub struct FederationConfig {
     /// Fill recorded federation gaps in the background (SPEC §6.5): the
     /// history between this server's old head and an event it accepted
     /// across a gap is fetched with `/backfill`, verified and stored so
-    /// `/messages` and `/context` serve it. Off leaves the gaps recorded.
+    /// `/messages` and `/context` serve it. Off leaves the gaps recorded, and
+    /// leaves PDUs refused for missing dependencies unretried.
     #[serde(default = "default_true")]
     pub gap_backfill: bool,
     /// Events asked for per `/backfill` request, and so the most one chunk
@@ -1282,8 +1283,9 @@ pub struct FederationConfig {
     /// again, seconds (#725). In that time a pushed PDU that names it is
     /// refused at once, without the recovery and gap acceptance that
     /// failed for it last time, and a peer's body for it that failed is
-    /// not fetched from that peer again. The sender retries the
-    /// transaction, so the PDU is judged again after this expires. `0`
+    /// not fetched from that peer again. A sender does not send a
+    /// PDU again after a 200, so this server keeps the refused PDU and
+    /// judges it again after this expires. `0`
     /// turns it off; at most a day.
     #[serde(default = "default_dependency_failure_ttl_secs")]
     pub dependency_failure_ttl_secs: u64,
