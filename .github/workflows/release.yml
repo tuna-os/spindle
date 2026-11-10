@@ -235,9 +235,114 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+  # .deb and .rpm from the tarball's binary (#825). Packaging is a separate
+  # job and `continue-on-error`, and `publish` does not require it to pass:
+  # a broken packaging step (these tools have not yet run in this workflow)
+  # must never hold back the tarballs and the image. When it fails, the
+  # release has no packages and says nothing about them.
+  packages:
+    name: Packages for ${{ matrix.arch }}
+    needs: [cut, binaries]
+    if: needs.cut.outputs.tag != '' && !inputs.dry_run
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.cut.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      DEB_ARCH: ${{ matrix.deb }}
+      RPM_ARCH: ${{ matrix.rpm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            deb: amd64
+            rpm: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb: arm64
+            rpm: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.cut.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.90.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: tarball
+      - name: Install the packaging tools
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      # The packages carry the tarball's binary, not a second build.
+      - name: Stage the files
+        run: |
+          mkdir -p target/release target/pkg dist
+          tar -xzf "tarball/spindle-${TAG}-${TARGET}.tar.gz" -C tarball
+          install -m 0755 "tarball/spindle-${TAG}-${TARGET}/spindle" target/release/spindle
+          # The tarball unit starts /usr/local/bin/spindle; a package installs /usr/bin.
+          sed 's|^ExecStart=/usr/local/bin/spindle |ExecStart=/usr/bin/spindle |' \
+            deploy/systemd/spindle.service > target/pkg/spindle.service
+          grep -q '^ExecStart=/usr/bin/spindle ' target/pkg/spindle.service
+      - name: Build the packages
+        run: |
+          version="${TAG#v}"
+          cargo deb -p spindle-server --no-build --deb-version "$version" \
+            --output "dist/spindle-${TAG}-${DEB_ARCH}.deb"
+          cargo generate-rpm -p crates/spindle-server \
+            --set-metadata "version = \"$version\"" \
+            --output "dist/spindle-${TAG}-${RPM_ARCH}.rpm"
+      - name: Check the packages hold what they should
+        run: |
+          deb="dist/spindle-${TAG}-${DEB_ARCH}.deb"
+          rpm="dist/spindle-${TAG}-${RPM_ARCH}.rpm"
+          dpkg-deb --contents "$deb" | tee deb.list
+          dpkg-deb --info "$deb"
+          for f in ./usr/bin/spindle ./usr/lib/systemd/system/spindle.service \
+                   ./etc/spindle/spindle.toml ./usr/share/doc/spindle/LICENSE-MIT \
+                   ./usr/share/doc/spindle/LICENSE-APACHE; do
+            grep -q " $f\$" deb.list
+          done
+          dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./conffiles | grep -qx /etc/spindle/spindle.toml
+          rpm -qlp "$rpm" | tee rpm.list
+          for f in /usr/bin/spindle /usr/lib/systemd/system/spindle.service \
+                   /etc/spindle/spindle.toml /usr/share/doc/spindle/LICENSE-MIT \
+                   /usr/share/doc/spindle/LICENSE-APACHE; do
+            grep -qx "$f" rpm.list
+          done
+          rpm -qcp "$rpm" | grep -qx /etc/spindle/spindle.toml
+      - name: Checksum
+        run: |
+          cd dist
+          for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done
+      - name: Attest the provenance of the packages
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.target }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.sha256
+
   publish:
     name: Publish the release
-    needs: [cut, binaries, image]
+    # `packages` is listed so its artifacts are ready when it succeeds, but
+    # the `if` below ignores its result: a failed or skipped packaging job
+    # still lets the release go out without .deb and .rpm files.
+    needs: [cut, binaries, image, packages]
+    if: ${{ !cancelled() && needs.cut.result == 'success' && needs.binaries.result == 'success' && needs.image.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Pushes the multi-architecture tag and creates the release.
@@ -285,6 +390,7 @@ jobs:
             echo
             echo '```'
             echo "gh attestation verify spindle-${TAG}-x86_64-unknown-linux-gnu.tar.gz --repo ${GITHUB_REPOSITORY}"
+            echo "# The .deb and .rpm files, when the release has them, verify the same way."
             echo "gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY,,}:${TAG} --repo ${GITHUB_REPOSITORY}"
             echo '```'
             echo
@@ -317,6 +423,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Packages exist only if the packaging job passed; the glob must
+          # not turn a missing .deb into an error.
+          shopt -s nullglob
+          packages=(dist/*.deb dist/*.rpm)
           prerelease=""
           case "$TAG" in v0.*) prerelease="--prerelease" ;; esac
-          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json "${packages[@]}"

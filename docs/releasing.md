@@ -52,7 +52,14 @@ Either way the run then:
 - signs a provenance attestation for each tarball and each image, through
   Sigstore, tied to the workflow's own identity; the image attestations
   are pushed to the registry beside the images;
-- creates the GitHub release with the tarballs, the checksums, the SBOMs
+- builds a `.deb` and an `.rpm` for each architecture from the tarball's
+  binary, in a separate `packages` job (`cargo-deb` and
+  `cargo-generate-rpm`, metadata in `crates/spindle-server/Cargo.toml`).
+  It writes a checksum for each and signs a provenance attestation. This
+  job may fail without blocking the release: the tarballs and the image
+  still go out, without packages;
+- creates the GitHub release with the tarballs, the packages when they
+  exist, the checksums, the SBOMs
   and notes that say what the tag is and give the image digest, followed
   by the titles of the pull requests merged since the previous tag,
   marked a prerelease for every `v0.*` tag.

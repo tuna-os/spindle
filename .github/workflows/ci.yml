@@ -230,3 +230,18 @@ jobs:
         run: |
           pip install --quiet pyyaml==6.0.3
           python3 scripts/check-deploy.py --require-all
+
+  # Starts the Compose file's Spindle service from the repository's own
+  # Dockerfile and walks the first operator steps: register, log in, create
+  # a room, send a message (#825). The render checks above cannot tell that
+  # the stack runs.
+  deploy-smoke:
+    name: Deployment smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start the Compose service and register a user
+        run: scripts/deploy-smoke.sh
