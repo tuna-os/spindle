@@ -549,20 +549,35 @@ async fn register(
         .as_deref()
         .ok_or_else(|| MatrixError::bad_json("no password"))?;
 
-    accounts
-        .register(username, password)
-        .map_err(|error| match error {
+    // The use is taken before the account is made, so parallel requests
+    // cannot all pass the validity check and then all succeed on a one-use
+    // token. It is given back if the account is not created.
+    let tokens =
+        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store));
+    if let Some(token) = &registration_token
+        && !tokens
+            .try_consume(token)
+            .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        return Ok(registration_challenge(
+            &state,
+            Some(("M_UNAUTHORIZED", "the registration token is not valid")),
+        ));
+    }
+    if let Err(error) = accounts.register(username, password) {
+        if let Some(token) = &registration_token {
+            tokens
+                .release(token)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        }
+        return Err(match error {
             AccountError::UserInUse => MatrixError::user_in_use(),
             AccountError::InvalidUsername => MatrixError::invalid_username(),
             other => internal(&other),
-        })?;
+        });
+    }
 
     let user_id = accounts.user_id(username);
-    if let Some(token) = registration_token {
-        crate::registration_tokens::RegistrationTokens::new(std::sync::Arc::clone(&state.store))
-            .consume(&token)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    }
     if let Some(address) = address {
         crate::email::bind(&state, username, &address)?;
     }
