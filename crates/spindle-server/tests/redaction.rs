@@ -420,3 +420,162 @@ async fn redacting_a_state_event_leaves_the_state_entry_in_place() {
     assert_eq!(topic["event_id"], topic_event);
     assert_eq!(topic["content"], json!({}), "{topic}");
 }
+
+impl Harness {
+    /// A public room alice created and bob joined; both tokens.
+    async fn shared_room(&self) -> (String, String, String, String) {
+        let alice = self.register("alice").await;
+        let bob = self.register("bob").await;
+        let (_, created) = self
+            .post(
+                "/_matrix/client/v3/createRoom",
+                &alice,
+                &json!({ "preset": "public_chat" }),
+            )
+            .await;
+        let room = created["room_id"].as_str().unwrap().to_owned();
+        let (status, body) = self
+            .post(&format!("/_matrix/client/v3/join/{room}"), &bob, &json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let bob_id = "@bob:example.org".to_owned();
+        (room, alice, bob, bob_id)
+    }
+
+    async fn event_body(&self, room: &str, token: &str, event: &str) -> Value {
+        self.get(
+            &format!("/_matrix/client/v3/rooms/{room}/event/{event}"),
+            token,
+        )
+        .await
+        .1
+    }
+
+    async fn redaction_count(&self, room: &str, token: &str) -> usize {
+        let (_, timeline) = self
+            .get(
+                &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100"),
+                token,
+            )
+            .await;
+        timeline["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "m.room.redaction")
+            .count()
+    }
+}
+
+/// Room v3 and later let any member *send* a redaction, so the rules alone do
+/// not stop a member with no power from stripping someone else's event. The
+/// refusal must come before anything is stored.
+#[tokio::test]
+async fn a_member_without_power_cannot_redact_another_members_event() {
+    let harness = Harness::new();
+    let (room, alice, bob, _) = harness.shared_room().await;
+    let target = harness.say(&room, &alice, "alice's words", "t1").await;
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/r1"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+
+    let event = harness.event_body(&room, &alice, &target).await;
+    assert_eq!(event["content"]["body"], "alice's words", "{event}");
+    assert_eq!(
+        harness.redaction_count(&room, &alice).await,
+        0,
+        "a refused redaction was stored"
+    );
+}
+
+/// Redacting a state event is the same rule: a member without power cannot
+/// blank the room name.
+#[tokio::test]
+async fn a_member_without_power_cannot_redact_a_state_event() {
+    let harness = Harness::new();
+    let (room, alice, bob, _) = harness.shared_room().await;
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+            &alice,
+            &json!({ "name": "the name" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let name_event = body["event_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{name_event}/r1"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let event = harness.event_body(&room, &alice, &name_event).await;
+    assert_eq!(event["content"]["name"], "the name", "{event}");
+    assert_eq!(harness.redaction_count(&room, &alice).await, 0);
+}
+
+#[tokio::test]
+async fn a_member_can_redact_their_own_event() {
+    let harness = Harness::new();
+    let (room, _alice, bob, _) = harness.shared_room().await;
+    let target = harness.say(&room, &bob, "bob's words", "t1").await;
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/r1"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event = harness.event_body(&room, &bob, &target).await;
+    assert_eq!(event["content"], json!({}), "{event}");
+}
+
+/// A member whose power reaches the room's `redact` level may redact others'
+/// events.
+#[tokio::test]
+async fn a_moderator_can_redact_another_members_event() {
+    let harness = Harness::new();
+    let (room, alice, bob, bob_id) = harness.shared_room().await;
+    let target = harness.say(&room, &alice, "alice's words", "t1").await;
+
+    let (_, mut levels) = harness
+        .get(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+            &alice,
+        )
+        .await;
+    let needed = levels["redact"].as_i64().unwrap_or(50);
+    levels["users"][&bob_id] = json!(needed);
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.power_levels"),
+            &alice,
+            &levels,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room}/redact/{target}/r1"),
+            &bob,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event = harness.event_body(&room, &alice, &target).await;
+    assert_eq!(event["content"], json!({}), "{event}");
+}

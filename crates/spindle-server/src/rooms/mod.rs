@@ -2651,6 +2651,8 @@ impl Rooms {
         let content = Value::Object(content);
 
         let redaction_id = self.with_room(room_id, |rooms, log| {
+            // Before anything is stored: a refused redaction leaves no event.
+            rooms.check_may_redact(log, room_id, sender, target)?;
             rooms.append(
                 log,
                 room_id,
@@ -2670,7 +2672,7 @@ impl Rooms {
     }
 
     /// Rewrite a stored event to its redacted form.
-    fn apply_redaction(
+    pub(super) fn apply_redaction(
         &self,
         room_id: &str,
         target: &str,
@@ -6778,6 +6780,14 @@ impl Rooms {
         }
 
         let redaction_target = self.redaction_target(log, room_id, json)?;
+        // Judged against the state the redaction was sent in, not today's.
+        let redaction_power = redaction_target.is_some().then(|| {
+            self.redact_power_in(
+                room_id,
+                &state_before,
+                json["sender"].as_str().unwrap_or_default(),
+            )
+        });
 
         let previous_current = log.current_state().cloned();
         let previous_tips = log.forward_extremities().clone();
@@ -6820,7 +6830,13 @@ impl Rooms {
             if log.get(&EventId::new(target.as_str())).is_some()
                 || self.gap_position(room_id, &target)?.is_some()
             {
-                self.apply_redaction(room_id, &target, event_id)?;
+                self.apply_received_redaction(
+                    room_id,
+                    &target,
+                    event_id,
+                    &sender,
+                    redaction_power.unwrap_or(false),
+                )?;
             } else {
                 self.note_unheld_redaction(log, room_id, &target, event_id, json)?;
             }

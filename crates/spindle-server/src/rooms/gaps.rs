@@ -892,7 +892,7 @@ impl Rooms {
 
     /// Whether `sender` may redact others' events in `state`: their power
     /// reaches the room's `redact` level, or they created the room.
-    fn may_redact(
+    pub(super) fn may_redact(
         &self,
         room_id: &str,
         state: &StateSnapshot,
@@ -925,6 +925,71 @@ impl Rooms {
             .unwrap_or(0);
         let needed = content.get("redact").and_then(power_level).unwrap_or(50);
         power >= needed
+    }
+
+    /// Refuse a redaction authored here unless `sender` may redact `target`:
+    /// they hold the room's `redact` power, or the target is their own event.
+    /// The auth rules of room v3 and later let any member *send* a redaction;
+    /// whether it takes effect is decided here, before anything is stored.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Forbidden`] if the sender may not redact the
+    /// target, or a read error for the target.
+    pub(super) fn check_may_redact(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        sender: &str,
+        target: &str,
+    ) -> Result<(), RoomError> {
+        let body = self.read_event(room_id, &EventId::new(target))?;
+        if body["sender"].as_str() == Some(sender) {
+            return Ok(());
+        }
+        let power_ok = log
+            .current_state()
+            .is_some_and(|state| self.may_redact(room_id, state, sender, &HashMap::new()));
+        if power_ok {
+            Ok(())
+        } else {
+            Err(RoomError::Forbidden(
+                "you do not have permission to redact this event".to_owned(),
+            ))
+        }
+    }
+
+    /// Whether `sender` held the `redact` power in `state`, the room state
+    /// at a received redaction.
+    pub(super) fn redact_power_in(
+        &self,
+        room_id: &str,
+        state: &StateSnapshot,
+        sender: &str,
+    ) -> bool {
+        self.may_redact(room_id, state, sender, &HashMap::new())
+    }
+
+    /// Apply a received redaction to its held target only if it takes
+    /// effect: `power_ok` (decided against the state at the redaction) or
+    /// the same server vouching for both senders. The redaction event stays
+    /// in the room either way; an ineffective one just leaves the target.
+    pub(super) fn apply_received_redaction(
+        &self,
+        room_id: &str,
+        target: &str,
+        redaction_id: &str,
+        sender: &str,
+        power_ok: bool,
+    ) -> Result<(), RoomError> {
+        let body = self.read_event(room_id, &EventId::new(target))?;
+        if redaction_applies(
+            power_ok,
+            sender,
+            body["sender"].as_str().unwrap_or_default(),
+        ) {
+            self.apply_redaction(room_id, target, redaction_id)?;
+        }
+        Ok(())
     }
 
     /// Note a redaction whose target this server does not hold, in a room

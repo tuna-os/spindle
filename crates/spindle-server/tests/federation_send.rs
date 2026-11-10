@@ -459,6 +459,111 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
     assert_eq!(messages["chunk"][0]["sender"], json!(peer.user()));
 }
 
+fn redaction_event(
+    store: &Arc<FjallStore>,
+    peer: &Peer,
+    room: &str,
+    prev: &str,
+    target: &str,
+) -> Value {
+    peer.event(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.redaction",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "redacts": target },
+            "origin_server_ts": now_millis(),
+            "depth": 12,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
+}
+
+/// Room v3 and later let any member send a redaction; whether it takes
+/// effect is the receiver's call. A remote member without the `redact` power
+/// stays in the timeline as an event but must not strip someone else's
+/// message, while the same member redacting their own message does apply.
+#[tokio::test]
+async fn a_powerless_remote_redaction_is_kept_but_does_not_strip_the_target() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, body) = harness.deliver(&peer, "t1", vec![join]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, sent) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/a1"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "alice's words" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let target = sent["event_id"].as_str().unwrap().to_owned();
+
+    let head = harness.head_event(&room, &alice).await;
+    let redaction = redaction_event(&harness.store, &peer, &room, &head, &target);
+    let (status, body) = harness.deliver(&peer, "t2", vec![redaction]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["pdus"].as_object().unwrap().values().next().unwrap(),
+        &json!({}),
+        "{body}"
+    );
+
+    // The redaction event is in the room, as on other servers.
+    let redaction_id = harness.head_event(&room, &alice).await;
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{redaction_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["type"], "m.room.redaction", "{event}");
+
+    // But the target was not stripped.
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{target}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["content"]["body"], "alice's words", "{event}");
+
+    // The peer's own message is theirs to redact.
+    let head = harness.head_event(&room, &alice).await;
+    let own = message_event(&harness.store, &peer, &room, &head, "bob's words");
+    let own_id = harness.deliver(&peer, "t3", vec![own]).await.1["pdus"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let head = harness.head_event(&room, &alice).await;
+    let redaction = redaction_event(&harness.store, &peer, &room, &head, &own_id);
+    let (status, body) = harness.deliver(&peer, "t4", vec![redaction]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{own_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["content"], json!({}), "{event}");
+}
+
 /// `m.room.server_acl`, both halves: once the room denies the peer, its
 /// PDUs are refused before verification, its room reads are forbidden,
 /// and nothing after the ACL is queued to it on the outbox. The ACL event
