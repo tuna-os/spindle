@@ -331,3 +331,58 @@ fn an_empty_store_and_a_messages_only_room_collect_nothing() {
     assert_eq!(report.swept, 0);
     assert!(store.get(&odd).unwrap().is_some());
 }
+
+/// A `CurrentState` row that does not decode is a stale cache: a room load
+/// ignores it, so gc drops it instead of refusing forever.
+#[test]
+fn an_undecodable_cache_row_is_dropped_not_fatal() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    seed(&store, "!room:example.org", 10);
+    let planted = plant_garbage(&store, "stray");
+    let cache = room_prefix(Keyspace::CurrentState, "!room:example.org");
+    store.put(&cache, b"not a record").unwrap();
+
+    let dry = collect_state_nodes(&store, true).unwrap();
+    assert_eq!(dry.dropped_cache_rows, 1);
+    assert!(store.get(&cache).unwrap().is_some(), "a dry run keeps it");
+
+    let report = collect_state_nodes(&store, false).unwrap();
+    assert_eq!(report.dropped_cache_rows, 1);
+    assert_eq!(report.swept, planted, "the garbage went too: {report:?}");
+    assert!(store.get(&cache).unwrap().is_none());
+    RoomStore::new(&store, "!room:example.org")
+        .load_exhaustive()
+        .unwrap()
+        .expect("the room loads without its cache row");
+    assert_eq!(collect_state_nodes(&store, false).unwrap().swept, 0);
+}
+
+/// The sweep deletes in batches and never holds all the dead addresses.
+///
+/// Counted, not timed: `unbatched` is the rows written outside a batch and
+/// must not move; `written` moves by exactly the nodes swept; and the most
+/// addresses held at once stays below the number swept.
+#[test]
+fn the_sweep_batches_its_deletes_and_holds_one_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    seed(&store, "!room:example.org", 10);
+    let mut planted = 0;
+    for tag in 0..160 {
+        planted += plant_garbage(&store, &format!("t{tag}x"));
+    }
+    let (unbatched, written) = (store.unbatched(), store.written());
+
+    let report = collect_state_nodes(&store, false).unwrap();
+    assert_eq!(report.swept, planted, "{report:?}");
+    assert!(report.swept > 2 * report.peak_pending, "{report:?}");
+    assert_eq!(
+        report.delete_batches,
+        report.swept.div_ceil(report.peak_pending),
+        "{report:?}"
+    );
+    assert_eq!(store.unbatched(), unbatched, "no delete went unbatched");
+    assert_eq!(store.written() - written, planted);
+    assert_eq!(node_count(&store), report.marked);
+}

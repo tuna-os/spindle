@@ -26,6 +26,7 @@ pub mod backup;
 pub mod codec;
 pub mod gc;
 pub mod migrate;
+pub mod verify;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -304,6 +305,22 @@ pub trait Store: ReadView {
     ///
     /// Returns a backend error if the delete fails.
     fn delete(&self, key: &[u8]) -> Result<(), StoreError>;
+
+    /// Remove every key in one write, if they are there.
+    ///
+    /// The default deletes one by one; a backend with batches overrides it
+    /// so a sweep of a million keys is thousands of writes, not a million.
+    /// Not durable until [`Store::flush`], like [`Store::delete`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the delete fails.
+    fn delete_batch(&self, keys: &[Vec<u8>]) -> Result<(), StoreError> {
+        for key in keys {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
 
     fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
         None
@@ -1335,6 +1352,24 @@ impl Store for FjallStore {
         Ok(())
     }
 
+    fn delete_batch(&self, keys: &[Vec<u8>]) -> Result<(), StoreError> {
+        self.injected(false)?;
+        let mut batch = self.db.batch();
+        for key in keys {
+            batch.remove(&self.partition, key.as_slice());
+        }
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
+        self.written.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        // A journalled write nobody has synced: `flush` owes the barrier.
+        self.journalled.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
         // `Keyspace::instant`, not `Partition::snapshot`. The latter reads the
         // raw sequence counter, which a batch commit bumps *before* inserting
@@ -1657,6 +1692,60 @@ pub struct RestoreProfile {
     pub node_reads: u64,
 }
 
+/// A state-node lookup for a restore.
+///
+/// The restore machinery asks for `Option<node>`, so a failed read has no
+/// way to say so and used to count as "node missing". That made an I/O error
+/// look like a damaged store, or worse, like a harmless gap. This keeps the
+/// first failure, and [`Self::finish`] returns it ahead of whatever the
+/// restore concluded from the `None`.
+struct NodeReader<'a, S: Store> {
+    store: &'a S,
+    reads: std::cell::Cell<u64>,
+    failure: std::cell::RefCell<Option<StoreError>>,
+}
+
+impl<'a, S: Store> NodeReader<'a, S> {
+    fn new(store: &'a S) -> Self {
+        Self {
+            store,
+            reads: std::cell::Cell::new(0),
+            failure: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn load(&self, address: &StateRoot) -> Option<Vec<u8>> {
+        self.reads.set(self.reads.get() + 1);
+        match self
+            .store
+            .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+        {
+            Ok(node) => node,
+            Err(error) => {
+                self.failure.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    fn reads(&self) -> u64 {
+        self.reads.get()
+    }
+
+    /// The failed read, if there was one. Takes it, so call it once.
+    fn failure(&self) -> Option<StoreError> {
+        self.failure.borrow_mut().take()
+    }
+
+    /// `result`, unless a read failed: the failure is the real cause.
+    fn finish<T, E: Into<StoreError>>(&self, result: Result<T, E>) -> Result<T, StoreError> {
+        match self.failure() {
+            Some(error) => Err(error),
+            None => result.map_err(Into::into),
+        }
+    }
+}
+
 /// Persist a room's log, and read it back.
 pub struct RoomStore<'a, S: Store> {
     store: &'a S,
@@ -1879,12 +1968,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// its state rehydrated from the stored trie.
     fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
             let state = spindle_core::StateSnapshot::rehydrate(
@@ -1895,19 +1980,15 @@ impl<'a, S: Store> RoomStore<'a, S> {
             .unwrap_or_else(|_| spindle_core::StateSnapshot::new(log.table().clone()));
             log.restore_sidelined(entry, state);
         }
-        Ok(())
+        reader.finish(Ok::<(), StoreError>(()))
     }
 
     /// [`Self::restore_sidelined`] for the exhaustive check: every
     /// sidelined state must read back verified.
     fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
             let state = spindle_core::StateSnapshot::rehydrate(
@@ -1915,10 +1996,15 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 &mut load_node,
                 log.table().clone(),
             )
-            .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            .map_err(|_| {
+                // A failed read is not a damaged state: say which.
+                reader.failure().unwrap_or_else(|| {
+                    RestoreError::UnreadableSidelined(entry.event_id.clone()).into()
+                })
+            })?;
             log.restore_sidelined(entry, state);
         }
-        Ok(())
+        reader.finish(Ok::<(), StoreError>(()))
     }
 
     /// The runtime form: each sidelined record, without its state (see
@@ -2301,18 +2387,13 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         self.stream_outside_records(&mut restore, &mut profile)?;
-        let mut node_reads = 0_u64;
-        let mut load_node = |address: &StateRoot| {
-            node_reads += 1;
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         let started = std::time::Instant::now();
-        let restored = restore.finish_runtime(&mut load_node)?;
+        let restored = restore.finish_runtime(&mut load_node);
         profile.roots = started.elapsed();
-        profile.node_reads = node_reads;
+        profile.node_reads = reader.reads();
+        let restored = reader.finish(restored)?;
         Ok(Some((restored, profile)))
     }
 
@@ -2326,13 +2407,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         self.stream_outside_records(&mut restore, &mut profile)?;
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
-        let mut restored = restore.finish_exhaustive(&mut load_node)?;
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
+        let restored = restore.finish_exhaustive(&mut load_node);
+        let mut restored = reader.finish(restored)?;
         // The records are in already; this reads and verifies each state.
         self.restore_sidelined_checked(&mut restored.log)?;
         Ok(Some(restored))
@@ -2352,14 +2430,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
 
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
 
-        let mut restored = RoomLog::restore_with_state(
+        let restored = RoomLog::restore_with_state(
             entries,
             meta.next_forward,
             meta.next_backward,
@@ -2368,7 +2442,8 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .map(|id| EventId::new(id.as_str())),
             &mut load_node,
             self.store.key_table(),
-        )?;
+        );
+        let mut restored = reader.finish(restored)?;
         self.restore_sidelined(&mut restored.log)?;
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))

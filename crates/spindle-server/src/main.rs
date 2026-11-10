@@ -172,7 +172,52 @@ fn store_maintenance_command() -> Option<ExitCode> {
             let dry_run = std::env::args().any(|argument| argument == "--dry-run");
             Some(gc(&config_path, dry_run))
         }
+        // `spindle verify <config>` -- check every room exhaustively and
+        // exit non-zero when anything is wrong (#818). Offline like `gc`:
+        // opening the store takes the directory lock.
+        "verify" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle verify <config>");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(verify(&config_path))
+        }
         _ => None,
+    }
+}
+
+/// Check every room's records, chain and state roots.
+fn verify(config_path: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_store::verify::verify_store(&store) {
+        Ok(report) => {
+            println!(
+                "verify: {} rooms, {} log entries checked",
+                report.rooms, report.entries
+            );
+            if report.unverified_rooms > 0 {
+                println!(
+                    "verify: {} rooms hold backfilled state that is not re-derivable here (expected)",
+                    report.unverified_rooms
+                );
+            }
+            for (room, error) in &report.problems {
+                eprintln!("verify: {room}: {error}");
+            }
+            if report.is_intact() {
+                println!("verify: the store is intact");
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("verify: {} rooms have problems", report.problems.len());
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("verify: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -193,6 +238,17 @@ fn gc(config_path: &str, dry_run: bool) -> ExitCode {
                 "gc: {verb} {} unreachable state nodes ({} bytes)",
                 report.swept, report.swept_bytes
             );
+            if report.dropped_cache_rows > 0 {
+                println!(
+                    "gc: {} unreadable current-state cache rows {}",
+                    report.dropped_cache_rows,
+                    if dry_run {
+                        "would be dropped"
+                    } else {
+                        "dropped"
+                    }
+                );
+            }
             if dry_run {
                 println!("gc: dry run, nothing deleted");
             }
