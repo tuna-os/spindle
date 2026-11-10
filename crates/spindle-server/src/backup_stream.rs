@@ -125,7 +125,8 @@ pub struct BackupStream {
 impl BackupStream {
     /// Start writing a backup of one snapshot of `store`.
     ///
-    /// The task owns `slot` and drops it when it ends, however it ends.
+    /// The task owns `slot` and frees it before it calls `done`, or when it
+    /// ends, however it ends.
     /// `done` gets the row count or the error, for the audit record.
     pub fn start(
         store: Arc<spindle_store::FjallStore>,
@@ -137,7 +138,6 @@ impl BackupStream {
         let stats = Arc::new(Stats::default());
         let task_stats = Arc::clone(&stats);
         tokio::task::spawn_blocking(move || {
-            let _slot = slot;
             let error_tx = tx.clone();
             let mut writer = ChannelWriter {
                 tx,
@@ -156,6 +156,11 @@ impl BackupStream {
                 // aborted download rather than a short file that ends cleanly.
                 let _ = error_tx.blocking_send(Err(std::io::Error::other(error.to_string())));
             }
+            // Free the slot before `done` runs: "done" must mean the next backup
+            // may start. Left to the end of the task, the slot was still
+            // taken when the callback ran, and a request that acted on "done"
+            // could get a 409.
+            drop(slot);
             done(&result, &task_stats);
         });
         Self { rx, stats }
