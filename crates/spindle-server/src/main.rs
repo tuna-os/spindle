@@ -165,12 +165,8 @@ fn store_maintenance_command() -> Option<ExitCode> {
         // a node the append has just made live again. Opening the store
         // takes the engine's directory lock, so a running server refuses it.
         "gc" => {
-            let Some(config_path) = std::env::args().nth(2) else {
-                eprintln!("usage: spindle gc <config> [--dry-run]");
-                return Some(ExitCode::FAILURE);
-            };
-            let dry_run = std::env::args().any(|argument| argument == "--dry-run");
-            Some(gc(&config_path, dry_run))
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            Some(gc_command(&args))
         }
         // `spindle verify <config>` -- check every room exhaustively and
         // exit non-zero when anything is wrong (#818). Offline like `gc`:
@@ -221,17 +217,76 @@ fn verify(config_path: &str) -> ExitCode {
     }
 }
 
-/// Collect the store's unreachable state-trie nodes, or with `dry_run`
-/// count them.
-fn gc(config_path: &str, dry_run: bool) -> ExitCode {
-    let Some(store) = open_store(config_path) else {
+// `concat!` of whole lines, not a `\` continuation: a continuation drops the
+// next line's leading spaces, which flattened the option list.
+const GC_USAGE: &str = concat!(
+    "usage: spindle gc <config> [--dry-run] [--max-marks N]\n",
+    "  Deletes state-trie nodes that no stored record reaches. The server must be stopped.\n",
+    "  --dry-run      report what would be deleted and delete nothing\n",
+    "  --max-marks N  hold at most N reachable-node addresses in memory (default 4194304,\n",
+    "                 about 200 MB); the rest go to a scratch database next to the store,\n",
+    "                 removed when the run ends. The result does not depend on N.",
+);
+
+/// Parse `gc`'s arguments and run it.
+fn gc_command(args: &[String]) -> ExitCode {
+    let mut config_path = None;
+    let mut dry_run = false;
+    let mut max_marks = spindle_store::gc::DEFAULT_MAX_MARKS;
+    let mut iter = args.iter();
+    while let Some(argument) = iter.next() {
+        match argument.as_str() {
+            "--dry-run" => dry_run = true,
+            "--max-marks" => match iter.next().and_then(|value| value.parse::<usize>().ok()) {
+                Some(value) if value > 0 => max_marks = value,
+                _ => {
+                    eprintln!("{GC_USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--help" | "-h" => {
+                println!("{GC_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with('-') && config_path.is_none() => {
+                config_path = Some(other.to_owned());
+            }
+            _ => {
+                eprintln!("{GC_USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(config_path) = config_path else {
+        eprintln!("{GC_USAGE}");
         return ExitCode::FAILURE;
     };
-    match spindle_store::gc::collect_state_nodes(&store, dry_run) {
+    gc(&config_path, dry_run, max_marks)
+}
+
+/// Collect the store's unreachable state-trie nodes, or with `dry_run`
+/// count them.
+fn gc(config_path: &str, dry_run: bool, max_marks: usize) -> ExitCode {
+    let Some((store, config)) = open_store_with_config(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    // Beside the store, not in the system temp directory: the spill can
+    // reach gigabytes and the store's disk is the one sized for that.
+    let mut scratch = config.storage.path.clone().into_os_string();
+    scratch.push(".gc-scratch");
+    let options = spindle_store::gc::GcOptions {
+        max_marks,
+        scratch: Some(scratch.into()),
+    };
+    match spindle_store::gc::collect_state_nodes_with(&store, dry_run, &options) {
         Ok(report) => {
             println!(
                 "gc: {} root-holding rows; {} reachable state nodes ({} bytes, {} node reads)",
                 report.holders, report.marked, report.marked_bytes, report.node_reads
+            );
+            println!(
+                "gc: at most {} marked addresses in memory, {} spilled to disk",
+                report.peak_marked, report.spilled
             );
             let verb = if dry_run { "would sweep" } else { "swept" };
             println!(
