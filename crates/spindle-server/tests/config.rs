@@ -767,3 +767,34 @@ fn an_upstream_issuer_is_https_unless_loopback_or_explicitly_insecure() {
 fn an_upstream_email_claim_cannot_be_redirected() {
     assert!(upstream("https://sso.example.org", "email_claim = \"mail\"\n").is_err());
 }
+
+#[test]
+fn storage_durability_defaults_to_group_and_takes_the_three_modes() {
+    use spindle_server::config::DurabilityMode;
+    let config = parse("[server]\nname='example.org'\n").unwrap();
+    assert_eq!(config.storage.durability, DurabilityMode::Group);
+    assert_eq!(config.storage.relaxed_sync_interval_ms, 1000);
+    for (text, mode) in [
+        ("strict", DurabilityMode::Strict),
+        ("group", DurabilityMode::Group),
+        ("relaxed", DurabilityMode::Relaxed),
+    ] {
+        let config = parse(&format!(
+            "[server]\nname='example.org'\n[storage]\ndurability='{text}'\nrelaxed_sync_interval_ms=250\n"
+        ))
+        .unwrap();
+        assert_eq!(config.storage.durability, mode);
+        assert_eq!(config.storage.relaxed_sync_interval_ms, 250);
+    }
+    parse("[server]\nname='example.org'\n[storage]\ndurability='fast'\n")
+        .expect_err("an unknown mode is refused, not defaulted");
+    let error = parse("[server]\nname='example.org'\n[storage]\nrelaxed_sync_interval_ms=0\n")
+        .expect_err("a zero interval is refused");
+    assert!(matches!(
+        error,
+        ConfigError::Invalid {
+            field: "storage.relaxed_sync_interval_ms",
+            ..
+        }
+    ));
+}

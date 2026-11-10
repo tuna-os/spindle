@@ -608,10 +608,13 @@ microseconds. Three configurable modes:
 | `group` *(default)* | fsync batched, ≤1 ms window, response after batch | General |
 | `relaxed` | OS page cache, periodic fsync | Ephemeral / test |
 
-**Status.** The modes exist in the store, but no setting chooses one. The room
-log always uses `group`, and `relaxed` has no periodic fsync (#810). Account,
-token and key writes ask for a `group` sync of their own. There is one journal
-for the whole store, not one for each shard.
+**Status.** All three modes are built. `[storage] durability` chooses one, and
+`group` is the default. The mode applies to room commits. Account, token,
+device, one-time key and signing key writes never fall below `group`: `strict`
+raises them to `strict`, and `relaxed` leaves them at `group`. Under `relaxed`
+a timer fsyncs the journal every `[storage] relaxed_sync_interval_ms` (1 s by
+default), so a crash loses at most that window. A batch can now delete as well
+as write. There is one journal for the whole store, not one for each shard.
 
 Because ordering is decided before durability, a crash can only lose a suffix of
 the log — never reorder it, never fork it. Recovery truncates to the last

@@ -1633,6 +1633,47 @@ pub struct StorageConfig {
     /// means no limit.
     #[serde(default = "default_max_resident_rooms")]
     pub max_resident_rooms: usize,
+    /// How hard a commit is made durable before it is acknowledged.
+    /// `group` (the default) shares one fsync between concurrent commits.
+    /// See [`DurabilityMode`] for what each mode does to security writes.
+    #[serde(default)]
+    pub durability: DurabilityMode,
+    /// Under `relaxed`, how often the journal is fsynced in the background,
+    /// in milliseconds. A crash loses at most about this much. Ignored in
+    /// the other modes. Must be above zero.
+    #[serde(default = "default_relaxed_sync_interval_ms")]
+    pub relaxed_sync_interval_ms: u64,
+}
+
+/// `[storage] durability`: SPEC §8.3's three modes.
+///
+/// Security writes (tokens, accounts, devices, one-time keys, the signing
+/// key) ask the store for `group` at least. `strict` raises them to
+/// `strict`. `relaxed` leaves them at `group`: only room commits relax.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DurabilityMode {
+    /// fsync data and metadata before every acknowledgement.
+    Strict,
+    /// One fsync shared by concurrent commits, before they are acknowledged.
+    #[default]
+    Group,
+    /// Room commits wait for the OS page cache only; a timer fsyncs them.
+    Relaxed,
+}
+
+impl From<DurabilityMode> for spindle_store::Durability {
+    fn from(mode: DurabilityMode) -> Self {
+        match mode {
+            DurabilityMode::Strict => Self::Strict,
+            DurabilityMode::Group => Self::Group,
+            DurabilityMode::Relaxed => Self::Relaxed,
+        }
+    }
+}
+
+fn default_relaxed_sync_interval_ms() -> u64 {
+    1000
 }
 
 fn default_max_resident_rooms() -> usize {
@@ -1703,6 +1744,8 @@ impl Default for StorageConfig {
             s3: None,
             warm_concurrency: default_warm_concurrency(),
             max_resident_rooms: default_max_resident_rooms(),
+            durability: DurabilityMode::default(),
+            relaxed_sync_interval_ms: default_relaxed_sync_interval_ms(),
         }
     }
 }
@@ -1930,6 +1973,16 @@ impl Config {
         Ok(())
     }
 
+    fn validate_storage(&self) -> Result<(), ConfigError> {
+        if self.storage.relaxed_sync_interval_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "storage.relaxed_sync_interval_ms",
+                message: "must be greater than zero; a zero interval would never wait".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_rooms(&self) -> Result<(), ConfigError> {
         // One extremity is a room with no fork; a threshold below two would
         // send a dummy event into a room after every fork, however young.
@@ -2019,6 +2072,7 @@ impl Config {
         // it meant something else, so say so rather than starting.
         self.validate_delayed_events()?;
         self.validate_rooms()?;
+        self.validate_storage()?;
         self.validate_peers()?;
         self.validate_ratelimit()?;
         for (field, value) in [

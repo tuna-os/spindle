@@ -15,6 +15,9 @@ use spindle_core::{EventId, LogEntry};
 use super::{RoomError, Rooms, StateAtAnchor, event_body_key};
 use crate::admin::AdminActor;
 
+/// Body deletes per atomic batch in a purge.
+const PURGE_BATCH: usize = 1024;
+
 /// One log entry as the admin timeline shows it: the spine always, the
 /// body only while it exists. `json: None` with the entry present is the
 /// mark of a purge — the distinction #83 §3 says a purge must preserve.
@@ -364,15 +367,25 @@ impl RoomAdmin<'_> {
                 }
             }
         }
-        let mut purged = 0;
+        let mut doomed = Vec::new();
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);
             if spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)?.is_some() {
-                spindle_store::Store::delete(self.rooms.store.as_ref(), &key)?;
-                purged += 1;
+                doomed.push(spindle_store::BatchOp::Delete(key));
             }
         }
-        Ok(purged)
+        // Batched and synced: a purge is a promise that content is gone, so
+        // a power cut must not bring bodies back that the call reported
+        // deleted. Chunks keep one batch from growing without bound; the
+        // watermark above already makes a half-done purge read as purged.
+        for chunk in doomed.chunks(PURGE_BATCH) {
+            spindle_store::Store::commit_ops(
+                self.rooms.store.as_ref(),
+                chunk,
+                spindle_store::Durability::Group,
+            )?;
+        }
+        Ok(doomed.len() as u64)
     }
 
     /// One state event's content, read as an operator.

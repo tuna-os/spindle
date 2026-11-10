@@ -102,6 +102,27 @@ impl Store for FaultyStore {
         self.sync(durability)
     }
 
+    fn commit_ops_deferred(&self, ops: &[spindle_store::BatchOp]) -> Result<(), StoreError> {
+        let mut remaining = self.commits_before_failure.borrow_mut();
+        if *remaining == 0 {
+            return Err(StoreError::Backend("injected fault".to_owned()));
+        }
+        *remaining -= 1;
+        *self.writes_seen.borrow_mut() += ops.len();
+        let mut data = self.data.borrow_mut();
+        for op in ops {
+            match op {
+                spindle_store::BatchOp::Put(key, value) => {
+                    data.insert(key.clone(), value.clone());
+                }
+                spindle_store::BatchOp::Delete(key) => {
+                    data.remove(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
         let mut remaining = self.commits_before_failure.borrow_mut();
         if *remaining == 0 {

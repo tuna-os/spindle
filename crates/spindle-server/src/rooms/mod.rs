@@ -27,7 +27,7 @@ use spindle_core::{
     AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
     StateRoot, StateSnapshot, is_state_dag,
 };
-use spindle_store::{Durability, FjallStore, RoomStore, Store, StoreError};
+use spindle_store::{FjallStore, RoomStore, Store, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
 pub const ROOM_VERSION: &str = "11";
@@ -914,7 +914,7 @@ impl Rooms {
                         room_id.as_bytes().to_vec(),
                     ),
                 ],
-                Durability::Group,
+                self.store.durability(),
             )?;
             let key = StateKey::new(event_type.as_str(), state_key.as_str());
             if event_type == "m.room.member"
@@ -953,7 +953,7 @@ impl Rooms {
                 ));
                 retained += 1;
             }
-            spindle_store::Store::commit(rooms.store.as_ref(), &writes, Durability::Group)?;
+            spindle_store::Store::commit(rooms.store.as_ref(), &writes, rooms.store.durability())?;
             Ok(retained)
         })
     }
@@ -985,7 +985,7 @@ impl Rooms {
                 log,
                 &markers,
                 &writes,
-                Durability::Group,
+                rooms.store.durability(),
             )?;
             Ok(markers.len())
         })
@@ -1057,7 +1057,7 @@ impl Rooms {
             let body = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
             self.index_membership(room_id, Some(&user_id), &body["content"], li)?;
         }
-        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        spindle_store::Store::sync(self.store.as_ref(), self.store.durability())?;
         Ok(present.len())
     }
 
@@ -1110,7 +1110,7 @@ impl Rooms {
                 room_id.as_bytes().to_vec(),
             ));
         }
-        spindle_store::Store::commit(self.store.as_ref(), &writes, Durability::Group)?;
+        spindle_store::Store::commit(self.store.as_ref(), &writes, self.store.durability())?;
         Ok(())
     }
 
@@ -5895,7 +5895,7 @@ impl Rooms {
         let synced = if self.store.journalled() == before {
             Ok(())
         } else {
-            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)
+            spindle_store::Store::sync(self.store.as_ref(), self.store.durability())
         };
         // A write the store refused leaves this room's log ahead of it: the
         // entry is appended in memory before its batch is committed, and a
