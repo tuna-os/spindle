@@ -1306,6 +1306,53 @@ mod tests {
         );
     }
 
+    /// The hourly retention job removes old cached copies and keeps a
+    /// quarantined one: the operator holds it as evidence.
+    #[tokio::test]
+    async fn the_retention_job_never_removes_quarantined_media() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Arc::new(Media::new(store, blobs, "example.org"));
+        for id in ["plain", "held"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        media
+            .quarantine_remote("remote.example", "held", "@admin:example.org")
+            .unwrap();
+        let held = Media::remote_id("remote.example", "held");
+        let plain = Media::remote_id("remote.example", "plain");
+        // Zero days makes every cached copy old enough.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job = tokio::spawn(retention_loop(
+            Arc::downgrade(&media),
+            0,
+            Duration::from_secs(3600),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while media.record(&plain).unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job removes the unquarantined copy");
+        job.abort();
+        let kept = media
+            .record(&held)
+            .unwrap()
+            .expect("quarantined record kept");
+        assert!(kept.quarantined_by.is_some());
+        assert!(
+            media.blobs.get(&kept.hash).await.unwrap().is_some(),
+            "its bytes are kept"
+        );
+    }
+
     #[test]
     fn a_filename_cannot_inject_a_header() {
         // The uploader chooses the name, so it is attacker-controlled input
