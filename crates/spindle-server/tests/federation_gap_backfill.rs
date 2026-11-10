@@ -1884,3 +1884,107 @@ async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
         "{context}"
     );
 }
+
+/// `type/state_key -> event_id` of a list of state events.
+fn keyed(events: &[Value]) -> BTreeMap<String, String> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                format!(
+                    "{}/{}",
+                    event["type"].as_str().unwrap(),
+                    event["state_key"].as_str().unwrap()
+                ),
+                event["event_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A client's state after one sync of `room`: classic clients fold the
+/// state block and then the timeline, MSC4222 ones take the block after.
+fn fold_sync(held: &mut BTreeMap<String, String>, room: &Value, state_after: bool) {
+    let events = |block: &Value| block["events"].as_array().cloned().unwrap_or_default();
+    if state_after {
+        held.extend(keyed(&events(&room["state_after"])));
+    } else {
+        let mut seen = events(&room["state"]);
+        seen.extend(events(&room["timeline"]));
+        seen.retain(|event| event.get("state_key").is_some());
+        for event in &seen {
+            held.extend(keyed(std::slice::from_ref(event)));
+        }
+    }
+}
+
+/// A member who joined inside a gap reaches a client's incremental sync
+/// (#819). The join has no stream row, so only the change of the room's
+/// current state can carry it: a client that never hears of carol would not
+/// share keys with her in an encrypted room.
+///
+/// Both kinds of client fold what they are sent over what they held and
+/// must end with the room's own state.
+#[tokio::test]
+async fn a_member_who_joined_inside_a_gap_reaches_an_incremental_sync() {
+    let harness = Harness::new(Setup::default()).await;
+    let history = harness.history(3);
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    let token = harness.login_alice().await;
+    let path = |since: Option<&str>, state_after: bool| {
+        format!(
+            "/_matrix/client/v3/sync?timeout=0&use_state_after={state_after}{}",
+            since.map_or_else(String::new, |since| format!("&since={since}"))
+        )
+    };
+    let mut views = Vec::new();
+    for state_after in [false, true] {
+        let body = harness
+            .client("GET", &path(None, state_after), &token, None)
+            .await;
+        let mut held = BTreeMap::new();
+        fold_sync(
+            &mut held,
+            &body["rooms"]["join"][&harness.room],
+            state_after,
+        );
+        let since = body["next_batch"].as_str().unwrap().to_owned();
+        views.push((state_after, since, held));
+    }
+
+    accept_gap(&harness, &latest).await;
+
+    let state = harness
+        .client(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{}/state", harness.room),
+            &token,
+            None,
+        )
+        .await;
+    let room_state = keyed(state.as_array().unwrap());
+    assert!(
+        room_state.contains_key(&format!("m.room.member/{carol}")),
+        "the gap's join is in the room's state: {room_state:?}"
+    );
+    for (state_after, since, mut held) in views {
+        let body = harness
+            .client("GET", &path(Some(&since), state_after), &token, None)
+            .await;
+        fold_sync(
+            &mut held,
+            &body["rooms"]["join"][&harness.room],
+            state_after,
+        );
+        assert_eq!(
+            held, room_state,
+            "a client with state_after = {state_after} does not hold the room's state"
+        );
+    }
+}

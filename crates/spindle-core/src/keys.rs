@@ -548,6 +548,17 @@ pub enum Keyspace {
     /// the first acknowledged transaction; a healthy destination has no
     /// row.
     DestinationRetry = 0x65,
+    /// `(room_id, stream_id)` -> the change an append made to the room's
+    /// *current* state beyond the event itself (#819).
+    ///
+    /// Written in the batch of the event that caused it, under that event's
+    /// stream id, and only when a fork, a merge or a gap acceptance moved the
+    /// current state by more than the event. The value is JSON: the log index
+    /// of the event, and the `(type, state_key, event_id)` of every key whose
+    /// current event it set. A linear append has no row, because the event is
+    /// the whole change and the timeline carries it. Absent from a store
+    /// written before it existed, which then reads as "nothing but the events".
+    RoomStateDelta = 0x66,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -1078,6 +1089,23 @@ pub fn delayed_event_by_id(delay_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEventById as u8];
     key.extend_from_slice(delay_id.as_bytes());
     key
+}
+
+/// One room's row in the current-state delta index.
+///
+/// See [`Keyspace::RoomStateDelta`]. The stream id is big-endian after the
+/// room, as in [`room_stream`], so a scan starts at a client's token.
+#[must_use]
+pub fn room_state_delta(room_id: &str, stream_id: u64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::RoomStateDelta, room_id);
+    key.extend_from_slice(&stream_id.to_be_bytes());
+    key
+}
+
+/// The prefix every current-state delta row for one room shares.
+#[must_use]
+pub fn room_state_delta_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RoomStateDelta, room_id)
 }
 
 /// The prefix every reverse-index row for one room shares.

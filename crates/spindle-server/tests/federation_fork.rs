@@ -1600,3 +1600,283 @@ async fn a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_
         "/state_ids disagrees with the client's view of the room"
     );
 }
+
+/// A client's view of one room's state, kept the way its kind of client
+/// keeps it, so a test can ask whether what a sync said adds up to what the
+/// room holds (#819).
+struct ClientView {
+    /// MSC4222: the block after the timeline is the answer, and the
+    /// timeline's state events are not folded into it.
+    state_after: bool,
+    since: Option<String>,
+    state: std::collections::BTreeMap<String, String>,
+}
+
+impl ClientView {
+    fn new(state_after: bool) -> Self {
+        Self {
+            state_after,
+            since: None,
+            state: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Sync once and apply what the room's entry says. Returns the entry.
+    async fn sync(&mut self, harness: &Harness, token: &str, room: &str, limit: usize) -> Value {
+        let path = format!(
+            "/_matrix/client/v3/sync?timeout=0&timeline_limit={limit}&use_state_after={}{}",
+            self.state_after,
+            self.since
+                .as_ref()
+                .map_or_else(String::new, |since| format!("&since={since}"))
+        );
+        let (status, body) = harness.get(&path, token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        self.since = Some(body["next_batch"].as_str().unwrap().to_owned());
+        let entry = body["rooms"]["join"][room].clone();
+        let key = |event: &Value| {
+            format!(
+                "{}/{}",
+                event["type"].as_str().unwrap_or_default(),
+                event["state_key"].as_str().unwrap_or_default()
+            )
+        };
+        let events = |block: &Value| block["events"].as_array().cloned().unwrap_or_default();
+        if self.state_after {
+            for event in events(&entry["state_after"]) {
+                self.state
+                    .insert(key(&event), event["event_id"].as_str().unwrap().to_owned());
+            }
+        } else {
+            let state = events(&entry["state"]);
+            let timeline = events(&entry["timeline"]);
+            for event in state.iter().chain(timeline.iter()) {
+                if event.get("state_key").is_some() {
+                    self.state
+                        .insert(key(event), event["event_id"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        entry
+    }
+
+    async fn agrees_with_the_room(&self, harness: &Harness, token: &str, room: &str) {
+        let held = harness.state_ids(room, token).await;
+        assert_eq!(
+            self.state,
+            held,
+            "a {} client's state is not the room's (#819)",
+            if self.state_after {
+                "state_after"
+            } else {
+                "classic"
+            }
+        );
+    }
+}
+
+/// An event on a stale parent is appended last and loses state resolution.
+/// A `state_after` client is told the block *is* the state, so it must be
+/// told the winner and not the last topic of the timeline (#819).
+///
+/// The loser is in the timeline, where a classic client folds it; that is
+/// the protocol's own limit, so only the `state_after` client is held to
+/// the room here. Both are held in the next test, where the loser is not in
+/// the window.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_state_after_client_is_told_the_topic_that_won_not_the_one_that_arrived_last() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+    let mut client = ClientView::new(true);
+    client.sync(&harness, &alice, &room, 20).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Older than ours, so it loses; appended after ours, so the timeline
+    // ends on it.
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "theirs" }),
+        now_millis() - 60_000,
+    );
+    let theirs = injected_id(&harness.inject(&peer, "loser", pdu).await);
+    let held = harness.state_ids(&room, &alice).await;
+    assert_eq!(held.get("m.room.topic/"), Some(&ours), "the scenario loses");
+
+    let entry = client.sync(&harness, &alice, &room, 20).await;
+    let timeline: Vec<&str> = entry["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect();
+    assert_eq!(timeline.last(), Some(&theirs.as_str()), "{entry}");
+    client.agrees_with_the_room(&harness, &alice, &room).await;
+
+    // And after the merge a later sync keeps agreeing.
+    harness.say(&room, &alice, "after").await;
+    client.sync(&harness, &alice, &room, 20).await;
+    client.agrees_with_the_room(&harness, &alice, &room).await;
+}
+
+/// A span a limited sync skips holds an event that lost resolution. The
+/// classic `state` block must name what the room holds, not the loser the
+/// skipped span ended on (#819, on top of #820).
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_limited_sync_does_not_state_a_topic_that_lost_in_the_span_it_skipped() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+    let mut classic = ClientView::new(false);
+    let mut after = ClientView::new(true);
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "theirs" }),
+        now_millis() - 60_000,
+    );
+    harness.inject(&peer, "loser", pdu).await;
+    // Newer messages push both topics out of a one-event window.
+    harness.say(&room, &alice, "newer").await;
+    let held = harness.state_ids(&room, &alice).await;
+    assert_eq!(held.get("m.room.topic/"), Some(&ours), "the scenario loses");
+
+    for client in [&mut classic, &mut after] {
+        let entry = client.sync(&harness, &alice, &room, 1).await;
+        assert_eq!(entry["timeline"]["limited"], json!(true), "{entry}");
+        client.agrees_with_the_room(&harness, &alice, &room).await;
+    }
+}
+
+/// A key put back to an older event is delivered, to a classic client, a
+/// `state_after` client and a sliding-sync client alike (#819).
+///
+/// The peer sets the topic, alice overwrites it, and then the peer lowers
+/// alice's power on a stale branch. Resolution takes alice's topic away and
+/// the room holds the peer's again: an event no window of the stream
+/// carries, because it entered the stream long ago.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_topic_put_back_to_an_older_event_reaches_every_kind_of_client() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, _) = harness.shared_room(&peer).await;
+    // Alice may write the topic, but the peer outranks her.
+    let (status, _) = harness
+        .put_state(
+            &room,
+            &alice,
+            "m.room.power_levels",
+            &json!({
+                "users": { "@alice:example.org": 50, peer.user(): 100 },
+                "users_default": 0, "state_default": 50, "events_default": 0,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let head = harness.head_event(&room, &alice).await;
+    let pdu = harness.stale_state(
+        &peer,
+        &room,
+        &head,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "the peer's" }),
+    );
+    let first = injected_id(&harness.inject(&peer, "first-topic", pdu).await);
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut classic = ClientView::new(false);
+    let mut after = ClientView::new(true);
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+    classic.agrees_with_the_room(&harness, &alice, &room).await;
+    assert_eq!(classic.state.get("m.room.topic/"), Some(&ours));
+    let sliding = json!({ "lists": { "main": {
+        "ranges": [[0, 5]], "timeline_limit": 5,
+        "required_state": [["m.room.topic", ""]],
+    } } });
+    let path = "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync";
+    let (status, first_sliding) = harness.send("POST", path, &alice, &sliding).await;
+    assert_eq!(status, StatusCode::OK, "{first_sliding}");
+    let pos = first_sliding["pos"].as_str().unwrap().to_owned();
+
+    // Alice loses her power on a branch that never saw her topic.
+    let levels = json!({
+        "users": { "@alice:example.org": 0, peer.user(): 100 },
+        "users_default": 0, "state_default": 50, "events_default": 0,
+    });
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &first,
+        "m.room.power_levels",
+        "",
+        &levels,
+        harness.just_after(&peer, &ours).await,
+    );
+    harness.inject(&peer, "demote", pdu).await;
+    let current = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        current.get("m.room.topic/"),
+        Some(&first),
+        "the scenario must put the topic back"
+    );
+
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+    classic.agrees_with_the_room(&harness, &alice, &room).await;
+    after.agrees_with_the_room(&harness, &alice, &room).await;
+
+    let (status, second) = harness
+        .send("POST", &format!("{path}?pos={pos}"), &alice, &sliding)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let sent: Vec<&str> = second["rooms"][&room]["required_state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the topic put back was not sent: {second}"))
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect();
+    assert_eq!(sent, vec![first.as_str()], "{second}");
+}
