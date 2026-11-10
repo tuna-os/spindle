@@ -1367,7 +1367,19 @@ pub(crate) async fn federation_origin(
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
-    state
+    let refused = || {
+        state
+            .federation
+            .metrics()
+            .record_federation_listed(crate::metrics::ListedDirection::Inbound);
+        MatrixError::forbidden("this server does not federate with your server")
+    };
+    // Before the signature check, which would fetch the refused server's
+    // keys: that fetch is itself refused, and would answer 401.
+    if state.federation.listed_out_origin(authorization).is_some() {
+        return Err(refused());
+    }
+    let origin = state
         .federation
         .verify_request(authorization, method, uri, content)
         .await
@@ -1378,7 +1390,13 @@ pub(crate) async fn federation_origin(
                 "M_UNAUTHORIZED",
                 "the request signature is not valid".to_owned(),
             )
-        })
+        })?;
+    // Every federation route authenticates here, so this covers them all.
+    // Nothing of a refused request is read or stored.
+    if !state.federation.server_permitted(&origin) {
+        return Err(refused());
+    }
+    Ok(origin)
 }
 
 /// Authenticate a federation request AND require the origin in the room

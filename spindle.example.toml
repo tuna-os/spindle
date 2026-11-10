@@ -260,6 +260,14 @@ gap_acceptance_window_secs = 600
 # 0 turns this off.
 dependency_failure_ttl_secs = 300
 
+# Servers this server federates with, as globs (`*`, `?`) like a room's
+# m.room.server_acl. Empty allows every server that `deny` does not name.
+# Set, only these servers are reached or answered. A change needs a restart.
+allow = []
+
+# Servers refused in every room, in both directions, whatever `allow` says.
+deny = []
+
 # MSC3995 hub mode (#22, SPEC section 12.6), between Spindle servers that
 # both turn it on. Only a build with the `hub-mode` Cargo feature can enable
 # it; any other build refuses to start with enabled = true. Off, an

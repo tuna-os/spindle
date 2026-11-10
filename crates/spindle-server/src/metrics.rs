@@ -398,6 +398,8 @@ pub struct Metrics {
     backfill_events: [AtomicU64; BackfillEvent::ALL.len()],
     /// Recorded federation gaps not yet filled (a gauge).
     gaps_remaining: AtomicU64,
+    /// Requests refused by `[federation] allow`/`deny`, by direction.
+    federation_listed: [AtomicU64; 2],
     /// Peer signing-key lookups and event signature failures.
     keys: KeyMetrics,
     auth: AuthCounters,
@@ -481,6 +483,7 @@ impl Default for Metrics {
             backfill_latency: Family::default(),
             backfill_events: Default::default(),
             gaps_remaining: AtomicU64::new(0),
+            federation_listed: [AtomicU64::new(0), AtomicU64::new(0)],
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
@@ -2572,6 +2575,13 @@ impl SignatureFailure {
     }
 }
 
+/// Which way a request refused by `[federation] allow`/`deny` was going.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListedDirection {
+    Inbound = 0,
+    Outbound = 1,
+}
+
 /// Key lookups by source and result, and signature failures by reason.
 /// Fixed enum labels only: no server name, so a peer cannot mint series.
 #[derive(Debug, Default)]
@@ -2581,6 +2591,17 @@ struct KeyMetrics {
 }
 
 impl Metrics {
+    /// Record one request refused by `[federation] allow`/`deny`.
+    pub fn record_federation_listed(&self, direction: ListedDirection) {
+        self.federation_listed[direction as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the refused-by-list counter, for tests.
+    #[must_use]
+    pub fn federation_listed_count(&self, direction: ListedDirection) -> u64 {
+        self.federation_listed[direction as usize].load(Ordering::Relaxed)
+    }
+
     /// Record one lookup of a peer's signing keys.
     pub fn record_key_fetch(&self, source: KeySource, result: KeyFetchResult) {
         self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
@@ -2607,6 +2628,21 @@ impl Metrics {
     }
 
     fn render_keys(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_listed_refusals_total Federation requests refused \
+         because `[federation] allow` or `deny` does not permit the server, by direction.\n\
+         # TYPE spindle_federation_listed_refusals_total counter\n",
+        );
+        for (direction, label) in [
+            (ListedDirection::Inbound, "inbound"),
+            (ListedDirection::Outbound, "outbound"),
+        ] {
+            let _ = writeln!(
+                out,
+                "spindle_federation_listed_refusals_total{{direction=\"{label}\"}} {}",
+                self.federation_listed_count(direction)
+            );
+        }
         out.push_str(
             "# HELP spindle_federation_key_fetches_total Lookups of a peer's signing \
          keys, by where they were answered from and how.\n\

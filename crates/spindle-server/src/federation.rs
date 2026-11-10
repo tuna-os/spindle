@@ -135,6 +135,10 @@ pub struct Federation {
     /// `[federation] enabled`. Off refuses every outbound request in
     /// [`Federation::base_url`], the one place each of them is addressed.
     enabled: bool,
+    /// `[federation] allow` and `deny`. Checked in [`Federation::address`]
+    /// beside `enabled`, so one place covers every outbound request.
+    allow: Vec<String>,
+    deny: Vec<String>,
     /// What each server name's `.well-known/matrix/server` said; shared
     /// with every [`Discovery`] handed out, so one fetch serves them all.
     delegations: Arc<Delegations>,
@@ -561,6 +565,8 @@ impl Federation {
             durable_edus: edu_outbox::EduOutbox::default(),
             receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             enabled: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
             delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             well_known_port: 443,
             destinations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -625,6 +631,32 @@ impl Federation {
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
+    }
+
+    /// Restrict federation to `allow` (when not empty) and never `deny`
+    /// (`[federation] allow`, `deny`).
+    #[must_use]
+    pub fn with_server_lists(mut self, allow: &[String], deny: &[String]) -> Self {
+        self.allow = allow.to_vec();
+        self.deny = deny.to_vec();
+        self
+    }
+
+    /// Whether the server-wide lists let this server talk to `name`. The
+    /// deny list wins; an empty allow list admits everyone else.
+    #[must_use]
+    pub fn server_permitted(&self, name: &str) -> bool {
+        use crate::server_acl::matches_any;
+        !matches_any(&self.deny, name) && (self.allow.is_empty() || matches_any(&self.allow, name))
+    }
+
+    /// The origin an `X-Matrix` header names, if the lists refuse it. A
+    /// refused server's keys are never fetched, so its signature cannot be
+    /// checked; the header's claim is enough to turn it away.
+    #[must_use]
+    pub fn listed_out_origin(&self, authorization: Option<&str>) -> Option<String> {
+        let origin = parse_x_matrix(authorization?).ok()?.origin;
+        (!self.server_permitted(&origin)).then_some(origin)
     }
 
     /// Whether this server federates at all.
@@ -700,6 +732,13 @@ impl Federation {
         if !self.enabled {
             return Err(FederationError::Refused(format!(
                 "federation is disabled on this server; not contacting {name}"
+            )));
+        }
+        if !self.server_permitted(name) {
+            self.metrics
+                .record_federation_listed(crate::metrics::ListedDirection::Outbound);
+            return Err(FederationError::Refused(format!(
+                "{name} is not permitted by [federation] allow/deny; not contacting it"
             )));
         }
         // A configured peer goes where the operator said, and its host is
@@ -3223,6 +3262,10 @@ fn plan_transactions(
     {
         by_destination.entry(destination).or_default();
     }
+    // A destination `[federation] allow`/`deny` refuses is not planned at
+    // all: its rows wait, unsent and without backoff, so removing it from
+    // the deny list delivers them. Planning it would only fail in `address`.
+    by_destination.retain(|destination, _| federation.server_permitted(destination));
     let now = now_millis();
     let (healthy, due): (Vec<&String>, Vec<&String>) = by_destination
         .keys()

@@ -62,6 +62,16 @@ impl ServerAcl {
     }
 }
 
+/// Whether `server_name`, port stripped, matches any of `patterns`, with
+/// the same `*` and `?` globs and case folding a room's ACL uses. The
+/// server-wide federation lists (`[federation] allow` and `deny`) call this
+/// so the two never differ on what a pattern means.
+#[must_use]
+pub fn matches_any(patterns: &[String], server_name: &str) -> bool {
+    let host = strip_port(server_name);
+    patterns.iter().any(|pattern| glob_matches(pattern, host))
+}
+
 /// The host part of a server name: a trailing `:port` removed, a bracketed
 /// IPv6 literal left whole.
 fn strip_port(name: &str) -> &str {
