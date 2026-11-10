@@ -158,6 +158,8 @@ old index rows, reads each stored message body and writes the rows again.
 It prints the number of rooms, log entries and rows. A room without an
 index is still searched correctly. The search scans it.
 
+A truncation removes the index rows of the entries it deletes.
+
 ## Collecting unreachable state
 
 ```

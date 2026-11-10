@@ -71,6 +71,15 @@ pub fn rows(room_id: &str, li: LinearIndex, body: &str) -> Vec<Record> {
     out
 }
 
+/// The posting keys of `body` at `li`.
+#[must_use]
+pub fn posting_keys(room_id: &str, li: LinearIndex, body: &str) -> Vec<Vec<u8>> {
+    words_of(body)
+        .iter()
+        .map(|word| keys::search_posting(room_id, word, li))
+        .collect()
+}
+
 /// Remove the postings of `body` at `li`. The vocabulary stays: a stale
 /// word costs one empty scan.
 ///

@@ -365,6 +365,8 @@ impl Rooms {
             return Ok(report);
         }
         let keep = self.bodies_to_keep(room_id, log)?;
+        // Before the bodies go: the words to drop are read from them.
+        report.index_rows += self.unindex_doomed(room_id, &doomed)?;
         let (mut bodies, mut reverse) = (Vec::new(), Vec::new());
         for (_, record) in &doomed {
             if !keep.contains(&record.event_id) {
@@ -391,6 +393,36 @@ impl Rooms {
         report.entries = delete_counting(store, &log_keys)?;
         Store::sync(store, Durability::Group)?;
         Ok(report)
+    }
+
+    /// Drop the search postings (#830) of the entries a truncation removes.
+    /// Retention does not go through `purge_history`, so nothing else would.
+    /// The posting of an entry that is gone can never be a search hit, so
+    /// this covers kept bodies too.
+    fn unindex_doomed(
+        &self,
+        room_id: &str,
+        doomed: &[(Vec<u8>, EntryRecord)],
+    ) -> Result<u64, RoomError> {
+        if !self.search_indexed() {
+            return Ok(0);
+        }
+        let mut keys = Vec::new();
+        for (_, record) in doomed {
+            let body = match self.read_event(room_id, &EventId::new(record.event_id.as_str())) {
+                Ok(body) => body,
+                Err(RoomError::MissingBody(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(text) = crate::search_index::body_of(&body) {
+                keys.extend(crate::search_index::posting_keys(
+                    room_id,
+                    LinearIndex::from_raw(record.li),
+                    text,
+                ));
+            }
+        }
+        Ok(delete_counting(self.store.as_ref(), &keys)?)
     }
 
     /// The events whose bodies outlive a truncation: the auth chain of

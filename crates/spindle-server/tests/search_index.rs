@@ -434,3 +434,82 @@ async fn an_event_sent_while_the_index_was_off_is_still_found() {
         json!(1)
     );
 }
+
+#[test]
+fn a_retention_truncation_takes_the_removed_events_postings_with_it() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap();
+    let rooms = spindle_server::rooms::Rooms::new(Arc::clone(&store), "example.org");
+    rooms.set_search_index(true);
+    let alice = "@alice:example.org";
+    let room = rooms
+        .create(
+            alice,
+            key.pair(),
+            Some("indexed"),
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+    let mut ids = Vec::new();
+    for n in 0..8 {
+        let id = rooms
+            .send(
+                &room,
+                alice,
+                key.pair(),
+                "m.room.message",
+                &json!({ "msgtype": "m.text", "body": format!("truncword n{n}") }),
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let log = spindle_store::RoomStore::new(store.as_ref(), room.as_str())
+        .load_exhaustive()
+        .unwrap()
+        .unwrap()
+        .log;
+    let lis: Vec<i64> = ids
+        .iter()
+        .map(|id| {
+            log.get(&spindle_core::EventId::new(id.as_str()))
+                .unwrap()
+                .li
+                .get()
+        })
+        .collect();
+    let postings = |word: &str| {
+        store
+            .scan_prefix(&spindle_core::keys::search_posting_prefix(&room, word))
+            .unwrap()
+            .len()
+    };
+    assert_eq!(postings("truncword"), 8);
+    let floor = lis[5];
+    let report = rooms.truncate_room_log(&room, floor).unwrap();
+    assert!(report.entries > 0 && report.floor <= floor, "{report:?}");
+    // The truncation keeps the entry of a parent that a kept entry names, so
+    // count what the log still holds instead of what the floor implies.
+    let after = spindle_store::RoomStore::new(store.as_ref(), room.as_str())
+        .load_exhaustive()
+        .unwrap()
+        .unwrap()
+        .log;
+    let kept = lis
+        .iter()
+        .filter(|li| after.entry_at(**li).is_some())
+        .count();
+    assert!(kept < 8, "the truncation removed messages");
+    assert_eq!(
+        postings("truncword"),
+        kept,
+        "a removed event leaves no posting behind"
+    );
+}
