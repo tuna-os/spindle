@@ -217,12 +217,16 @@ fn verify(config_path: &str) -> ExitCode {
     }
 }
 
-const GC_USAGE: &str = "usage: spindle gc <config> [--dry-run] [--max-marks N]\n\
-  Deletes state-trie nodes that no stored record reaches. The server must be stopped.\n\
-  --dry-run      report what would be deleted and delete nothing\n\
-  --max-marks N  hold at most N reachable-node addresses in memory (default 4194304,\n\
-                 about 200 MB); the rest go to a scratch database next to the store,\n\
-                 removed when the run ends. The result does not depend on N.";
+// `concat!` of whole lines, not a `\` continuation: a continuation drops the
+// next line's leading spaces, which flattened the option list.
+const GC_USAGE: &str = concat!(
+    "usage: spindle gc <config> [--dry-run] [--max-marks N]\n",
+    "  Deletes state-trie nodes that no stored record reaches. The server must be stopped.\n",
+    "  --dry-run      report what would be deleted and delete nothing\n",
+    "  --max-marks N  hold at most N reachable-node addresses in memory (default 4194304,\n",
+    "                 about 200 MB); the rest go to a scratch database next to the store,\n",
+    "                 removed when the run ends. The result does not depend on N.",
+);
 
 /// Parse `gc`'s arguments and run it.
 fn gc_command(args: &[String]) -> ExitCode {
