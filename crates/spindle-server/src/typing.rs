@@ -71,20 +71,31 @@ impl Typing {
     /// re-sends `typing: true` every few seconds -- as clients do, to refresh
     /// the timeout -- must not wake every other client in the room each time.
     pub fn set(&self, room_id: &str, user_id: &str, typing: bool, timeout: Duration) {
+        self.set_at(room_id, user_id, typing, timeout, Instant::now());
+    }
+
+    /// [`Self::set`] at a stated time.
+    ///
+    /// The clock is an argument so that expiry can be tested at its exact
+    /// boundary. A test that sets a 50 ms timeout and then reads in real time
+    /// races its own first read on a loaded runner (#793).
+    pub fn set_at(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        typing: bool,
+        timeout: Duration,
+        now: Instant,
+    ) {
         let changed = {
             let mut active = self
                 .active
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let room = active.entry(room_id.to_owned()).or_default();
-            let was_typing = room
-                .get(user_id)
-                .is_some_and(|expiry| *expiry > Instant::now());
+            let was_typing = room.get(user_id).is_some_and(|expiry| *expiry > now);
             if typing {
-                room.insert(
-                    user_id.to_owned(),
-                    Instant::now() + timeout.min(self.max_timeout),
-                );
+                room.insert(user_id.to_owned(), now + timeout.min(self.max_timeout));
                 !was_typing
             } else {
                 room.remove(user_id);
@@ -103,7 +114,12 @@ impl Typing {
     /// read.
     #[must_use]
     pub fn active(&self, room_id: &str) -> Vec<String> {
-        let now = Instant::now();
+        self.active_at(room_id, Instant::now())
+    }
+
+    /// [`Self::active`] at a stated time, for the reason [`Self::set_at`] gives.
+    #[must_use]
+    pub fn active_at(&self, room_id: &str, now: Instant) -> Vec<String> {
         let mut active = self
             .active
             .lock()
@@ -175,5 +191,70 @@ impl Typing {
             "type": "m.typing",
             "content": { "user_ids": users },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #793: expiry at its exact boundary, on a clock the test holds. No
+    /// sleep, so there is nothing for a loaded runner to race.
+    #[test]
+    fn a_notice_expires_exactly_at_its_timeout() {
+        let typing = Typing::new();
+        let start = Instant::now();
+        typing.set_at(
+            "!room:example.org",
+            "@alice:example.org",
+            true,
+            Duration::from_millis(50),
+            start,
+        );
+
+        let before = start + Duration::from_millis(49);
+        assert_eq!(
+            typing.active_at("!room:example.org", before),
+            vec!["@alice:example.org"],
+            "still typing one millisecond before the timeout"
+        );
+        let at = start + Duration::from_millis(50);
+        assert!(
+            typing.active_at("!room:example.org", at).is_empty(),
+            "a notice whose time has come is not reported"
+        );
+    }
+
+    #[test]
+    fn typing_again_moves_the_expiry_and_stopping_ends_it() {
+        let typing = Typing::new();
+        let start = Instant::now();
+        let room = "!room:example.org";
+        let alice = "@alice:example.org";
+        typing.set_at(room, alice, true, Duration::from_millis(100), start);
+        // A refresh at 80 ms keeps her typing past the first deadline.
+        typing.set_at(
+            room,
+            alice,
+            true,
+            Duration::from_millis(100),
+            start + Duration::from_millis(80),
+        );
+        assert_eq!(
+            typing.active_at(room, start + Duration::from_millis(150)),
+            vec![alice]
+        );
+        typing.set_at(
+            room,
+            alice,
+            false,
+            Duration::ZERO,
+            start + Duration::from_millis(160),
+        );
+        assert!(
+            typing
+                .active_at(room, start + Duration::from_millis(161))
+                .is_empty()
+        );
     }
 }
