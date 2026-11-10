@@ -1655,6 +1655,13 @@ pub struct MediaConfig {
     /// with 413 `M_TOO_LARGE` before any pixel is decoded.
     #[serde(default = "default_max_thumbnail_pixels")]
     pub max_thumbnail_pixels: u64,
+    /// Days to keep media cached from other servers (#828). Absent, which
+    /// is the default, the cache is kept until an admin purges it with
+    /// `POST /_synapse/admin/v1/purge_media_cache`. Quarantined items and
+    /// this server's own uploads are never removed by it. A removed item
+    /// is fetched again if a client asks for it.
+    #[serde(default)]
+    pub remote_retention_days: Option<u32>,
 }
 
 fn default_max_thumbnail_pixels() -> u64 {
@@ -1671,6 +1678,7 @@ impl Default for MediaConfig {
             max_upload_bytes: default_max_upload_bytes(),
             max_bytes_per_user: None,
             max_thumbnail_pixels: default_max_thumbnail_pixels(),
+            remote_retention_days: None,
         }
     }
 }
@@ -1940,6 +1948,12 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "media.max_bytes_per_user",
                 message: "must be greater than zero; omit it for no quota".to_owned(),
+            });
+        }
+        if self.media.remote_retention_days == Some(0) {
+            return Err(ConfigError::Invalid {
+                field: "media.remote_retention_days",
+                message: "must be greater than zero; omit it to keep the cache".to_owned(),
             });
         }
         Ok(())

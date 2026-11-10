@@ -52,6 +52,9 @@ to let back in.
 - A leaked URI is a leaked file, for as long as the file exists. That is
   the spec's model; deleting the upload is the remedy the spec offers,
   and `Media` supports it.
+- An admin can quarantine an item, a user's uploads, or a room's media.
+  A quarantined item answers 404 on every route and to peers, and its
+  bytes stay as evidence.
 - If per-room media scoping ever enters the spec (MSC3911 is the
   candidate), this ADR is superseded by implementing it, not by adding a
   local rule.

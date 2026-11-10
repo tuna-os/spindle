@@ -40,7 +40,7 @@ pub struct Reservation {
     pub expires_at: u64,
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
@@ -86,6 +86,14 @@ pub struct MediaRecord {
     pub filename: Option<String>,
     pub size: usize,
     pub uploaded_by: String,
+    /// When the bytes arrived, in milliseconds. Absent on records written
+    /// before this was kept; the cache purge reads those as the oldest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ts: Option<u64>,
+    /// The admin who quarantined it. A quarantined record is kept as
+    /// evidence and never served; see [`Media::set_quarantine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_by: Option<String>,
 }
 
 impl MediaRecord {
@@ -339,6 +347,8 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
         self.store_upload(&media_id, bytes, &record, quota).await?;
         Ok(media_id)
@@ -470,6 +480,8 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -573,6 +585,8 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
         self.store_upload(media_id, bytes, &record, quota).await?;
         Store::delete(self.store.as_ref(), &keys::media_reservation(media_id))?;
@@ -619,6 +633,8 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: format!("federation:{server_name}"),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -655,6 +671,10 @@ impl Media {
         let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (key, value) in ReadView::scan_prefix(self.store.as_ref(), &keys::media_all())? {
             let record: MediaRecord = serde_json::from_slice(&value)?;
+            // A tombstone holds no bytes to be missing.
+            if record.hash.is_empty() {
+                continue;
+            }
             let id = keys::media_id(&key).unwrap_or_else(|| "<unreadable key>".to_owned());
             wanted.entry(record.hash).or_default().push(id);
         }
@@ -690,6 +710,13 @@ impl Media {
     /// a client can retry once the uploader finishes.
     fn record_or_pending(&self, media_id: &str) -> Result<MediaRecord, MediaError> {
         if let Some(record) = self.record(media_id)? {
+            // Every read path -- download, thumbnail, and the federation
+            // twins -- goes through here, so one check covers them all and
+            // a new route cannot forget it. Not-found, not forbidden: a
+            // 403 would tell the requester the item exists.
+            if record.quarantined_by.is_some() {
+                return Err(MediaError::Unknown(media_id.to_owned()));
+            }
             return Ok(record);
         }
         if self.reservation(media_id)?.is_some() {
@@ -860,6 +887,9 @@ impl Media {
         if !media_id.contains('/') {
             self.refund(&record.uploaded_by, record.size);
         }
+        if record.hash.is_empty() {
+            return Ok(true);
+        }
         let shared = self
             .records()?
             .iter()
@@ -877,6 +907,91 @@ impl Media {
         Ok(true)
     }
 
+    /// Quarantine (`Some(admin)`) or release (`None`) the record under
+    /// `media_id`. Returns whether the record exists.
+    ///
+    /// A quarantined item stays in the store and keeps its bytes, as
+    /// evidence, and is not served or sent to a peer. Releasing an item
+    /// that [`Self::quarantine_remote`] wrote as a tombstone removes the
+    /// tombstone, so the next request fetches it afresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn set_quarantine(&self, media_id: &str, by: Option<&str>) -> Result<bool, MediaError> {
+        let Some(mut record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        if by.is_none() && record.hash.is_empty() {
+            Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+            return Ok(true);
+        }
+        record.quarantined_by = by.map(str::to_owned);
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Quarantine a remote server's media, cached here or not.
+    ///
+    /// An uncached item gets a record with no bytes, so the cache's "do I
+    /// hold it" check finds it and the item is never fetched: a ban that
+    /// only covered what happened to be cached would be undone by the next
+    /// client that asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn quarantine_remote(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        by: &str,
+    ) -> Result<(), MediaError> {
+        let id = Self::remote_id(server_name, media_id);
+        if self.set_quarantine(&id, Some(by))? {
+            return Ok(());
+        }
+        let tombstone = MediaRecord {
+            hash: String::new(),
+            content_type: "application/octet-stream".to_owned(),
+            filename: None,
+            size: 0,
+            uploaded_by: format!("federation:{server_name}"),
+            created_ts: Some(now_millis()),
+            quarantined_by: Some(by.to_owned()),
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(&id),
+            &serde_json::to_vec(&tombstone)?,
+        )?;
+        Ok(())
+    }
+
+    /// Delete cached remote media last cached before `before_ts`
+    /// (milliseconds), and return the IDs removed. This server's own
+    /// uploads are never touched, and neither is a quarantined item:
+    /// purging it would release what the operator meant to hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn purge_remote(&self, before_ts: u64) -> Result<Vec<String>, MediaError> {
+        let mut purged = Vec::new();
+        for (media_id, record) in self.records()? {
+            let old = record.created_ts.is_none_or(|ts| ts < before_ts);
+            if media_id.contains('/') && record.quarantined_by.is_none() && old {
+                self.delete(&media_id).await?;
+                purged.push(media_id);
+            }
+        }
+        Ok(purged)
+    }
+
     /// The `mxc://` URI for one of this server's media IDs.
     #[must_use]
     pub fn mxc(&self, media_id: &str) -> String {
@@ -887,6 +1002,31 @@ impl Media {
     #[must_use]
     pub fn is_ours(&self, server_name: &str) -> bool {
         server_name == self.server_name
+    }
+}
+
+/// Remove cached remote media older than `days`, every `interval`.
+///
+/// Holds the media store weakly, like the other delivery loops, so the
+/// last owner of the store is never this task.
+pub async fn retention_loop(media: std::sync::Weak<Media>, days: u32, interval: Duration) {
+    let max_age = u64::from(days).saturating_mul(24 * 60 * 60 * 1000);
+    loop {
+        let Some(live) = media.upgrade() else {
+            return;
+        };
+        match live
+            .purge_remote(now_millis().saturating_sub(max_age))
+            .await
+        {
+            Ok(purged) if !purged.is_empty() => {
+                tracing::info!(removed = purged.len(), "purged old cached remote media");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("remote media retention failed: {error}"),
+        }
+        drop(live);
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1176,6 +1316,8 @@ mod tests {
             filename: Some(name.to_owned()),
             size: 1,
             uploaded_by: "@a:b".to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
 
         let injected = record("evil\r\nX-Evil: yes").content_disposition();
@@ -1209,6 +1351,8 @@ mod tests {
                 filename: None,
                 size: 1,
                 uploaded_by: "@a:b".to_owned(),
+                created_ts: Some(now_millis()),
+                quarantined_by: None,
             };
             assert!(!record.inline_safe(), "{dangerous} must not render inline");
             assert_eq!(record.content_disposition(), "attachment");
@@ -1223,6 +1367,8 @@ mod tests {
             filename: Some("cat.png".to_owned()),
             size: 1,
             uploaded_by: "@a:b".to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
         };
         assert!(record.inline_safe());
         assert_eq!(

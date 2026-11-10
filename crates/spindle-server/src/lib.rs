@@ -625,6 +625,14 @@ fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
+    // Cached remote media past its retention is removed, hourly (#828).
+    if let Some(days) = state.config.media.remote_retention_days {
+        tokio::spawn(media::retention_loop(
+            Arc::downgrade(&state.media),
+            days,
+            std::time::Duration::from_secs(60 * 60),
+        ));
+    }
     // Presence's clock -- idle, stopped syncing, a peer gone quiet -- at
     // Synapse's cadence. A pass reads only the users not already offline.
     if state.presence.enabled() {

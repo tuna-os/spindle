@@ -287,6 +287,26 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             ),
             (reqwest::Method::GET, format!("{prefix}/media/x/y")),
             (reqwest::Method::DELETE, format!("{prefix}/media/x/y")),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/quarantine/x/y"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/unquarantine/x/y"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/user/{user}/media/quarantine"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/room/!r:x/media/quarantine"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/purge_media_cache?before_ts=1"),
+            ),
         ]);
     }
     routes
@@ -2320,6 +2340,171 @@ async fn user_media_lists_and_deletes() {
         .await;
     assert_eq!(status, 200, "{deleted}");
     assert_eq!(deleted["total"], 1, "{deleted}");
+}
+
+/// Quarantine by user and by room, under both prefixes: what is held is
+/// answered 404 on the client routes and listed as quarantined.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn quarantine_by_user_and_room_hides_media_and_lists_it() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let bob_token = server.register("bob").await;
+    let alice = server.user("alice");
+    let upload = |token: String, name: &'static str| {
+        let client = server.client.clone();
+        let host = server.name.clone();
+        async move {
+            let response = client
+                .post(format!(
+                    "http://{host}/_matrix/media/v3/upload?filename={name}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "text/plain")
+                .body(format!("contents of {name}"))
+                .send()
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            body["content_uri"].as_str().unwrap().to_owned()
+        }
+    };
+    let alice_one = upload(alice_token.clone(), "a1.txt").await;
+    let alice_two = upload(alice_token.clone(), "a2.txt").await;
+    let bob_in_room = upload(bob_token.clone(), "b1.txt").await;
+    let bob_elsewhere = upload(bob_token.clone(), "b2.txt").await;
+    let id = |mxc: &str| mxc.rsplit('/').next().unwrap().to_owned();
+    let status_of = |token: String, mxc: String| {
+        let client = server.client.clone();
+        let host = server.name.clone();
+        async move {
+            let (server_name, media_id) =
+                mxc.strip_prefix("mxc://").unwrap().split_once('/').unwrap();
+            let response = client
+                .get(format!(
+                    "http://{host}/_matrix/client/v1/media/download/{server_name}/{media_id}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap();
+            response.status().as_u16()
+        }
+    };
+
+    // Alice's uploads, by user, under the Spindle prefix.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/user/{alice}/media/quarantine"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!((status, &body), (200, &json!({ "num_quarantined": 2 })));
+    for mxc in [&alice_one, &alice_two] {
+        assert_eq!(status_of(bob_token.clone(), mxc.clone()).await, 404);
+    }
+    assert_eq!(status_of(bob_token.clone(), bob_in_room.clone()).await, 200);
+    let (_, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        listing["media"][0]["quarantined_by"],
+        server.user("root").as_str(),
+        "{listing}"
+    );
+
+    // A room's media: the attachment, its thumbnail and a remote item.
+    let (status, room) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{room}");
+    let room = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/t1"),
+            Some(&admin_token),
+            Some(&json!({
+                "msgtype": "m.image", "body": "x", "url": bob_in_room,
+                "info": { "thumbnail_url": "mxc://elsewhere.example/remote1" },
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/room/{room}/media/quarantine"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "num_quarantined": 2 }), "{body}");
+    assert_eq!(
+        status_of(alice_token.clone(), bob_in_room.clone()).await,
+        404
+    );
+    assert_eq!(
+        status_of(alice_token.clone(), bob_elsewhere.clone()).await,
+        200,
+        "media the room never mentioned is left alone"
+    );
+    let (_, info) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/media/elsewhere.example/remote1",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        info["media_info"]["quarantined_by"],
+        server.user("root").as_str(),
+        "{info}"
+    );
+
+    // Releasing one item serves it again.
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_synapse/admin/v1/media/unquarantine/{}/{}",
+                server.name,
+                id(&alice_one)
+            ),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(bob_token.clone(), alice_one).await, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/nosuchmedia",
+                server.name
+            ),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 404, "an unknown local item is not reported as held");
 }
 
 /// Event reports filter, page by integer token, and can be dismissed;

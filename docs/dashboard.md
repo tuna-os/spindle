@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**306 routes implemented; 0 known gaps in scope.**
+**316 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 89 implemented, 0 planned
+### Admin & moderation — 99 implemented, 0 planned
 
 - `GET /_spindle/admin/ui`
 - `GET /_spindle/admin/ui/app.js`
@@ -43,10 +43,14 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/federation/destinations/{destination}`
 - `POST /_spindle/admin/v1/federation/destinations/{destination}/reset_connection`
 - `GET /_spindle/admin/v1/federation/destinations/{destination}/rooms`
+- `POST /_spindle/admin/v1/media/quarantine/{server_name}/{media_id}`
+- `POST /_spindle/admin/v1/media/unquarantine/{server_name}/{media_id}`
 - `GET/DELETE /_spindle/admin/v1/media/{server_name}/{media_id}`
+- `POST /_spindle/admin/v1/purge_media_cache`
 - `GET /_spindle/admin/v1/registration_tokens`
 - `POST /_spindle/admin/v1/registration_tokens/new`
 - `GET/PUT/DELETE /_spindle/admin/v1/registration_tokens/{token}`
+- `POST /_spindle/admin/v1/room/{room_id}/media/quarantine`
 - `GET /_spindle/admin/v1/rooms`
 - `GET/DELETE /_spindle/admin/v1/rooms/{room_id}`
 - `GET/PUT /_spindle/admin/v1/rooms/{room_id}/block`
@@ -60,6 +64,7 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/scheduled_tasks`
 - `POST /_spindle/admin/v1/send_server_notice`
 - `GET /_spindle/admin/v1/server_version`
+- `POST /_spindle/admin/v1/user/{user_id}/media/quarantine`
 - `GET /_spindle/admin/v1/username_available`
 - `GET /_spindle/admin/v1/users`
 - `GET/PUT /_spindle/admin/v1/users/{user_id}`
@@ -81,13 +86,17 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/federation/destinations/{destination}`
 - `POST /_synapse/admin/v1/federation/destinations/{destination}/reset_connection`
 - `GET /_synapse/admin/v1/federation/destinations/{destination}/rooms`
+- `POST /_synapse/admin/v1/media/quarantine/{server_name}/{media_id}`
+- `POST /_synapse/admin/v1/media/unquarantine/{server_name}/{media_id}`
 - `GET/DELETE /_synapse/admin/v1/media/{server_name}/{media_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`
+- `POST /_synapse/admin/v1/purge_media_cache`
 - `GET/POST /_synapse/admin/v1/register`
 - `GET /_synapse/admin/v1/registration_tokens`
 - `POST /_synapse/admin/v1/registration_tokens/new`
 - `GET/PUT/DELETE /_synapse/admin/v1/registration_tokens/{token}`
 - `POST /_synapse/admin/v1/reset_password/{user_id}`
+- `POST /_synapse/admin/v1/room/{room_id}/media/quarantine`
 - `GET /_synapse/admin/v1/rooms`
 - `GET/DELETE /_synapse/admin/v1/rooms/{room_id}`
 - `GET/PUT /_synapse/admin/v1/rooms/{room_id}/block`
@@ -101,6 +110,7 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/scheduled_tasks`
 - `POST /_synapse/admin/v1/send_server_notice`
 - `GET /_synapse/admin/v1/server_version`
+- `POST /_synapse/admin/v1/user/{user_id}/media/quarantine`
 - `GET /_synapse/admin/v1/username_available`
 - `GET /_synapse/admin/v1/users`
 - `GET/PUT /_synapse/admin/v1/users/{user_id}`

@@ -61,6 +61,11 @@ path = "./data"
 # thumbnailed. The header is read first; an image over this is refused with
 # 413 M_TOO_LARGE before any pixel is decoded. Zero is refused at startup.
 # max_thumbnail_pixels = 40000000
+# Days to keep media cached from other servers. Unset (the default) keeps
+# the cache until an admin calls POST /_synapse/admin/v1/purge_media_cache.
+# A background job removes older entries hourly. It never removes this
+# server's uploads or quarantined items. Zero is refused at startup.
+# remote_retention_days = 30
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
