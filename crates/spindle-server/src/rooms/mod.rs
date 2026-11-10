@@ -2524,7 +2524,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read or the outbox
     /// written.
     pub fn push_sticky_to(&self, room_id: &str, destination: &str) -> Result<(), RoomError> {
-        for (_, event, _) in self.sticky_events(room_id, None)? {
+        for (event_id, event, _) in self.sticky_events(room_id, None)? {
             let local = event["sender"]
                 .as_str()
                 .and_then(|sender| sender.split_once(':'))
@@ -2532,19 +2532,13 @@ impl Rooms {
             if !local {
                 continue;
             }
-            // The stored body, without the client-facing `event_id`.
-            let mut pdu = event;
-            if let Some(object) = pdu.as_object_mut() {
-                object.remove("event_id");
-            }
             let stream_write = self.reserve_stream_id();
             let seq = stream_write.id();
             self.outbox.enqueue(
                 self.store.as_ref(),
                 &self.metrics,
-                destination,
-                seq,
-                pdu.to_string().as_bytes(),
+                &[(destination, seq)],
+                &crate::federation::outbox::reference(room_id, &event_id),
             )?;
         }
         Ok(())
@@ -6665,7 +6659,7 @@ impl Rooms {
         )?;
         self.settle(log, room_id, &entry, &settling)?;
         self.prune_stuck_extremities(log, room_id, &entry.event_id, &json);
-        self.enqueue_outbound(log, room_id, &json)?;
+        self.enqueue_outbound(log, room_id, &event_id, &json)?;
         Ok(event_id)
     }
 
@@ -6681,6 +6675,7 @@ impl Rooms {
         &self,
         log: &RoomLog,
         room_id: &str,
+        event_id: &str,
         json: &Value,
     ) -> Result<(), RoomError> {
         let live = self.destinations_in(log, room_id)?;
@@ -6732,22 +6727,36 @@ impl Rooms {
             permits(&acl) || replaced.as_ref().is_some_and(permits)
         };
 
-        for destination in live
+        let destinations: Vec<&str> = live
             .iter()
             .map(String::as_str)
             .chain(departing)
             .filter(|domain| admitted(domain))
-        {
-            let stream_write = self.reserve_stream_id();
-            let seq = stream_write.id();
-            self.outbox.enqueue(
-                self.store.as_ref(),
-                &self.metrics,
-                destination,
-                seq,
-                json.to_string().as_bytes(),
-            )?;
+            .collect();
+        // Nothing to queue is not a batch: a room with no remote member
+        // writes nothing, so an event stays one batch (`append_batch.rs`).
+        if destinations.is_empty() {
+            return Ok(());
         }
+        // One batch for every destination, holding only a reference to the
+        // body the event's own commit stored. The write guards live until
+        // the batch has landed, so no sync passes a sequence whose row is
+        // not there yet.
+        let writes: Vec<_> = destinations
+            .iter()
+            .map(|_| self.reserve_stream_id())
+            .collect();
+        let queued: Vec<(&str, u64)> = destinations
+            .iter()
+            .copied()
+            .zip(writes.iter().map(SideStreamWrite::id))
+            .collect();
+        self.outbox.enqueue(
+            self.store.as_ref(),
+            &self.metrics,
+            &queued,
+            &crate::federation::outbox::reference(room_id, event_id),
+        )?;
         Ok(())
     }
 
@@ -7102,7 +7111,7 @@ impl Rooms {
             }
         }
         if fan_out {
-            self.enqueue_outbound(log, room_id, json)?;
+            self.enqueue_outbound(log, room_id, event_id, json)?;
         }
         Ok(())
     }
@@ -8139,10 +8148,7 @@ fn split_user_room(key: &[u8]) -> Option<(String, String)> {
 
 /// Event bodies live beside the log, keyed by room and event ID.
 fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
-    let mut key =
-        spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::EventIndex, room_id);
-    key.extend_from_slice(event_id.as_bytes());
-    key
+    spindle_core::keys::event_body(room_id, event_id)
 }
 
 /// The state events a new event must cite to be authorizable (room v11's

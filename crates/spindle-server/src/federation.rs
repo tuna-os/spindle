@@ -3502,21 +3502,32 @@ fn load_batch(
     };
     let catching_up = backoff.get(destination).is_some_and(|entry| entry.long)
         && federation.peer_max_backoff(destination).is_none();
-    let rows = if catching_up {
-        retry::cut(
-            store,
-            federation.metrics(),
-            outbox,
-            destination,
-            retry::queued(store, destination),
-        )
-    } else {
-        outbox::head(store, destination, PDUS_PER_TRANSACTION)
-    };
-    if rows.is_empty() {
-        outbox.found_empty(destination, queue);
+    // Rows whose bodies were purged are dropped on the way, so a page that
+    // lost some is read again until it is full or the queue is short.
+    loop {
+        let rows = if catching_up {
+            retry::cut(
+                store,
+                federation.metrics(),
+                outbox,
+                destination,
+                retry::queued(store, destination),
+            )
+        } else {
+            outbox::head(store, destination, PDUS_PER_TRANSACTION)
+        };
+        let read = rows.len();
+        let page: Vec<OutboxRow> = rows.into_iter().take(PDUS_PER_TRANSACTION).collect();
+        let (sendable, purged) =
+            outbox::resolve(store, outbox, federation.metrics(), destination, page);
+        if purged > 0 && read >= PDUS_PER_TRANSACTION {
+            continue;
+        }
+        if sendable.is_empty() && read as u64 == purged {
+            outbox.found_empty(destination, queue);
+        }
+        return sendable;
     }
-    rows.into_iter().take(PDUS_PER_TRANSACTION).collect()
 }
 
 /// Set the queue depth gauge from the index. A destination that only has

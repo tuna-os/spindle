@@ -1613,6 +1613,14 @@ pub fn sticky_parts(key: &[u8], room_id: &str) -> Option<(u64, String)> {
     Some((expires, event_id))
 }
 
+/// Where a room's event body is stored, by room and event ID.
+#[must_use]
+pub fn event_body(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::EventIndex, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
 /// `(destination, seq)` key for [`Keyspace::FederationOutbox`].
 #[must_use]
 pub fn federation_outbox(destination: &str, seq: u64) -> Vec<u8> {
