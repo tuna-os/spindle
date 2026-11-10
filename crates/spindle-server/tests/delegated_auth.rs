@@ -655,6 +655,59 @@ async fn delegated_admin_whoami_identifies_an_account_without_inventing_a_device
     }
 }
 
+/// #832: the lock and suspend flags are this server's, and the provider
+/// that vouches for a delegated token does not know them. They were checked
+/// on `/whoami` only, so a locked or suspended user's provider-issued device
+/// token kept full access through every other endpoint.
+#[tokio::test]
+async fn account_holds_apply_to_a_delegated_device_session() {
+    let (_provider, url) = Provider::serve().await;
+    let server = Instance::start(Some(&url)).await;
+    let accounts = spindle_server::accounts::Accounts::new(server.store.as_ref(), &server.name);
+    let read = || {
+        server.request(
+            reqwest::Method::GET,
+            "/_matrix/client/v3/joined_rooms",
+            Some(MAS_TOKEN),
+            None,
+        )
+    };
+    let empty = json!({});
+    let create = || {
+        server.request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(MAS_TOKEN),
+            Some(&empty),
+        )
+    };
+
+    let (status, body) = read().await;
+    assert_eq!(status, 200, "{body}");
+
+    // Locked: refused everything, with the lock's own code.
+    accounts.set_locked("alice", true).unwrap();
+    let (status, body) = read().await;
+    assert_eq!(
+        status, 401,
+        "a lock stops the device session reading: {body}"
+    );
+    assert_eq!(body["errcode"], "M_USER_LOCKED", "{body}");
+    accounts.set_locked("alice", false).unwrap();
+
+    // Suspended: reads continue and writes are refused.
+    accounts.set_suspended("alice", true).unwrap();
+    let (status, body) = read().await;
+    assert_eq!(status, 200, "a suspended user may still read: {body}");
+    let (status, body) = create().await;
+    assert_eq!(status, 403, "a suspended user may not write: {body}");
+    assert_eq!(body["errcode"], "M_USER_SUSPENDED", "{body}");
+    accounts.set_suspended("alice", false).unwrap();
+
+    let (status, body) = create().await;
+    assert_eq!(status, 200, "lifting the hold restores the session: {body}");
+}
+
 #[tokio::test]
 async fn delegated_account_identity_checks_scopes_and_cached_account_holds() {
     let (_provider, url) = Provider::serve().await;

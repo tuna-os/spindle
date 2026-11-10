@@ -58,7 +58,10 @@ async fn identify(
         // under MSC3861 delegation — a token only the provider can
         // vouch for. The order is cheapest-check-first.
         Ok(None) if state.appservices.by_token(&token).is_some() => {
-            appservice_identity(parts, state, &token)
+            let identity = appservice_identity(parts, state, &token)?;
+            // A ghost user can be locked or suspended like any other (#832).
+            refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
+            Ok(identity)
         }
         Ok(None) => match &state.delegated {
             Some(delegated) => {
@@ -71,9 +74,12 @@ async fn identify(
                         .identify(state.store.as_ref(), &state.config.server.name, &token)
                         .await?
                 };
-                if account_only {
-                    refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
-                }
+                // Every delegated request, not only the account-level ones:
+                // the provider vouches for the token, and the hold is this
+                // server's own flag, which the provider does not know about
+                // (#832). Checked on the device path too, so a locked user's
+                // session cannot read or write through `/sync` and `/send`.
+                refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
                 Ok(identity)
             }
             None => Err(MatrixError::unknown_token()),
@@ -211,7 +217,7 @@ pub(crate) fn bearer(parts: &Parts) -> Option<String> {
 }
 
 /// The two administrative holds of spec v1.18, checked on every local
-/// session. A locked account is refused everything, with `soft_logout` so
+/// session, every delegated one and every appservice identity. A locked account is refused everything, with `soft_logout` so
 /// the client keeps its session for when the lock lifts. A suspended
 /// account keeps reading -- `/sync`, `/messages`, its own profile -- and
 /// may log out, and every other write is refused: the spec's shape, so a
