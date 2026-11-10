@@ -2054,23 +2054,52 @@ async fn room_hierarchy(
         .max_depth
         .unwrap_or(HIERARCHY_DEPTH_MAX)
         .min(HIERARCHY_DEPTH_MAX);
-    let offset: usize = match query.from.as_deref() {
-        Some(token) => token.parse().map_err(|_| {
+    let (snapshot_id, offset) = match query.from.as_deref() {
+        Some(token) => crate::remote_space::parse_token(token).ok_or_else(|| {
             MatrixError::bad_json("from is not a hierarchy token this server issued")
         })?,
-        None => 0,
+        None => (None, 0),
     };
+    let denied = || MatrixError::forbidden("you are not allowed to view this room's hierarchy");
+    let scope = format!(
+        "{}|{room_id}|{max_depth}|{}",
+        identity.user_id, query.suggested_only
+    );
 
     // The root itself has to be visible, and a root nobody may see is a 403
     // rather than an empty page: an empty page would say "this space is
-    // empty", which is a different and false claim.
-    if hierarchy_visible(&state, &identity.user_id, &room_id).is_none() {
-        return Err(MatrixError::forbidden(
-            "you are not allowed to view this room's hierarchy",
-        ));
+    // empty", which is a different and false claim. A root this server does
+    // not hold is asked of its own server; when nobody shows it the answer is
+    // the same 403 as for a room the caller may not see, so the status is no
+    // oracle for whether the room exists. A root this server does hold is
+    // judged by its own state only: a peer's claim never widens it.
+    // `held` only says whether this server has the room: nothing from the room
+    // is read or returned. A held room is checked against the caller on the
+    // next line, and a room this server does not hold takes the remote path
+    // and ends in the same 403 as a room the caller may not see.
+    // nosemgrep: room-read-without-authorization
+    let held = state.rooms.summary(&room_id).is_ok();
+    if held && hierarchy_visible(&state, &identity.user_id, &room_id).is_none() {
+        return Err(denied());
     }
 
-    let ordered = hierarchy_walk(&state, &identity.user_id, &room_id, max_depth, &query).await;
+    // A later page continues the list its first page was cut from, so a
+    // remote room that answers in between cannot shift the pages.
+    let kept = snapshot_id
+        .as_deref()
+        .and_then(|id| crate::remote_space::snapshot(id, &scope));
+    let (ordered, snapshot_id) = if let Some(kept) = kept {
+        (kept, snapshot_id)
+    } else {
+        let (ordered, used_remote) =
+            hierarchy_walk(&state, &identity.user_id, &room_id, max_depth, &query).await;
+        if ordered.is_empty() {
+            return Err(denied());
+        }
+        let id = (used_remote && offset + limit < ordered.len())
+            .then(|| crate::remote_space::keep(&scope, &ordered));
+        (ordered, id)
+    };
 
     let total = ordered.len();
     let mut rooms = Vec::new();
@@ -2082,10 +2111,19 @@ async fn room_hierarchy(
     let mut body = serde_json::Map::new();
     body.insert("rooms".to_owned(), Value::Array(rooms));
     if offset + limit < total {
-        body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
+        body.insert(
+            "next_batch".to_owned(),
+            json!(crate::remote_space::token(
+                snapshot_id.as_deref(),
+                offset + limit
+            )),
+        );
     }
     Ok(Json(Value::Object(body)))
 }
+
+/// A visible room's summary chunk and its `children_state`.
+pub(crate) type HierarchyEntry = (serde_json::Map<String, Value>, Vec<Value>);
 
 /// One room in a walk waiting to be visited.
 struct Pending {
@@ -2117,7 +2155,7 @@ async fn hierarchy_walk(
     start: &str,
     max_depth: usize,
     query: &HierarchyQuery,
-) -> Vec<(serde_json::Map<String, Value>, Vec<Value>)> {
+) -> (Vec<HierarchyEntry>, bool) {
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ordered = Vec::new();
     let mut frontier = std::collections::VecDeque::new();
@@ -2185,7 +2223,7 @@ async fn hierarchy_walk(
             });
         }
     }
-    ordered
+    (ordered, budget < crate::remote_space::MAX_REMOTE_FETCHES)
 }
 
 #[derive(Debug, Deserialize)]
