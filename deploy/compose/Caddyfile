@@ -1,0 +1,29 @@
+# Caddy gets and renews the certificate for {$SPINDLE_DOMAIN} by itself.
+# This is the single-host layout: the server name and the public host are
+# the same, so one site block carries clients and federation.
+{$SPINDLE_DOMAIN} {
+	# Federation peers read this first. Without it they connect to port
+	# 8448, which this layout does not publish.
+	handle /.well-known/matrix/server {
+		header Content-Type application/json
+		respond `{"m.server": "{$SPINDLE_DOMAIN}:443"}`
+	}
+
+	handle {
+		# Uploads: keep this at or above [media] max_upload_bytes.
+		request_body {
+			max_size 100MB
+		}
+		reverse_proxy spindle:8008 {
+			# Send events to the client as they arrive.
+			flush_interval -1
+			# No read timeout on purpose. /sync is a long poll and
+			# holds the request open for up to 30 seconds or more.
+			health_uri /health
+			health_interval 15s
+		}
+	}
+}
+
+# Extra site blocks, such as the LiveKit host from compose.livekit.yaml.
+import /etc/caddy/conf.d/*.caddy

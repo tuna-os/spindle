@@ -36,7 +36,8 @@ Either way the run then:
 
 - builds `spindle` for `x86_64-unknown-linux-gnu` and
   `aarch64-unknown-linux-gnu` from the tagged tree with `--locked`, and
-  packages each as a tarball with the licences and the README, plus a
+  packages each as a tarball with the licences, the README, the example
+  config and the systemd unit, plus a
   `.sha256` beside it;
 - builds the runtime image (the `Dockerfile` at the root) for `amd64` and
   `arm64` and publishes a manifest at `ghcr.io/tuna-os/spindle:<tag>`;

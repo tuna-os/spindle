@@ -1,0 +1,16 @@
+# The smallest working config for the Compose file. The full reference is
+# spindle.example.toml at the root of the repository.
+
+[server]
+# Permanent. It goes into every user ID and room ID. Choose it before
+# anyone registers. Here it is the same host that Caddy serves.
+name = "matrix.example.org"
+bind = "0.0.0.0:8008"
+public_base_url = "https://matrix.example.org"
+
+[storage]
+path = "/var/lib/spindle"
+
+[registration]
+# Create the first account, promote it, then keep this on (docs/operations.md).
+require_token = true

@@ -131,7 +131,7 @@ def unpinned_images(name: str, text: str) -> list[tuple[int, str]]:
     pinned by digest.
 
     A Dockerfile's own earlier stages and `scratch` are not images, and a
-    reference with a placeholder in it (`__IMAGE__`, `${SPINDLE_IMAGE:-...}`)
+    reference with a placeholder in it (`__IMAGE__`, `${SPINDLE_IMAGE:-...}`, a Helm `{{ }}`)
     names one the caller supplies, so neither is something to pin here.
     """
     found: list[tuple[int, str]] = []
@@ -149,6 +149,7 @@ def unpinned_images(name: str, text: str) -> list[tuple[int, str]]:
             or image == "scratch"
             or "$" in image
             or "__" in image
+            or "{{" in image
         ):
             continue
         if "@sha256:" not in image:

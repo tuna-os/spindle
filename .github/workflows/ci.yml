@@ -214,3 +214,19 @@ jobs:
         run: |
           python3 scripts/actions-pinned.py
           python3 scripts/actions-pinned-test.py
+
+  # The files under deploy/ run nowhere in the Rust gate, so they would rot
+  # unseen. Compose, Caddy, Helm and systemd each check their own file with
+  # their own tool, on the runner's preinstalled copies (#825).
+  deploy:
+    name: Deployment files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the deployment files
+        run: |
+          pip install --quiet pyyaml==6.0.3
+          python3 scripts/check-deploy.py --require-all

@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spindle.fullname" . }}
+  labels:
+    {{- include "spindle.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "spindle.selector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+---
+# Gives the StatefulSet its stable name. It carries no traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spindle.fullname" . }}-headless
+  labels:
+    {{- include "spindle.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "spindle.selector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8008
+      targetPort: http
+{{- if .Values.metrics.enabled }}
+---
+# Names the metrics port for the ServiceMonitor. Keep it off the client Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spindle.fullname" . }}-metrics
+  labels:
+    {{- include "spindle.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  selector:
+    {{- include "spindle.selector" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+{{- end }}

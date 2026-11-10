@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "spindle.fullname" . }}
+  labels:
+    {{- include "spindle.labels" . | nindent 4 }}
+spec:
+  # One process per store. Do not scale this.
+  replicas: 1
+  serviceName: {{ include "spindle.fullname" . }}-headless
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "spindle.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spindle.labels" . | nindent 8 }}
+      annotations:
+        {{- if not .Values.config.existingSecret }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: spindle
+          image: {{ include "spindle.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["/etc/spindle/spindle.toml"]
+          ports:
+            - name: http
+              containerPort: 8008
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
+          # /health says the process runs. /ready says the store takes writes.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/spindle
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/spindle
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          {{- if .Values.config.existingSecret }}
+          secret:
+            secretName: {{ .Values.config.existingSecret }}
+          {{- else }}
+          configMap:
+            name: {{ include "spindle.fullname" . }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "spindle.selector" . | nindent 10 }}
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

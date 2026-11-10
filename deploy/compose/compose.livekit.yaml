@@ -1,0 +1,29 @@
+# Adds LiveKit for Element Call, with Spindle's built-in JWT service
+# (docs/matrix-rtc.md, option A). Use it with compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.livekit.yaml up -d
+#
+# Before you start: set the same API secret in livekit.yaml and in
+# spindle-rtc.toml, and point lk.<domain> at this host in DNS.
+# Open 7881/tcp and 7882/udp in the firewall.
+services:
+  spindle:
+    volumes:
+      # Replaces the config of compose.yaml with the one that has [rtc.livekit].
+      - ./spindle-rtc.toml:/etc/spindle/spindle.toml:ro
+
+  livekit:
+    image: livekit/livekit-server:v1.13.5@sha256:3497163e15c48fef6e7830c78716f9e9d5edc28abf7aa90b61c86e93bbc306b1
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7881:7881"
+      - "7882:7882/udp"
+    depends_on: [spindle]
+
+  caddy:
+    volumes:
+      # Caddyfile imports /etc/caddy/conf.d/*.caddy. Without this file it imports nothing.
+      - ./livekit.caddy:/etc/caddy/conf.d/livekit.caddy:ro

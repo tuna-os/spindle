@@ -1,0 +1,61 @@
+# Install:
+#   install -m 0755 spindle /usr/local/bin/spindle
+#   install -d /etc/spindle
+#   install -m 0600 spindle.example.toml /etc/spindle/spindle.toml
+#   install -m 0644 spindle.service /etc/systemd/system/spindle.service
+#   systemctl daemon-reload && systemctl enable --now spindle
+# Set [server] name and [storage] path = "/var/lib/spindle" in the config.
+# The config stays root-only: systemd hands a copy to the service
+# (LoadCredential) so the service user never needs to read /etc/spindle.
+# See docs/deploy.md.
+[Unit]
+Description=Spindle Matrix homeserver
+Documentation=https://github.com/tuna-os/spindle/blob/main/docs/deploy.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/spindle/spindle.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spindle ${CREDENTIALS_DIRECTORY}/spindle.toml
+LoadCredential=spindle.toml:/etc/spindle/spindle.toml
+Restart=on-failure
+RestartSec=5s
+# A clean stop lets the store close and keeps delayed-event deadlines.
+TimeoutStopSec=60s
+LimitNOFILE=65536
+
+# A throwaway user that owns /var/lib/spindle (the store and its keys).
+DynamicUser=yes
+StateDirectory=spindle
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/spindle
+
+# Hardening. Spindle only needs the network and its own state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
