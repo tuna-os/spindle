@@ -721,3 +721,63 @@ async fn the_account_pages_keep_the_issuer_path() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 404);
 }
+
+/// RFC 7009: revoking the refresh token ends the session, access token
+/// included, and the refresh grant is refused afterwards.
+#[tokio::test]
+async fn revoking_a_refresh_token_ends_the_session() {
+    let server = Instance::start(true).await;
+    server.register_user("alice").await;
+    let client_id = server.register_client(REDIRECT).await;
+    let verifier = "a-code-verifier-of-sufficient-length-for-rfc7636";
+    let code = server
+        .login_for_code(&client_id, REDIRECT, STABLE_SCOPE, &pkce(verifier))
+        .await;
+    let (status, body) = server.exchange(&client_id, REDIRECT, &code, verifier).await;
+    assert_eq!(status, 200, "{body}");
+    let access = body["access_token"].as_str().unwrap();
+    let refresh = body["refresh_token"].as_str().unwrap();
+    assert_eq!(server.whoami(access).await.0, 200);
+
+    let revoke = |token: String| {
+        let client = server.client.clone();
+        let url = format!("http://{}/oauth2/revoke", server.name);
+        let client_id = client_id.clone();
+        async move {
+            client
+                .post(url)
+                .form(&[
+                    ("token", token.as_str()),
+                    ("client_id", &client_id),
+                    ("token_type_hint", "refresh_token"),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(revoke(refresh.to_owned()).await, 200);
+    assert_eq!(server.whoami(access).await.0, 401, "the access token died");
+
+    let response = server
+        .client
+        .post(format!("http://{}/oauth2/token", server.name))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id.as_str()),
+            ("refresh_token", refresh),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "the refresh grant is refused"
+    );
+
+    // Unknown tokens still answer 200.
+    assert_eq!(revoke("syr_never_issued".to_owned()).await, 200);
+}

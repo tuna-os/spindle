@@ -901,9 +901,7 @@ async fn revoke(
 ) -> Result<Json<Value>, OAuthError> {
     provider(&state)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    accounts
-        .logout(&request.token)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    crate::mas::end_local_session(&state, &accounts, &request.token)?;
     Ok(Json(json!({})))
 }
 

@@ -124,6 +124,12 @@ pub struct Device {
 pub struct TokenRecord {
     pub localpart: String,
     pub device_id: String,
+    /// When an access token of a refreshing session was minted, in Unix
+    /// milliseconds. Absent on rows written before expiry existed and on
+    /// sessions without a refresh token: both never expire, because expiring
+    /// a token its client cannot renew only logs the client out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_ms: Option<u64>,
 }
 
 /// A session's credentials, as handed to the client.
@@ -148,7 +154,7 @@ pub struct Session {
 /// renew would log them out for no reason, so a non-refreshing session gets one
 /// that does not expire -- which is why `expires_in_ms` is absent there rather
 /// than merely large.
-const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+pub const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
 
 /// How long a `get_token` login token stays redeemable: the spec's two
 /// minutes, enough to hand it to the other client and no more.
@@ -516,6 +522,7 @@ impl<'a, S: Store> Accounts<'a, S> {
         let record = TokenRecord {
             localpart: localpart.to_owned(),
             device_id,
+            issued_at_ms: with_refresh.then(now_millis),
         };
         let access_token = random_token("syt");
         self.store.put(
@@ -563,7 +570,15 @@ impl<'a, S: Store> Accounts<'a, S> {
         // died between the two writes would leave the old token live alongside
         // a new one.
         self.store.delete(&key)?;
+        // The access tokens the device held go with it. Left alone, every
+        // refresh would add one more token that stays good, and the expiry
+        // would bound only the newest.
+        self.delete_access_tokens(&record.localpart, &record.device_id)?;
 
+        let record = TokenRecord {
+            issued_at_ms: Some(now_millis()),
+            ..record
+        };
         let access_token = random_token("syt");
         self.store.put(
             &token_key(Keyspace::AccessToken, &access_token),
@@ -594,9 +609,24 @@ impl<'a, S: Store> Accounts<'a, S> {
     ///
     /// Returns a storage or decoding error.
     pub fn identify(&self, token: &str) -> Result<Option<Identity>, AccountError> {
+        self.identify_at(token, now_millis())
+    }
+
+    /// [`Self::identify`] as of `now_ms` (Unix milliseconds), so a test can
+    /// move the clock instead of sleeping through the token lifetime.
+    ///
+    /// An expired token answers `None`, as an unknown one does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn identify_at(&self, token: &str, now_ms: u64) -> Result<Option<Identity>, AccountError> {
         match self.store.get(&token_key(Keyspace::AccessToken, token))? {
             Some(raw) => {
                 let record: TokenRecord = decode(&raw)?;
+                if record_expired(&record, now_ms) {
+                    return Ok(None);
+                }
                 Ok(Some(Identity {
                     user_id: self.user_id(&record.localpart),
                     device_id: record.device_id,
@@ -606,15 +636,66 @@ impl<'a, S: Store> Accounts<'a, S> {
         }
     }
 
-    /// Invalidate one token.
+    /// Is `token` a stored access token whose lifetime has run out? The
+    /// client is told so (`soft_logout`) and refreshes, rather than treating
+    /// it as a credential that never existed.
     ///
     /// # Errors
     ///
-    /// Returns a storage error.
-    pub fn logout(&self, token: &str) -> Result<(), AccountError> {
-        self.store
-            .delete(&token_key(Keyspace::AccessToken, token))?;
-        self.durable()?;
+    /// Returns a storage or decoding error.
+    pub fn is_expired(&self, token: &str) -> Result<bool, AccountError> {
+        match self.store.get(&token_key(Keyspace::AccessToken, token))? {
+            Some(raw) => Ok(record_expired(&decode(&raw)?, now_millis())),
+            None => Ok(false),
+        }
+    }
+
+    /// The session a stored access or refresh token belongs to, whether or
+    /// not the access token has expired: ending a session must work with
+    /// either half of the pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn session_of(&self, token: &str) -> Result<Option<TokenRecord>, AccountError> {
+        for keyspace in [Keyspace::AccessToken, Keyspace::RefreshToken] {
+            if let Some(raw) = self.store.get(&token_key(keyspace, token))? {
+                return Ok(Some(decode(&raw)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// End the session an access or refresh token belongs to: its device and
+    /// every token of it, the refresh token included. Deleting only the
+    /// presented access token would leave the refresh token able to mint a
+    /// new pair after the user signed out. An unknown token is a no-op.
+    ///
+    /// Returns the session that ended, if there was one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or decoding error.
+    pub fn logout(&self, token: &str) -> Result<Option<TokenRecord>, AccountError> {
+        let Some(record) = self.session_of(token)? else {
+            return Ok(None);
+        };
+        self.delete_device(&record.localpart, &record.device_id)?;
+        Ok(Some(record))
+    }
+
+    /// Delete the access tokens of one device, leaving its refresh token.
+    fn delete_access_tokens(&self, localpart: &str, device_id: &str) -> Result<(), AccountError> {
+        let prefix = [
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            Keyspace::AccessToken as u8,
+        ];
+        for (key, raw) in self.store.scan_prefix(&prefix)? {
+            let record: TokenRecord = decode(&raw)?;
+            if record.localpart == localpart && record.device_id == device_id {
+                self.store.delete(&key)?;
+            }
+        }
         Ok(())
     }
 
@@ -946,6 +1027,14 @@ impl<'a, S: Store> Accounts<'a, S> {
 /// does not exist so that a missing account costs the same as a wrong password.
 const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3BpbmRsZWR1bW15c2FsdA$\
     Zx8kM1kDBFqPuHRZ0M0MVXOaEfKMTL9dTgKtOJXHIWQ";
+
+/// Whether an access token minted at `record.issued_at_ms` is past its
+/// lifetime at `now_ms`. A record without a timestamp never expires.
+fn record_expired(record: &TokenRecord, now_ms: u64) -> bool {
+    record
+        .issued_at_ms
+        .is_some_and(|issued| now_ms.saturating_sub(issued) >= ACCESS_TOKEN_LIFETIME_MS)
+}
 
 fn account_key(localpart: &str) -> Vec<u8> {
     room_prefix(Keyspace::Account, localpart)
