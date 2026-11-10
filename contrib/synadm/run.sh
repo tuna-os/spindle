@@ -129,6 +129,20 @@ check "room make-admin"      'isinstance(d, dict)'                             -
 check "history purge"        'isinstance(d, dict)'                             -- history purge "$ROOM" --before-days 0 --delete-local
 check "room delete"          'isinstance(d, dict)'                             -- room delete "$ROOM" --v1
 
+# Media moderation: an upload, quarantined by ID and then served as 404, and
+# a protect that a later purge leaves alone. `synadm media unquarantine`
+# and `synadm media list` are not run here; the Rust tests cover them.
+UP="$(curl -s -X POST "$S/_matrix/media/v3/upload?filename=m.txt" -H "authorization: Bearer $ALICE" \
+  -H 'content-type: text/plain' --data-binary 'moderation fixture' | json content_uri)"
+MEDIA_ID="${UP##*/}"
+status_of() { curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ALICE" "$S/_matrix/client/v1/media/download/$SERVER_NAME/$MEDIA_ID"; }
+[[ "$(status_of)" == 200 ]] || { fail=$((fail+1)); echo "FAIL  media fixture is not served before quarantine"; }
+check "media protect"        'isinstance(d, dict)'                             -- media protect "$MEDIA_ID"
+check "media quarantine"     'isinstance(d, dict)'                             -- media quarantine --media-id "$MEDIA_ID"
+if [[ "$(status_of)" == 404 ]]; then pass=$((pass+1)); echo "ok    quarantined media answers 404"
+else fail=$((fail+1)); echo "FAIL  quarantined media still answers $(status_of)"; fi
+check "media purge"          'isinstance(d, dict)'                             -- media purge --before-days 0
+
 echo
 echo "synadm against Spindle: $pass ok, $fail failed, ${#gaps[@]} not served"
 for g in "${gaps[@]:-}"; do [[ -n $g ]] && echo "  not served: $g"; done

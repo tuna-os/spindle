@@ -61,7 +61,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-169 routes the pinned spec does not define: MSC surfaces under
+177 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -106,7 +106,11 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_spindle/admin/v1/federation/destinations/{}`
 - `/_spindle/admin/v1/federation/destinations/{}/reset_connection`
 - `/_spindle/admin/v1/federation/destinations/{}/rooms`
+- `/_spindle/admin/v1/media/protect/{}`
+- `/_spindle/admin/v1/media/protect/{}/{}`
 - `/_spindle/admin/v1/media/quarantine/{}/{}`
+- `/_spindle/admin/v1/media/unprotect/{}`
+- `/_spindle/admin/v1/media/unprotect/{}/{}`
 - `/_spindle/admin/v1/media/unquarantine/{}/{}`
 - `/_spindle/admin/v1/media/{}/{}`
 - `/_spindle/admin/v1/purge_media_cache`
@@ -153,7 +157,11 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_synapse/admin/v1/federation/destinations/{}`
 - `/_synapse/admin/v1/federation/destinations/{}/reset_connection`
 - `/_synapse/admin/v1/federation/destinations/{}/rooms`
+- `/_synapse/admin/v1/media/protect/{}`
+- `/_synapse/admin/v1/media/protect/{}/{}`
 - `/_synapse/admin/v1/media/quarantine/{}/{}`
+- `/_synapse/admin/v1/media/unprotect/{}`
+- `/_synapse/admin/v1/media/unprotect/{}/{}`
 - `/_synapse/admin/v1/media/unquarantine/{}/{}`
 - `/_synapse/admin/v1/media/{}/{}`
 - `/_synapse/admin/v1/purge_history/{}`

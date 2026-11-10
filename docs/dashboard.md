@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**318 routes implemented; 0 known gaps in scope.**
+**326 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 101 implemented, 0 planned
+### Admin & moderation — 109 implemented, 0 planned
 
 - `GET /_spindle/admin/ui`
 - `GET /_spindle/admin/ui/app.js`
@@ -44,7 +44,11 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/federation/destinations/{destination}`
 - `POST /_spindle/admin/v1/federation/destinations/{destination}/reset_connection`
 - `GET /_spindle/admin/v1/federation/destinations/{destination}/rooms`
+- `POST /_spindle/admin/v1/media/protect/{media_id}`
+- `POST /_spindle/admin/v1/media/protect/{server_name}/{media_id}`
 - `POST /_spindle/admin/v1/media/quarantine/{server_name}/{media_id}`
+- `POST /_spindle/admin/v1/media/unprotect/{media_id}`
+- `POST /_spindle/admin/v1/media/unprotect/{server_name}/{media_id}`
 - `POST /_spindle/admin/v1/media/unquarantine/{server_name}/{media_id}`
 - `GET/DELETE /_spindle/admin/v1/media/{server_name}/{media_id}`
 - `POST /_spindle/admin/v1/purge_media_cache`
@@ -88,7 +92,11 @@ neither implemented nor counted.
 - `GET /_synapse/admin/v1/federation/destinations/{destination}`
 - `POST /_synapse/admin/v1/federation/destinations/{destination}/reset_connection`
 - `GET /_synapse/admin/v1/federation/destinations/{destination}/rooms`
+- `POST /_synapse/admin/v1/media/protect/{media_id}`
+- `POST /_synapse/admin/v1/media/protect/{server_name}/{media_id}`
 - `POST /_synapse/admin/v1/media/quarantine/{server_name}/{media_id}`
+- `POST /_synapse/admin/v1/media/unprotect/{media_id}`
+- `POST /_synapse/admin/v1/media/unprotect/{server_name}/{media_id}`
 - `POST /_synapse/admin/v1/media/unquarantine/{server_name}/{media_id}`
 - `GET/DELETE /_synapse/admin/v1/media/{server_name}/{media_id}`
 - `POST /_synapse/admin/v1/purge_history/{room_id}`

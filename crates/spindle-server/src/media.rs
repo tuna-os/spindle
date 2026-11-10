@@ -94,9 +94,22 @@ pub struct MediaRecord {
     /// evidence and never served; see [`Media::set_quarantine`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined_by: Option<String>,
+    /// The admin who protected it. A protected record is still served, but
+    /// purge, the retention job and cache caps never remove it; see
+    /// [`Media::set_protected`]. Records written before this existed decode
+    /// as unprotected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_by: Option<String>,
 }
 
 impl MediaRecord {
+    /// Whether automatic cleanup must leave this record and its bytes alone:
+    /// quarantined media is evidence, protected media is kept on purpose.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.quarantined_by.is_some() || self.protected_by.is_some()
+    }
+
     /// Whether a browser may render this inline, or must be made to download it.
     #[must_use]
     pub fn inline_safe(&self) -> bool {
@@ -349,6 +362,7 @@ impl Media {
             uploaded_by: uploaded_by.to_owned(),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
         self.store_upload(&media_id, bytes, &record, quota).await?;
         Ok(media_id)
@@ -482,6 +496,7 @@ impl Media {
             uploaded_by: uploaded_by.to_owned(),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -587,6 +602,7 @@ impl Media {
             uploaded_by: uploaded_by.to_owned(),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
         self.store_upload(media_id, bytes, &record, quota).await?;
         Store::delete(self.store.as_ref(), &keys::media_reservation(media_id))?;
@@ -635,6 +651,7 @@ impl Media {
             uploaded_by: format!("federation:{server_name}"),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -935,6 +952,41 @@ impl Media {
         Ok(true)
     }
 
+    /// Protect (`Some(admin)`) or unprotect (`None`) the record under
+    /// `media_id`. Returns whether the record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn set_protected(&self, media_id: &str, by: Option<&str>) -> Result<bool, MediaError> {
+        let Some(mut record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        record.protected_by = by.map(str::to_owned);
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Delete `media_id` unless it is quarantined or protected. Every
+    /// automatic path that removes media (the cache purge, the retention
+    /// job, a cap, a replaced preview image) must use this, never
+    /// [`Self::delete`]: a quarantined item is evidence and a protected one
+    /// was kept on purpose. Returns whether anything was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn delete_unheld(&self, media_id: &str) -> Result<bool, MediaError> {
+        match self.record(media_id)? {
+            Some(record) if !record.held() => self.delete(media_id).await,
+            _ => Ok(false),
+        }
+    }
+
     /// Quarantine a remote server's media, cached here or not.
     ///
     /// An uncached item gets a record with no bytes, so the cache's "do I
@@ -963,6 +1015,7 @@ impl Media {
             uploaded_by: format!("federation:{server_name}"),
             created_ts: Some(now_millis()),
             quarantined_by: Some(by.to_owned()),
+            protected_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -974,8 +1027,8 @@ impl Media {
 
     /// Delete cached remote media last cached before `before_ts`
     /// (milliseconds), and return the IDs removed. This server's own
-    /// uploads are never touched, and neither is a quarantined item:
-    /// purging it would release what the operator meant to hold.
+    /// uploads are never touched, and neither is a quarantined or protected
+    /// item: purging it would release what the operator meant to hold.
     ///
     /// # Errors
     ///
@@ -984,8 +1037,11 @@ impl Media {
         let mut purged = Vec::new();
         for (media_id, record) in self.records()? {
             let old = record.created_ts.is_none_or(|ts| ts < before_ts);
-            if media_id.contains('/') && record.quarantined_by.is_none() && old {
-                self.delete(&media_id).await?;
+            if media_id.contains('/')
+                && !record.held()
+                && old
+                && self.delete_unheld(&media_id).await?
+            {
                 purged.push(media_id);
             }
         }
@@ -1353,6 +1409,97 @@ mod tests {
         );
     }
 
+    fn scratch() -> (tempfile::TempDir, Media) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Media::new(store, blobs, "example.org");
+        (dir, media)
+    }
+
+    /// Replacing or capping cached media goes through `delete_unheld`, which
+    /// must leave a quarantined record and its bytes, and a protected one.
+    #[tokio::test]
+    async fn delete_unheld_keeps_quarantined_and_protected_media() {
+        let (_dir, media) = scratch();
+        for id in ["plain", "evidence", "kept"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        let id = |name: &str| Media::remote_id("remote.example", name);
+        media
+            .set_quarantine(&id("evidence"), Some("@admin:example.org"))
+            .unwrap();
+        media
+            .set_protected(&id("kept"), Some("@admin:example.org"))
+            .unwrap();
+
+        assert!(!media.delete_unheld(&id("evidence")).await.unwrap());
+        assert!(!media.delete_unheld(&id("kept")).await.unwrap());
+        assert!(media.delete_unheld(&id("plain")).await.unwrap());
+        for held in ["evidence", "kept"] {
+            let record = media.record(&id(held)).unwrap().expect("record kept");
+            assert!(
+                media.blobs.get(&record.hash).await.unwrap().is_some(),
+                "{held} keeps its bytes"
+            );
+        }
+        assert!(media.record(&id("plain")).unwrap().is_none());
+
+        // Unprotecting makes it removable again.
+        media.set_protected(&id("kept"), None).unwrap();
+        assert!(media.delete_unheld(&id("kept")).await.unwrap());
+    }
+
+    /// The purge spares a protected item and takes it once unprotected; a
+    /// record written before `protected_by` existed still decodes.
+    #[tokio::test]
+    async fn purge_remote_spares_protected_media_until_it_is_released() {
+        let (_dir, media) = scratch();
+        for id in ["plain", "kept"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        let kept = Media::remote_id("remote.example", "kept");
+        assert!(
+            media
+                .set_protected(&kept, Some("@admin:example.org"))
+                .unwrap()
+        );
+        assert!(
+            !media
+                .set_protected("remote.example/missing", Some("@a:b"))
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let purged = media.purge_remote(now_millis()).await.unwrap();
+        assert_eq!(purged, vec![Media::remote_id("remote.example", "plain")]);
+        assert!(media.record(&kept).unwrap().is_some(), "protected survives");
+        // Protected media is still served; only quarantine hides it.
+        media.bytes(&kept).await.unwrap();
+        media
+            .set_quarantine(&kept, Some("@admin:example.org"))
+            .unwrap();
+        assert!(media.bytes(&kept).await.is_err(), "quarantine wins");
+
+        media.set_quarantine(&kept, None).unwrap();
+        media.set_protected(&kept, None).unwrap();
+        let purged = media.purge_remote(now_millis() + 1).await.unwrap();
+        assert_eq!(purged, vec![kept]);
+
+        let old: MediaRecord = serde_json::from_str(
+            r#"{"hash":"h","content_type":"text/plain","filename":null,"size":1,"uploaded_by":"@a:b"}"#,
+        )
+        .unwrap();
+        assert!(old.protected_by.is_none() && !old.held());
+    }
+
     #[test]
     fn a_filename_cannot_inject_a_header() {
         // The uploader chooses the name, so it is attacker-controlled input
@@ -1365,6 +1512,7 @@ mod tests {
             uploaded_by: "@a:b".to_owned(),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
 
         let injected = record("evil\r\nX-Evil: yes").content_disposition();
@@ -1400,6 +1548,7 @@ mod tests {
                 uploaded_by: "@a:b".to_owned(),
                 created_ts: Some(now_millis()),
                 quarantined_by: None,
+                protected_by: None,
             };
             assert!(!record.inline_safe(), "{dangerous} must not render inline");
             assert_eq!(record.content_disposition(), "attachment");
@@ -1416,6 +1565,7 @@ mod tests {
             uploaded_by: "@a:b".to_owned(),
             created_ts: Some(now_millis()),
             quarantined_by: None,
+            protected_by: None,
         };
         assert!(record.inline_safe());
         assert_eq!(

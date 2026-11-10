@@ -304,6 +304,13 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
                 reqwest::Method::POST,
                 format!("{prefix}/room/!r:x/media/quarantine"),
             ),
+            (reqwest::Method::POST, format!("{prefix}/media/protect/x")),
+            (reqwest::Method::POST, format!("{prefix}/media/unprotect/x")),
+            (reqwest::Method::POST, format!("{prefix}/media/protect/x/y")),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/unprotect/x/y"),
+            ),
             (
                 reqwest::Method::POST,
                 format!("{prefix}/purge_media_cache?before_ts=1"),
@@ -2569,6 +2576,135 @@ async fn quarantine_by_user_and_room_hides_media_and_lists_it() {
         )
         .await;
     assert_eq!(status, 404, "an unknown local item is not reported as held");
+}
+
+/// Protection is reported as `safe_from_quarantine`, spares an item from a
+/// user's bulk quarantine, is audited, and releases on unprotect. Naming the
+/// item still quarantines it, and quarantine wins over serving.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn protecting_media_spares_it_from_bulk_quarantine_and_is_reported() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let alice = server.user("alice");
+    let mut ids = Vec::new();
+    for name in ["a1.txt", "a2.txt"] {
+        let response = server
+            .client
+            .post(format!(
+                "http://{}/_matrix/media/v3/upload?filename={name}",
+                server.name
+            ))
+            .header("authorization", format!("Bearer {alice_token}"))
+            .header("content-type", "text/plain")
+            .body(name)
+            .send()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        ids.push(
+            body["content_uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let post = |path: String| {
+        let (server, token) = (&server, admin_token.clone());
+        async move {
+            server
+                .request(reqwest::Method::POST, &path, Some(&token), Some(&json!({})))
+                .await
+        }
+    };
+    let status_of = |id: String| {
+        let (server, token) = (&server, alice_token.clone());
+        async move {
+            server
+                .client
+                .get(format!(
+                    "http://{}/_matrix/client/v1/media/download/{}/{id}",
+                    server.name, server.name
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    let (status, body) = post(format!("/_synapse/admin/v1/media/protect/{}", ids[0])).await;
+    assert_eq!((status, &body), (200, &json!({})));
+    let (status, _) = post("/_synapse/admin/v1/media/protect/nosuchmedia".to_owned()).await;
+    assert_eq!(status, 404, "an unknown item is not reported as protected");
+    let (_, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media?order_by=media_id"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    let flags = |listing: &Value| -> std::collections::BTreeMap<String, bool> {
+        listing["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["media_id"].as_str().unwrap().to_owned(),
+                    m["safe_from_quarantine"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+    assert!(flags(&listing)[&ids[0]], "{listing}");
+    assert!(!flags(&listing)[&ids[1]], "{listing}");
+
+    let (_, body) = post(format!("/_spindle/admin/v1/user/{alice}/media/quarantine")).await;
+    assert_eq!(
+        body,
+        json!({ "num_quarantined": 1 }),
+        "protected is skipped"
+    );
+    assert_eq!(status_of(ids[0].clone()).await, 200, "protected is served");
+    assert_eq!(status_of(ids[1].clone()).await, 404);
+
+    // Naming the protected item quarantines it: quarantine wins.
+    let (status, _) = post(format!(
+        "/_spindle/admin/v1/media/quarantine/{}/{}",
+        server.name, ids[0]
+    ))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(ids[0].clone()).await, 404);
+
+    let (status, _) = post(format!(
+        "/_spindle/admin/v1/media/unprotect/{}/{}",
+        server.name, ids[0]
+    ))
+    .await;
+    assert_eq!(status, 200);
+    let (_, info) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/media/{}/{}", server.name, ids[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(info["media_info"]["safe_from_quarantine"], false, "{info}");
+    assert_eq!(
+        info["media_info"]["quarantined_by"],
+        server.user("root").as_str()
+    );
 }
 
 /// Event reports filter, page by integer token, and can be dismissed;
