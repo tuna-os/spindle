@@ -471,3 +471,47 @@ fn a_half_claim_is_refused_at_startup() {
     .unwrap();
     assert!(spindle_server::app(config, store).is_err());
 }
+
+/// A path under the claimed prefix that carries dot segments, encoded dots,
+/// encoded separators, backslashes or empty segments is refused 400 and
+/// never reaches the service, which would receive the `hs_token` with it. An
+/// ordinary path under the prefix is still forwarded.
+#[tokio::test]
+async fn a_claimed_path_with_dot_segments_is_refused_and_not_forwarded() {
+    let (sidecar, url) = Sidecar::serve().await;
+    let harness = Harness::with_sidecar(&url, true);
+    let alice = harness.register("alice").await;
+
+    for tail in [
+        "../../../../_matrix/app/v1/transactions/x",
+        "%2e%2e/%2E%2e/_matrix/app/v1/transactions/x",
+        ".%2e/x",
+        "./x",
+        "a%2f..%2fb",
+        "a%5Cb",
+        "a//b",
+    ] {
+        let path = format!("/_matrix/client/v1/rtc/livekit/{tail}");
+        let (status, body, _) = harness
+            .call("PUT", &path, Some(&alice), Some(json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_INVALID_PARAM", "{path}");
+    }
+    assert!(
+        sidecar.heard().is_empty(),
+        "a refused path reached the service: {:?}",
+        sidecar.heard()
+    );
+
+    let (status, body, _) = harness
+        .call(
+            "PUT",
+            "/_matrix/client/v1/rtc/livekit/a.b/c-d/",
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(sidecar.heard().len(), 1);
+}

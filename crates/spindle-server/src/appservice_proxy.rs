@@ -233,9 +233,7 @@ fn fed_proxy_target(
     let allowed = service.proxy().is_some_and(|(prefix, _)| {
         split(&path).is_some_and(|(api, rest)| {
             api == Api::Federation && crate::appservices::claims_path(prefix, rest)
-        }) && !path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
+        }) && is_plain_path(&path)
     });
     if !allowed {
         return Err(fed_proxy_refusal(
@@ -339,6 +337,33 @@ pub(crate) fn split(path: &str) -> Option<(Api, &str)> {
     Some((api, rest))
 }
 
+/// Whether `path` (no query) can be forwarded verbatim without its meaning
+/// depending on who reads it next.
+///
+/// The claim is matched on the raw path and the same bytes go to the
+/// service, carrying its `hs_token`. A `..` (or `%2e%2e`, or an encoded
+/// separator) that this server leaves alone can be collapsed by the HTTP
+/// client or by the service, turning a path under the claimed prefix into
+/// one outside it, such as a homeserver-to-service transaction. So dot
+/// segments in any spelling, encoded `/` and `\`, backslashes and empty
+/// segments are refused. One trailing slash is ordinary and allowed.
+fn is_plain_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    rest.split('/').all(|segment| {
+        let lowered = segment.to_ascii_lowercase();
+        let decoded = lowered.replace("%2e", ".");
+        !segment.is_empty()
+            && !segment.contains('\\')
+            && !lowered.contains("%2f")
+            && !lowered.contains("%5c")
+            && decoded != "."
+            && decoded != ".."
+    })
+}
+
 /// The router's fallback: a path a service claims (MSC4512) is forwarded to
 /// it; anything else is the spec's `M_UNRECOGNIZED`.
 pub(crate) async fn proxy_or_unknown(State(state): State<AppState>, request: Request) -> Response {
@@ -371,6 +396,14 @@ pub(crate) async fn forward_claimed(
     }) else {
         return Ok(request);
     };
+    if !is_plain_path(&path) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "the path has dot segments, empty segments or encoded separators",
+        )
+        .into_response());
+    }
     Err(match forward(state, api, &service, request).await {
         Ok(response) | Err(response) => response,
     })
