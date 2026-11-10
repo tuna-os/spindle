@@ -604,6 +604,35 @@ async fn federation_public_rooms_filtered(
     )
 }
 
+/// The rooms whose members a restricted (or knock-restricted) room admits.
+/// Empty for any other join rule, which is what the spec's
+/// `allowed_room_ids` means for a room that is not restricted.
+fn restricted_allow(state: &AppState, room_id: &str) -> Vec<String> {
+    let Ok(events) = state.rooms.state_unscoped(room_id) else {
+        return Vec::new();
+    };
+    let Some(rules) = events
+        .iter()
+        .find(|event| event["type"] == "m.room.join_rules")
+    else {
+        return Vec::new();
+    };
+    if !matches!(
+        rules["content"]["join_rule"].as_str(),
+        Some("restricted" | "knock_restricted")
+    ) {
+        return Vec::new();
+    }
+    rules["content"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["type"] == "m.room_membership")
+        .filter_map(|entry| entry["room_id"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct FederationHierarchyQuery {
     #[serde(default)]
@@ -636,7 +665,17 @@ async fn federation_hierarchy(
         }
         let open = summary.world_readable
             || matches!(summary.join_rule.as_deref(), Some("public" | "knock"));
-        open.then_some(summary)
+        // A restricted room is visible to a server that is in a room its
+        // rule admits: that server's users can join it, so they may see it.
+        let admitted = || {
+            restricted_allow(&state, room).iter().any(|allowed| {
+                state
+                    .rooms
+                    .server_in_room(allowed, &origin)
+                    .unwrap_or(false)
+            })
+        };
+        (open || admitted()).then_some(summary)
     };
     let Some(root) = visible(&room_id) else {
         return Err(MatrixError::new(
@@ -652,7 +691,10 @@ async fn federation_hierarchy(
         };
         let children = space_children(&state, &summary.room_id, query.suggested_only);
         entry.insert("children_state".to_owned(), Value::Array(children));
-        entry.insert("allowed_room_ids".to_owned(), json!([]));
+        entry.insert(
+            "allowed_room_ids".to_owned(),
+            json!(restricted_allow(&state, &summary.room_id)),
+        );
         Value::Object(entry)
     };
     let parent = with_children(&root);

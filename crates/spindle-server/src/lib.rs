@@ -69,6 +69,7 @@ pub mod ratelimit;
 pub mod receipts;
 pub mod recovery;
 pub mod registration_tokens;
+pub mod remote_space;
 pub mod rendezvous;
 pub mod room_routes;
 pub mod rooms;

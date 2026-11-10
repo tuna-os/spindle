@@ -6,6 +6,7 @@ use crate::auth::Authenticated;
 use crate::errors::MatrixError;
 use crate::inbound::{join_candidates, merge_returned_signatures, sign_membership_template};
 use crate::ratelimit::{Budget, limit_write, limit_write_on};
+use crate::remote_space::{RemoteRoom, fetch_level, via_of};
 use crate::routes::{
     DelayQuery, chunk_of, delay_error, directory_error, may_read_room, optional_body, room_error,
     space_children,
@@ -16,6 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 /// Creating a room, getting in and out of one, and who else is there.
 pub fn routes() -> Router<AppState> {
@@ -1493,25 +1495,32 @@ async fn room_summary(
     State(state): State<AppState>,
     crate::auth::MaybeAuthenticated(viewer): crate::auth::MaybeAuthenticated,
     axum::extract::Path(room_id_or_alias): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, MatrixError> {
+    let mut servers = server_name_params(query.as_deref());
     let room_id = if room_id_or_alias.starts_with('#') {
-        state
+        let local = state
             .directory
             .resolve(&room_id_or_alias)
-            .map_err(|error| directory_error(&error))?
-            .ok_or_else(|| {
-                MatrixError::new(
-                    StatusCode::NOT_FOUND,
-                    "M_NOT_FOUND",
-                    format!("no room is called {room_id_or_alias}"),
-                )
-            })?
-            .room_id
+            .map_err(|error| directory_error(&error))?;
+        match local {
+            Some(record) => record.room_id,
+            None => resolve_remote_alias(&state, &room_id_or_alias, &mut servers).await?,
+        }
     } else {
         room_id_or_alias
     };
 
-    let summary = state.rooms.summary(&room_id).map_err(room_error)?;
+    let summary = match state.rooms.summary(&room_id) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let viewer_id = viewer.as_ref().map(|identity| identity.user_id.as_str());
+            return match remote_summary(&state, &room_id, &servers, viewer_id).await {
+                Some(body) => Ok(Json(body)),
+                None => Err(room_error(error)),
+            };
+        }
+    };
     let membership = match viewer {
         Some(identity) => {
             let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
@@ -1561,6 +1570,74 @@ async fn room_summary(
         }
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// Resolve an alias this server's directory does not hold by asking the
+/// server the alias names, remembering the servers it says can vouch for the
+/// room. The answer is only an ID and a list of servers: nothing is shown to
+/// the caller until the room itself has been asked about.
+async fn resolve_remote_alias(
+    state: &AppState,
+    alias: &str,
+    servers: &mut Vec<String>,
+) -> Result<String, MatrixError> {
+    let not_found = || {
+        MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("no room is called {alias}"),
+        )
+    };
+    let domain = alias
+        .split_once(':')
+        .map(|(_, domain)| domain)
+        .filter(|domain| *domain != state.config.server.name)
+        .ok_or_else(not_found)?;
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.federation.remote_query_directory(domain, alias),
+    )
+    .await
+    .map_err(|_| not_found())?
+    .map_err(|error| {
+        tracing::debug!("remote alias resolution failed: {error}");
+        not_found()
+    })?;
+    for named in answer["servers"].as_array().into_iter().flatten() {
+        if let Some(named) = named.as_str()
+            && !servers.iter().any(|server| server == named)
+        {
+            servers.push(named.to_owned());
+        }
+    }
+    // The alias's own server is a candidate too: it answered for the alias.
+    if !servers.iter().any(|server| server == domain) {
+        servers.push(domain.to_owned());
+    }
+    answer["room_id"]
+        .as_str()
+        .filter(|id| id.starts_with('!'))
+        .map(str::to_owned)
+        .ok_or_else(not_found)
+}
+
+/// The MSC3266 summary of a room this server does not hold, from the `room`
+/// object of the owning server's federation hierarchy answer (as Synapse
+/// does). Shown only if the room is open to this viewer by the same rule the
+/// hierarchy applies; `None` when it is not, or nobody answers, so the caller
+/// reports the same error as for an unknown room.
+async fn remote_summary(
+    state: &AppState,
+    room_id: &str,
+    servers: &[String],
+    viewer: Option<&str>,
+) -> Option<Value> {
+    let mut budget = crate::remote_space::MAX_REMOTE_FETCHES;
+    let level = fetch_level(state, room_id, servers, false, &mut budget).await?;
+    if !level.room.visible_to(state, viewer) {
+        return None;
+    }
+    Some(Value::Object(level.room.chunk))
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state`
@@ -1993,50 +2070,11 @@ async fn room_hierarchy(
         ));
     }
 
-    // Visibility is decided ONCE, as a room enters the walk. Filtering again
-    // at render time would look like belt and braces and is actually a bug:
-    // `ordered` would count rooms the caller cannot see, so `total` -- and
-    // therefore `next_batch` -- would be computed from a number that does not
-    // match what is returned, and `take(limit)` would hand back a SHORT page
-    // whenever an invisible room fell inside it. A client paging by counting
-    // would then mis-page. So nothing invisible is ever put in the list.
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut ordered: Vec<(crate::rooms::RoomSummary, Vec<Value>)> = Vec::new();
-    let mut frontier = vec![(room_id.clone(), 0_usize)];
-    visited.insert(room_id.clone());
-
-    while !frontier.is_empty() {
-        let (current, depth) = frontier.remove(0);
-        // The ONE visibility check, and it is deliberately here rather than at
-        // enqueue time. `continue` skips the child expansion below too, so an
-        // invisible room is neither returned nor descended into -- a second
-        // check on the way in would be pure optimisation, and a second check
-        // at render time is the bug described above. One check, one place.
-        let Some(summary) = hierarchy_visible(&state, &identity.user_id, &current) else {
-            continue;
-        };
-        let children = space_children(&state, &current, query.suggested_only);
-        ordered.push((summary, children.clone()));
-        if depth >= max_depth {
-            continue;
-        }
-        for child in &children {
-            let Some(child_id) = child["state_key"].as_str() else {
-                continue;
-            };
-            if !visited.insert(child_id.to_owned()) {
-                continue;
-            }
-            frontier.push((child_id.to_owned(), depth + 1));
-        }
-    }
+    let ordered = hierarchy_walk(&state, &identity.user_id, &room_id, max_depth, &query).await;
 
     let total = ordered.len();
     let mut rooms = Vec::new();
-    for (summary, children) in ordered.into_iter().skip(offset).take(limit) {
-        let Value::Object(mut entry) = chunk_of(&summary) else {
-            continue;
-        };
+    for (mut entry, children) in ordered.into_iter().skip(offset).take(limit) {
         entry.insert("children_state".to_owned(), Value::Array(children));
         rooms.push(Value::Object(entry));
     }
@@ -2047,6 +2085,107 @@ async fn room_hierarchy(
         body.insert("next_batch".to_owned(), json!((offset + limit).to_string()));
     }
     Ok(Json(Value::Object(body)))
+}
+
+/// One room in a walk waiting to be visited.
+struct Pending {
+    room_id: String,
+    depth: usize,
+    /// Servers the parent's `m.space.child` says can describe the room.
+    via: Vec<String>,
+    /// The room as its parent's remote server already described it.
+    prefetched: Option<RemoteRoom>,
+}
+
+/// Breadth-first walk of the space graph from `root`, returning each visible
+/// room's summary and `children_state`.
+///
+/// Visibility is decided ONCE, as a room enters the list. Filtering again at
+/// render time would look like belt and braces and is actually a bug: `total`
+/// -- and therefore `next_batch` -- would be computed from a number that does
+/// not match what is returned, and `take(limit)` would hand back a SHORT page
+/// whenever an invisible room fell inside it. So nothing invisible is ever put
+/// in the list, and an invisible room is not descended into either.
+///
+/// A room this server holds is judged by its own state. A room it does not
+/// hold is asked of the servers in the `via` of its `m.space.child`, and
+/// judged by the same rule applied to what they say; if none answers it is
+/// left out, like any room the caller may not see.
+async fn hierarchy_walk(
+    state: &AppState,
+    user: &str,
+    start: &str,
+    max_depth: usize,
+    query: &HierarchyQuery,
+) -> Vec<(serde_json::Map<String, Value>, Vec<Value>)> {
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    let mut frontier = std::collections::VecDeque::new();
+    let mut budget = crate::remote_space::MAX_REMOTE_FETCHES;
+    visited.insert(start.to_owned());
+    frontier.push_back(Pending {
+        room_id: start.to_owned(),
+        depth: 0,
+        via: Vec::new(),
+        prefetched: None,
+    });
+
+    while let Some(pending) = frontier.pop_front() {
+        let mut level_children: HashMap<String, RemoteRoom> = HashMap::new();
+        let (chunk, children) = if state.rooms.summary(&pending.room_id).is_ok() {
+            let Some(summary) = hierarchy_visible(state, user, &pending.room_id) else {
+                continue;
+            };
+            let Value::Object(chunk) = chunk_of(&summary) else {
+                continue;
+            };
+            (
+                chunk,
+                space_children(state, &pending.room_id, query.suggested_only),
+            )
+        } else {
+            let remote = if let Some(prefetched) = pending.prefetched {
+                prefetched
+            } else {
+                let Some(level) = fetch_level(
+                    state,
+                    &pending.room_id,
+                    &pending.via,
+                    query.suggested_only,
+                    &mut budget,
+                )
+                .await
+                else {
+                    continue;
+                };
+                level_children = level.children;
+                level.room
+            };
+            if !remote.visible_to(state, Some(user)) {
+                continue;
+            }
+            (remote.chunk, remote.children_state)
+        };
+        ordered.push((chunk, children.clone()));
+        if pending.depth >= max_depth {
+            continue;
+        }
+        for child in &children {
+            let Some(child_id) = child["state_key"].as_str() else {
+                continue;
+            };
+            if !visited.insert(child_id.to_owned()) {
+                continue;
+            }
+            frontier.push_back(Pending {
+                room_id: child_id.to_owned(),
+                depth: pending.depth + 1,
+                via: via_of(child),
+                prefetched: level_children.remove(child_id),
+            });
+        }
+    }
+    ordered
 }
 
 #[derive(Debug, Deserialize)]
