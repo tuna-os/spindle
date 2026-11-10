@@ -50,6 +50,8 @@ pub struct Config {
     /// History retention (#817). Off unless `enabled`.
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
@@ -59,6 +61,18 @@ pub struct Config {
     /// link.
     #[serde(default)]
     pub email: Option<EmailConfig>,
+}
+
+/// `/search` (#830).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Keep a word index of `content.body` in the store and use it to
+    /// narrow `/search`. Results are the same either way. Off by default;
+    /// a room is searched through the index once `spindle reindex-search`
+    /// has built it, or from its first event on while this is on.
+    #[serde(default)]
+    pub index: bool,
 }
 
 /// How to reach the SMTP relay.

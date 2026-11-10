@@ -1682,6 +1682,7 @@ impl Rooms {
                 spindle_core::keys::event_room(id),
                 room_id.as_bytes().to_vec(),
             )];
+            extra.extend(self.search_rows(&log, room_id, &entry, event)?);
             // MSC4354: a seeded sticky event is owed to this server's
             // syncing clients like any other, at a position every token
             // issued before the join precedes.

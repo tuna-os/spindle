@@ -4,7 +4,7 @@
 use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
-use crate::rooms::ReadScope;
+use crate::rooms::{ReadScope, SearchPlan};
 use crate::routes::{
     PublicRoomsQuery, PublicRoomsRequest, RoomStreamOrder, SEARCH_LIMIT_MAX, SearchHit, as_seen_by,
     directory_error, directory_page, page_by_stream, parse_stream_cursor, room_error,
@@ -515,7 +515,8 @@ fn text_at<'a>(event: &'a Value, path: &str) -> Option<&'a str> {
 
 /// Does `event` pass the search's filter and carry the term under one of
 /// its keys? Case-insensitive containment, which is what "search basics"
-/// means here: no stemming, no ranking, no index.
+/// means here: no stemming and no ranking. The optional word index
+/// (`[search] index`) only narrows which events are tested.
 fn search_matches(event: &Value, needle: &str, keys: &[String], filter: &SearchFilter) -> bool {
     let sender = event["sender"].as_str().unwrap_or_default();
     let event_type = event["type"].as_str().unwrap_or_default();
@@ -601,13 +602,18 @@ async fn search(
     // as it stands now; the token handed back carries that position.
     let snapshot = snapshot.unwrap_or_else(|| state.rooms.stream_position());
     let matches = |event: &Value| search_matches(event, &needle, &keys, &criteria.filter);
+    // The index covers `content.body` and nothing else.
+    let indexed_needle = (keys == ["content.body"]).then_some(needle.as_str());
 
     let SearchPage { hits, scopes, more } = search_rooms(
         &state,
         &identity.user_id,
         criteria.filter.rooms.as_deref(),
         &criteria.filter.not_rooms,
-        &matches,
+        &SearchPlan {
+            needle: indexed_needle,
+            matches: &matches,
+        },
         limit,
         (snapshot, &mut cursor),
     )?;
@@ -667,7 +673,7 @@ fn search_rooms(
     user_id: &str,
     rooms: Option<&[String]>,
     not_rooms: &[String],
-    matches: &(dyn Fn(&Value) -> bool + Sync),
+    plan: &SearchPlan<'_>,
     limit: usize,
     (snapshot, cursor): (u64, &mut BTreeMap<String, i64>),
 ) -> Result<SearchPage, MatrixError> {
@@ -692,7 +698,7 @@ fn search_rooms(
         let (found, next) = state
             .rooms
             .reader_with(user_id, &room_id, scope.clone())
-            .search(from, limit, matches)
+            .search_planned(from, limit, plan)
             .map_err(room_error)?;
         more |= next.is_some();
         hits.extend(found.into_iter().map(|event| {

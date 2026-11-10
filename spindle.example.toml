@@ -657,6 +657,16 @@ registrations = []
 # Minutes between two runs of the job.
 # interval_minutes = 60
 
+[search]
+# A word index for `POST /search` (#830). Without it, a search reads every
+# message of each room it covers. With it, a search reads only the messages
+# that may contain the words, and the answer is the same. The index covers
+# `content.body`, the default search key. Searches on other keys still scan.
+# The index adds a few rows to each message that the server stores. Rooms
+# that existed before you turned it on are searched by scanning until you
+# stop the server and run `spindle reindex-search <config>`.
+# index = false
+
 [limits]
 # Ceilings on what one account may make this server hold. Each of these
 # stores grew without bound under an ordinary registered account before the

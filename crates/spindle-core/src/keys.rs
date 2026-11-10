@@ -682,6 +682,22 @@ pub enum Keyspace {
     /// seed. The row is written before the first delete, so a crash leaves a
     /// room that reads as already truncated.
     ChainCheckpoint = 0x67,
+    /// `(room_id, token, li)` -> nothing: one row for each word of an
+    /// event's `content.body`. Derived data, written in the event's own
+    /// batch when `[search] index` is on; the log is the truth. A row
+    /// outliving its body is harmless, because a search verifies every
+    /// candidate against the body.
+    ///
+    /// `0x80` and up, apart from the run other branches allocate from.
+    SearchPosting = 0x80,
+    /// `(room_id, token)` -> nothing: the words a room's postings use, so
+    /// a part of a word can find the words that contain it. Never pruned
+    /// by a redaction: a stale word only costs one empty posting scan.
+    SearchVocab = 0x81,
+    /// `room_id` -> the highest `li` below which every entry is indexed
+    /// (big-endian, order-preserving `i64`). A room without the row is
+    /// not indexed and is searched by scanning.
+    SearchMarker = 0x82,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -692,6 +708,44 @@ const _: () = assert!(
     Keyspace::Account as u8 > Keyspace::RoomMeta as u8,
     "new keyspaces take fresh discriminants; they never reuse an existing one"
 );
+
+/// The prefix of one word's postings in one room: every row under it is
+/// one event's `li`, in order. The NUL ends the word, which never holds one.
+#[must_use]
+pub fn search_posting_prefix(room_id: &str, token: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::SearchPosting, room_id);
+    key.extend_from_slice(token.as_bytes());
+    key.push(0);
+    key
+}
+
+/// One posting: `token` occurs in the body of the event at `li`.
+#[must_use]
+pub fn search_posting(room_id: &str, token: &str, li: LinearIndex) -> Vec<u8> {
+    let mut key = search_posting_prefix(room_id, token);
+    key.extend_from_slice(&order_preserving(li.get()));
+    key
+}
+
+/// The prefix of a room's vocabulary rows.
+#[must_use]
+pub fn search_vocab_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::SearchVocab, room_id)
+}
+
+/// The vocabulary row for one word of a room.
+#[must_use]
+pub fn search_vocab(room_id: &str, token: &str) -> Vec<u8> {
+    let mut key = search_vocab_prefix(room_id);
+    key.extend_from_slice(token.as_bytes());
+    key
+}
+
+/// The row that says how far a room is indexed.
+#[must_use]
+pub fn search_marker(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::SearchMarker, room_id)
+}
 
 /// The global-profile row for one user.
 #[must_use]
