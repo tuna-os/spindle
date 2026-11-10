@@ -1459,9 +1459,12 @@ current state and of the parents of kept entries stay, without a chain
 value, and so do the bodies in the auth chain of kept events. `spindle gc`
 frees the state nodes that only the removed roots used. The floor never
 passes the head, an extremity or a gap anchor, and a room in hub mode, in a
-partial-state join or with a fork is left alone. The `[retention]` policy,
-`m.room.retention` and the background job are not built yet. `purge_history`
-still deletes only bodies.
+partial-state join or with a fork is left alone. The `[retention]` policy
+(off by default) and the room's `m.room.retention` event (MSC1763) set a
+maximum lifetime for each room, and a background job truncates each room
+below the events that lifetime has expired. The server limits clamp the
+room's choice. `purge_history` truncates when it is sent `"truncate": true`
+and otherwise deletes only bodies. Media retention is not built.
 
 ---
 

@@ -41,6 +41,9 @@ the incident it was supposed to explain.
 | `spindle_sync_subscribers` | gauge | — | Clients currently blocked in a long-polling `/sync`. |
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
+| `spindle_retention_runs_total` | counter | | Passes of the history retention job (#817). Zero while `[retention]` is off. |
+| `spindle_retention_rooms_total` | counter | `result` = `truncated`\|`refused`\|`failed` | Rooms the job handled. `refused` means a hub, partial-state or forked room. |
+| `spindle_retention_deleted_total` | counter | `kind` = `entries`\|`bodies` | Log rows and event bodies the job deleted. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
 | `spindle_last_successful_backup_timestamp_seconds` | gauge | — | Unix time of the last backup that `POST /_spindle/admin/v1/backup` wrote. `0` until one succeeds after a start. |
 | `spindle_federation_gaps_remaining` | gauge | — | Recorded federation gaps whose history is not backfilled yet (SPEC §6.6). Should fall to `0` within minutes of a gap acceptance. |

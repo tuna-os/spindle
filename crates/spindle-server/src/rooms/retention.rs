@@ -30,10 +30,83 @@ use spindle_core::{EventId, LinearIndex, RoomLog};
 use spindle_store::codec::{ChainCheckpointRecord, EntryRecord};
 use spindle_store::{Durability, ReadView, Store};
 
+use crate::config::RetentionConfig;
+
 use super::{INVITE_STR, JOIN_STR, RoomError, Rooms, current_state, event_body_key};
 
 /// Keys deleted per store call.
 const DELETE_BATCH: usize = 4096;
+
+/// Milliseconds in a day, for the day-based server limits.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The state event that sets a room's own lifetime (MSC1763).
+pub const RETENTION_EVENT_TYPE: &str = "m.room.retention";
+
+/// What a room's `m.room.retention` event asks for, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoomPolicy {
+    pub max_lifetime_ms: Option<u64>,
+    pub min_lifetime_ms: Option<u64>,
+}
+
+impl RoomPolicy {
+    /// Read the event's content. A value that is not a positive integer is
+    /// ignored, as if the room had not set it.
+    #[must_use]
+    pub fn from_content(content: &Value) -> Self {
+        let read = |field: &str| {
+            content
+                .get(field)
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+        };
+        Self {
+            max_lifetime_ms: read("max_lifetime"),
+            min_lifetime_ms: read("min_lifetime"),
+        }
+    }
+}
+
+/// How long a room keeps events, or `None` for forever.
+///
+/// The room's own maximum wins over the server default, but never passes
+/// the server's. The result is never below the server's minimum or the
+/// room's own `min_lifetime`: a policy that contradicts itself keeps more.
+#[must_use]
+pub fn effective_max_lifetime_ms(config: &RetentionConfig, room: &RoomPolicy) -> Option<u64> {
+    let server_max = config
+        .max_lifetime_days
+        .map(|days| u64::from(days).saturating_mul(DAY_MS));
+    let server_min = config
+        .min_lifetime_days
+        .map(|days| u64::from(days).saturating_mul(DAY_MS));
+    let mut max = match (room.max_lifetime_ms, server_max) {
+        (Some(room), Some(server)) => Some(room.min(server)),
+        (room, server) => room.or(server),
+    }?;
+    for floor in [server_min, room.min_lifetime_ms].into_iter().flatten() {
+        max = max.max(floor);
+    }
+    Some(max)
+}
+
+/// What one pass of the job did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PassReport {
+    /// Rooms looked at.
+    pub rooms: u64,
+    /// Rooms that lost entries.
+    pub truncated: u64,
+    /// Rooms left alone for a reason ([`TruncationReport::refused`]).
+    pub refused: u64,
+    /// Rooms whose read or truncation failed. The pass goes on.
+    pub failed: u64,
+    /// Log rows deleted.
+    pub entries: u64,
+    /// Event bodies deleted.
+    pub bodies: u64,
+}
 
 /// What one truncation did, or why it did nothing.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -113,6 +186,82 @@ impl Rooms {
             }
             rooms.finish_truncation(room_id, log, delete_floor)
         })
+    }
+
+    /// A room's own retention policy, empty when it has set none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room cannot be read.
+    pub fn room_retention(&self, room_id: &str) -> Result<RoomPolicy, RoomError> {
+        match self.state_event(room_id, RETENTION_EVENT_TYPE, "") {
+            Ok(content) => Ok(RoomPolicy::from_content(&content)),
+            Err(RoomError::UnknownState(_)) => Ok(RoomPolicy::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Truncate every room below the events its lifetime has expired.
+    ///
+    /// One room's failure is counted and logged, and the pass goes on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] only when the list of rooms cannot be read.
+    pub fn retention_pass(
+        &self,
+        config: &RetentionConfig,
+        now_ms: u64,
+    ) -> Result<PassReport, RoomError> {
+        let prefix = [
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::RoomMeta as u8,
+        ];
+        let mut report = PassReport::default();
+        for (key, _) in ReadView::scan_prefix(self.store.as_ref(), &prefix)? {
+            let Some(room) = spindle_core::keys::room_from_prefixed(&key) else {
+                continue;
+            };
+            report.rooms += 1;
+            match self.retain_room(room, config, now_ms) {
+                Ok(done) => {
+                    if done.refused.is_some() {
+                        report.refused += 1;
+                    }
+                    if done.entries > 0 {
+                        report.truncated += 1;
+                    }
+                    report.entries += done.entries;
+                    report.bodies += done.bodies;
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(room, %error, "retention could not truncate a room");
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn retain_room(
+        &self,
+        room_id: &str,
+        config: &RetentionConfig,
+        now_ms: u64,
+    ) -> Result<TruncationReport, RoomError> {
+        let policy = self.room_retention(room_id)?;
+        let Some(max) = effective_max_lifetime_ms(config, &policy) else {
+            return Ok(TruncationReport::default());
+        };
+        let anchor = super::StateAtAnchor::Ts(now_ms.saturating_sub(max));
+        let floor = match self.resolve_anchor(room_id, &anchor) {
+            // The newest event that has expired goes with everything older.
+            Ok((li, _)) => li.saturating_add(1),
+            // The log starts after the cutoff: nothing has expired.
+            Err(RoomError::UnknownState(_)) => return Ok(TruncationReport::default()),
+            Err(error) => return Err(error),
+        };
+        self.truncate_room_log(room_id, floor)
     }
 
     /// Lowest anchor among filled gaps and pending gap markers' events.
@@ -420,4 +569,61 @@ fn delete_counting(store: &impl Store, keys: &[Vec<u8>]) -> Result<u64, spindle_
         store.delete_batch(chunk)?;
     }
     Ok(present)
+}
+
+/// Run [`Rooms::retention_pass`] every `[retention] interval_minutes` for
+/// the life of the server.
+///
+/// Holds the rooms weakly and returns once they are gone, like the other
+/// delivery loops, so the store closes where its last owner is dropped.
+pub async fn retention_loop(
+    rooms: std::sync::Weak<Rooms>,
+    metrics: std::sync::Weak<crate::metrics::Metrics>,
+    config: RetentionConfig,
+) {
+    let tick = std::time::Duration::from_secs(config.interval_minutes.max(1) * 60);
+    let poll = tick.min(std::time::Duration::from_secs(1));
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        tokio::time::sleep(poll).await;
+        if rooms.strong_count() == 0 {
+            return;
+        }
+        waited += poll;
+        if waited < tick {
+            continue;
+        }
+        waited = std::time::Duration::ZERO;
+        let (rooms, metrics, config) = (rooms.clone(), metrics.clone(), config.clone());
+        let pass = tokio::task::spawn_blocking(move || {
+            let Some(rooms) = rooms.upgrade() else {
+                return false;
+            };
+            let started = std::time::Instant::now();
+            match rooms.retention_pass(&config, super::now_ms()) {
+                Ok(report) => {
+                    if let Some(metrics) = metrics.upgrade() {
+                        metrics.record_retention(&report);
+                    }
+                    tracing::info!(
+                        rooms = report.rooms,
+                        truncated = report.truncated,
+                        refused = report.refused,
+                        failed = report.failed,
+                        entries = report.entries,
+                        bodies = report.bodies,
+                        elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "retention pass finished"
+                    );
+                }
+                Err(error) => tracing::warn!(%error, "retention pass could not list rooms"),
+            }
+            true
+        })
+        .await;
+        if !matches!(pass, Ok(true)) {
+            return;
+        }
+    }
 }

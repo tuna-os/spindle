@@ -418,6 +418,7 @@ pub struct Metrics {
     edus: EduMetrics,
     /// State resolution's work and the forks that cause it (#626).
     state_res: StateResMetrics,
+    retention: RetentionMetrics,
     /// MSC3995 hub mode's counters (#22), in a build with the feature.
     #[cfg(feature = "hub-mode")]
     hub: crate::hub::HubMetrics,
@@ -440,6 +441,16 @@ struct StateResMetrics {
     /// Resident rooms by forward-extremity count, by
     /// [`EXTREMITY_BUCKETS`], as the last census found them.
     extremity_buckets: [AtomicU64; 4],
+}
+
+/// What history retention has done since start (#817).
+#[derive(Debug, Default)]
+struct RetentionMetrics {
+    runs: AtomicU64,
+    /// `[truncated, refused, failed]` rooms.
+    rooms: [AtomicU64; 3],
+    entries: AtomicU64,
+    bodies: AtomicU64,
 }
 
 /// The labels of `spindle_rooms_by_forward_extremities`, in index order.
@@ -504,6 +515,7 @@ impl Default for Metrics {
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
             state_res: StateResMetrics::default(),
+            retention: RetentionMetrics::default(),
             #[cfg(feature = "hub-mode")]
             hub: crate::hub::HubMetrics::default(),
         }
@@ -1038,6 +1050,68 @@ impl Metrics {
         )
     }
 
+    /// Record one pass of the retention job (#817).
+    pub fn record_retention(&self, report: &crate::rooms::PassReport) {
+        let counters = &self.retention;
+        counters.runs.fetch_add(1, Ordering::Relaxed);
+        for (slot, count) in
+            counters
+                .rooms
+                .iter()
+                .zip([report.truncated, report.refused, report.failed])
+        {
+            slot.fetch_add(count, Ordering::Relaxed);
+        }
+        counters
+            .entries
+            .fetch_add(report.entries, Ordering::Relaxed);
+        counters.bodies.fetch_add(report.bodies, Ordering::Relaxed);
+    }
+
+    /// Retention passes finished so far, for tests.
+    #[must_use]
+    pub fn retention_runs(&self) -> u64 {
+        self.retention.runs.load(Ordering::Relaxed)
+    }
+
+    /// History retention's counters (#817).
+    fn render_retention(&self, out: &mut String) {
+        let counters = &self.retention;
+        out.push_str(
+            "# HELP spindle_retention_runs_total Passes of the history retention job.\n\
+             # TYPE spindle_retention_runs_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_retention_runs_total {}",
+            counters.runs.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_retention_rooms_total Rooms the retention job handled, by \
+             result: truncated, refused for a reason, or failed.\n\
+             # TYPE spindle_retention_rooms_total counter\n",
+        );
+        for (index, result) in ["truncated", "refused", "failed"].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_retention_rooms_total{{result=\"{result}\"}} {}",
+                counters.rooms[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_retention_deleted_total Rows the retention job deleted, by \
+             kind: log entries or event bodies.\n\
+             # TYPE spindle_retention_deleted_total counter\n",
+        );
+        for (kind, counter) in [("entries", &counters.entries), ("bodies", &counters.bodies)] {
+            let _ = writeln!(
+                out,
+                "spindle_retention_deleted_total{{kind=\"{kind}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+    }
+
     /// Record `count` stuck forward extremities dropped from one room.
     pub fn record_extremities_pruned(&self, count: u64) {
         self.state_res
@@ -1072,6 +1146,7 @@ impl Metrics {
         render_build_info(&mut out);
         self.render_appends(&mut out);
         self.render_state_res(&mut out);
+        self.render_retention(&mut out);
         self.render_room_locks(&mut out);
         self.render_http(&mut out);
         self.render_federation(&mut out);
@@ -3381,6 +3456,9 @@ mod tests {
             "spindle_dummy_events_total",
             "spindle_forward_extremities_pruned_total",
             "spindle_rooms_by_forward_extremities",
+            "spindle_retention_runs_total",
+            "spindle_retention_rooms_total",
+            "spindle_retention_deleted_total",
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{text}");
             assert!(text.contains(&format!("# TYPE {name} ")), "{text}");

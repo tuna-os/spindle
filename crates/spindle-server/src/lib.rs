@@ -685,6 +685,15 @@ fn spawn_delivery_loops(state: &AppState) {
         rooms::extremities::MergePolicy::of(&state.config.rooms),
         std::time::Duration::from_secs(60),
     ));
+    // History retention truncates expired history on a schedule (#817).
+    // Off unless `[retention] enabled`: it deletes.
+    if state.config.retention.enabled {
+        tokio::spawn(rooms::retention_loop(
+            Arc::downgrade(&state.rooms),
+            Arc::downgrade(&state.metrics),
+            state.config.retention.clone(),
+        ));
+    }
     // Disabled federation leaves queued rows in the outbox and never starts
     // the drain that would only be refused, row by row.
     if state.config.federation.enabled {

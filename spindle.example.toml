@@ -638,6 +638,25 @@ registrations = []
 # The fewest seconds between two dummy events in one room.
 # dummy_event_interval_secs = 300
 
+[retention]
+# History retention (#817, MSC1763). Off by default, because it deletes
+# history. When on, a background job truncates each room's log below the
+# newest event that is older than the room's maximum lifetime. The log, the
+# event bodies and the old state of those events go, and `spindle gc` then
+# frees the state nodes that only they used. A room sets its own lifetime
+# with an m.room.retention event; the limits below clamp it. The job skips
+# rooms in hub mode, in a partial-state join and with a fork.
+#
+# enabled = false
+# Days any room keeps events. This is the default for a room without an
+# m.room.retention event and the most a room may ask for. Absent, a room
+# without a policy keeps everything.
+# max_lifetime_days = 365
+# The fewest days any room keeps events. A room's lifetime is raised to this.
+# min_lifetime_days = 7
+# Minutes between two runs of the job.
+# interval_minutes = 60
+
 [limits]
 # Ceilings on what one account may make this server hold. Each of these
 # stores grew without bound under an ordinary registered account before the

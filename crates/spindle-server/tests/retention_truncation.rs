@@ -597,3 +597,143 @@ fn state_delta_rows_below_the_floor_go_and_a_sync_from_below_it_answers() {
         );
     }
 }
+
+mod policy {
+    use serde_json::json;
+    use spindle_server::config::RetentionConfig;
+    use spindle_server::rooms::{RoomPolicy, effective_max_lifetime_ms};
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    fn config(max: Option<u32>, min: Option<u32>) -> RetentionConfig {
+        RetentionConfig {
+            enabled: true,
+            max_lifetime_days: max,
+            min_lifetime_days: min,
+            ..RetentionConfig::default()
+        }
+    }
+
+    fn room(max: Option<u64>, min: Option<u64>) -> RoomPolicy {
+        RoomPolicy {
+            max_lifetime_ms: max,
+            min_lifetime_ms: min,
+        }
+    }
+
+    #[test]
+    fn a_room_without_a_policy_takes_the_server_default_or_keeps_everything() {
+        assert_eq!(
+            effective_max_lifetime_ms(&config(Some(30), None), &room(None, None)),
+            Some(30 * DAY)
+        );
+        assert_eq!(
+            effective_max_lifetime_ms(&config(None, Some(7)), &room(None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_room_may_shorten_but_not_pass_the_server_maximum() {
+        let server = config(Some(30), None);
+        assert_eq!(
+            effective_max_lifetime_ms(&server, &room(Some(10 * DAY), None)),
+            Some(10 * DAY)
+        );
+        assert_eq!(
+            effective_max_lifetime_ms(&server, &room(Some(90 * DAY), None)),
+            Some(30 * DAY)
+        );
+        // With no server maximum the room's own is honoured.
+        assert_eq!(
+            effective_max_lifetime_ms(&config(None, None), &room(Some(5 * DAY), None)),
+            Some(5 * DAY)
+        );
+    }
+
+    #[test]
+    fn minimums_raise_a_maximum_and_never_lower_one() {
+        let server = config(Some(30), Some(7));
+        assert_eq!(
+            effective_max_lifetime_ms(&server, &room(Some(DAY), None)),
+            Some(7 * DAY)
+        );
+        assert_eq!(
+            effective_max_lifetime_ms(&server, &room(Some(10 * DAY), Some(20 * DAY))),
+            Some(20 * DAY)
+        );
+        assert_eq!(
+            effective_max_lifetime_ms(&server, &room(Some(10 * DAY), Some(2 * DAY))),
+            Some(10 * DAY)
+        );
+    }
+
+    #[test]
+    fn content_that_is_not_a_positive_integer_is_ignored() {
+        let read = |content| RoomPolicy::from_content(&content);
+        assert_eq!(
+            read(json!({ "max_lifetime": 5000, "min_lifetime": 100 })),
+            room(Some(5000), Some(100))
+        );
+        for bad in [
+            json!({ "max_lifetime": 0 }),
+            json!({ "max_lifetime": -1 }),
+            json!({ "max_lifetime": 1.5 }),
+            json!({ "max_lifetime": "9" }),
+            json!({}),
+        ] {
+            assert_eq!(read(bad), room(None, None));
+        }
+    }
+}
+
+/// The pass reads the room's own `m.room.retention` and the clock it is
+/// handed, so a test sets both without sleeping.
+#[test]
+fn a_pass_truncates_the_room_to_its_own_policy_and_counts_it() {
+    use spindle_server::config::RetentionConfig;
+    let fixture = fixture(12);
+    // Everything so far was sent "now"; a pass an hour later with a one-minute
+    // room policy finds all of it expired.
+    fixture
+        .rooms
+        .set_state(
+            &fixture.room,
+            ALICE,
+            fixture.key.pair(),
+            "m.room.retention",
+            "",
+            &json!({ "max_lifetime": 60_000 }),
+        )
+        .unwrap();
+    let before = fixture.log().len();
+    let config = RetentionConfig {
+        enabled: true,
+        ..RetentionConfig::default()
+    };
+    let later = u64::try_from(chrono_free_now()).unwrap() + 3_600_000;
+
+    let report = fixture.rooms.retention_pass(&config, later).unwrap();
+    assert_eq!((report.rooms, report.truncated, report.failed), (1, 1, 0));
+    assert!(report.entries > 0 && report.bodies > 0);
+    assert!(fixture.log().len() < before);
+    // The newest event is never the one that expires with the rest.
+    fixture.send("still writable");
+    let report = spindle_store::verify::verify_store(fixture.store.as_ref()).unwrap();
+    assert!(report.is_intact(), "{:?}", report.problems);
+
+    // Nothing is left to do on a second pass, and a room with no policy and
+    // no server default is not touched at all.
+    let again = fixture.rooms.retention_pass(&config, later).unwrap();
+    assert_eq!((again.truncated, again.entries), (0, 0));
+    let quiet = self::fixture(3);
+    let report = quiet.rooms.retention_pass(&config, later).unwrap();
+    assert_eq!((report.truncated, report.entries), (0, 0));
+}
+
+fn chrono_free_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
