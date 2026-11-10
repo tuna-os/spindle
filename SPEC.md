@@ -363,6 +363,10 @@ A room with 50k state events holds on the order of a few MB resident; rooms
 evict to disk under an LRU keyed by last activity, retaining only the 32-byte
 root.
 
+**Status.** The eviction of idle rooms in the paragraph above is designed only.
+An open room keeps its whole log index in memory until the process stops
+(#816). The snapshot window below is built.
+
 Within a room the same rule applies per entry. Every log entry keeps its state
 root — 32 bytes, forever — but the materialized snapshot it names is held only
 while something can still ask for it. Retaining one snapshot per entry sounds
@@ -583,6 +587,11 @@ microseconds. Three configurable modes:
 | `strict` | fsync before responding to the client | Regulated / single-node deployments |
 | `group` *(default)* | fsync batched, ≤1 ms window, response after batch | General |
 | `relaxed` | OS page cache, periodic fsync | Ephemeral / test |
+
+**Status.** The modes exist in the store, but no setting chooses one. The room
+log always uses `group`, and `relaxed` has no periodic fsync (#810). Account,
+token and key writes ask for a `group` sync of their own. There is one journal
+for the whole store, not one for each shard.
 
 Because ordering is decided before durability, a crash can only lose a suffix of
 the log — never reorder it, never fork it. Recovery truncates to the last
@@ -816,6 +825,12 @@ about it is non-standard, and no peer needs to know Spindle exists.
 | Media | `/_matrix/federation/v1/media/download`, `/media/thumbnail` (authenticated media) |
 | Misc | `/openid/userinfo`, `3pid/onbind`, `/exchange_third_party_invite` |
 | EDUs | `m.typing`, `m.receipt`, `m.presence`, `m.direct_to_device`, `m.device_list_update`, `m.signing_key_update` |
+
+**Status.** Two parts of this table are designed only. The server does not
+serve `3pid/onbind` or `/exchange_third_party_invite`
+([spec-gaps.md](docs/spec-gaps.md)). The client `/hierarchy` and room summary
+read only rooms that this server holds, and they do not ask other servers
+(#823).
 
 ### 11.3 Outbound
 
@@ -1385,10 +1400,19 @@ dropping `li < X` for a room is a range delete plus a mark-and-sweep over
 There is no state-group compaction job, which removes an entire class of
 operator toil.
 
+**Status.** Retention is designed only. `purge_history` deletes the bodies of
+non-state events and keeps every log entry, because the hash chain covers the
+event IDs. The log, the stream indexes and the old state roots keep growing,
+and `spindle gc` cannot free the state of a purged room (#817).
+
 ---
 
 ## 15. Concurrency and process model
 
+- **Status.** The next two points are the design, not the code. The server
+  has one lock for each open room, a registry lock and several shared maps,
+  and request handlers run on the Tokio pool. Rooms have no executors of
+  their own.
 - **Rooms shard by `hash(room_id) % N`** across `N` executors, `N` = available
   cores. Each executor is a single-threaded async task owning its rooms'
   mutable state: head, state root, hot tail, subscriber list.

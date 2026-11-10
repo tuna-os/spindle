@@ -229,7 +229,7 @@ Reversibility is declared per step and reported before anything runs.
 
 | step is | means |
 |---|---|
-| **reversible** | the older binary can still read the store afterwards, and re-stamps the marker on its own terms. Downgrading works. |
+| **reversible** | the older binary can still read the store afterwards. No step is reversible today, and an older binary refuses a store with a newer marker. |
 | **irreversible** | it cannot. Going back means restoring the backup taken beforehand, and losing everything written since. |
 
 A plan containing one irreversible step is irreversible as a whole, and
