@@ -4744,7 +4744,15 @@ impl Rooms {
             match in_timeline(event_id) {
                 Some(event) if state_after => out.push(event.clone()),
                 Some(_) => {}
-                None => out.push(self.event(room_id, event_id)?),
+                // A key can hold an event this server sidelined: room v1 keeps
+                // a slot only one branch wrote, and the resolver does not
+                // re-check it. Clients never see a soft-failed or purged
+                // event, so there is nothing to send for that key.
+                None => match self.event(room_id, event_id) {
+                    Ok(event) => out.push(event),
+                    Err(RoomError::MissingBody(_)) => {}
+                    Err(error) => return Err(error),
+                },
             }
         }
         Ok(out)
