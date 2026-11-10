@@ -26,6 +26,11 @@ struct Harness {
 impl Harness {
     /// `allow_private` is the harness's previews allow-list, verbatim.
     fn new(allow_private: &str) -> Self {
+        Self::with_ratelimit(allow_private, "enabled = false")
+    }
+
+    /// As [`Self::new`], with `ratelimit` as the body of `[ratelimit]`.
+    fn with_ratelimit(allow_private: &str, ratelimit: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         // The storage path too, not only the store: a preview's image is
@@ -33,7 +38,7 @@ impl Harness {
         // the crate's source tree.
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n\
-             [ratelimit]\nenabled = false\n\
+             [ratelimit]\n{ratelimit}\n\
              [previews]\nallow_private = [{allow_private}]\n",
             dir.path().display(),
         ))
@@ -104,6 +109,7 @@ impl Harness {
 async fn fixture() -> (SocketAddr, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_for_page = Arc::clone(&hits);
+    let hits_for_pages = Arc::clone(&hits);
     let png: &[u8] = b"\x89PNG\r\n\x1a\nnot really a png but served as one";
     let router = axum::Router::new()
         .route(
@@ -126,6 +132,28 @@ async fn fixture() -> (SocketAddr, Arc<AtomicUsize>) {
         .route(
             "/img.png",
             axum::routing::get(move || async move { ([("content-type", "image/png")], png) }),
+        )
+        .route(
+            "/p/{n}",
+            axum::routing::get(move |axum::extract::Path(n): axum::extract::Path<u8>| {
+                let hits = Arc::clone(&hits_for_pages);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Html(format!(
+                        r#"<head><meta property="og:title" content="P{n}"/>
+                    <meta property="og:image" content="/i/{n}"></head>"#
+                    ))
+                }
+            }),
+        )
+        .route(
+            "/i/{n}",
+            axum::routing::get(
+                |axum::extract::Path(n): axum::extract::Path<u8>| async move {
+                    // 3000 bytes that differ per page, so each is its own blob.
+                    ([("content-type", "image/png")], vec![n; 3000])
+                },
+            ),
         )
         .route(
             "/huge",
@@ -356,4 +384,218 @@ async fn a_bad_allow_list_entry_refuses_to_start() {
             "{entry:?}: {error} does not name the entry"
         );
     }
+}
+
+#[tokio::test]
+async fn the_preview_after_the_budget_is_refused_with_a_rate_limit() {
+    let (fixture, hits) = fixture().await;
+    // A burst of 3 and a refill too slow to matter inside the test.
+    let harness = Harness::with_ratelimit(
+        LOOPBACK,
+        "url_previews = { per_second = 0.0001, burst = 3 }",
+    );
+    let token = harness.register().await;
+
+    let mut statuses = Vec::new();
+    for n in 0..5 {
+        let (status, body) = harness
+            .preview(&token, &format!("http://{fixture}/p/{n}"))
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+        }
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        3,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
+        2,
+        "{statuses:?}"
+    );
+    // The refused ones never reached the network.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "only allowed previews fetched"
+    );
+}
+
+/// The cache fixture built directly, so each preview carries the time it
+/// is made at and the oldest is not a matter of the wall clock.
+struct Cache {
+    dir: TempDir,
+    store: Arc<FjallStore>,
+    media: Arc<spindle_server::media::Media>,
+    previews: spindle_server::previews::Previews,
+}
+
+impl Cache {
+    fn new(cap: u64) -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let media = Arc::new(spindle_server::media::Media::new(
+            Arc::clone(&store),
+            spindle_server::blobs::Blobs::Local {
+                root: dir.path().join("media"),
+            },
+            "example.org",
+        ));
+        let previews = spindle_server::previews::Previews::new(
+            Arc::clone(&store),
+            Arc::clone(&media),
+            &[LOOPBACK.trim_matches('"').to_owned()],
+        )
+        .unwrap()
+        .with_cache_cap(cap);
+        Self {
+            dir,
+            store,
+            media,
+            previews,
+        }
+    }
+
+    /// Every preview row, and the bytes the cache holds for them: the row
+    /// plus its image, as the cap counts it.
+    fn held(&self) -> (usize, u64) {
+        let prefix = vec![
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::UrlPreview as u8,
+        ];
+        let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix).unwrap();
+        let mut bytes = 0;
+        for (_, value) in &rows {
+            let row: Value = serde_json::from_slice(value).unwrap();
+            bytes += value.len() as u64;
+            if let Some(id) = row["og"]["og:image"]
+                .as_str()
+                .and_then(|mxc| mxc.rsplit('/').next())
+            {
+                bytes += self.media.record(id).unwrap().map_or(0, |r| r.size as u64);
+            }
+        }
+        (rows.len(), bytes)
+    }
+
+    fn blob_files(&self) -> usize {
+        fn walk(path: &std::path::Path) -> usize {
+            std::fs::read_dir(path).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .map(|e| {
+                        if e.path().is_dir() {
+                            walk(&e.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+        }
+        walk(&self.dir.path().join("media"))
+    }
+}
+
+#[tokio::test]
+async fn the_preview_cache_stays_under_its_cap_and_evicts_the_oldest_first() {
+    let (fixture, _) = fixture().await;
+    // One preview is about 3,200 bytes: room for two, not three.
+    let cache = Cache::new(7_000);
+
+    let mut first_image = None;
+    for n in 0..5_u64 {
+        let og = cache
+            .previews
+            .preview(&format!("http://{fixture}/p/{n}"), 1_000 + n)
+            .await
+            .unwrap();
+        if n == 0 {
+            first_image = og["og:image"].as_str().map(str::to_owned);
+        }
+        let (rows, bytes) = cache.held();
+        assert!(bytes <= 7_000, "preview {n}: cache holds {bytes} bytes");
+        assert_eq!(rows, usize::try_from(n + 1).unwrap().min(2), "preview {n}");
+    }
+
+    // The two newest survive, so previewing them again is a cache hit; the
+    // oldest went first, and its image went with its row.
+    let first_id = first_image.unwrap().rsplit('/').next().unwrap().to_owned();
+    assert!(cache.media.record(&first_id).unwrap().is_none());
+    assert_eq!(cache.blob_files(), 2, "two images' bytes remain, no more");
+    for n in [3_u64, 4] {
+        let og = cache
+            .previews
+            .preview(&format!("http://{fixture}/p/{n}"), 2_000)
+            .await
+            .unwrap();
+        let id = og["og:image"].as_str().unwrap().rsplit('/').next().unwrap();
+        assert!(cache.media.record(id).unwrap().is_some(), "{n} survived");
+    }
+    assert_eq!(cache.held().0, 2);
+}
+
+/// The cap never removes a preview whose image is quarantined, even when it
+/// is the oldest: the operator holds the image as evidence.
+#[tokio::test]
+async fn the_preview_cap_never_evicts_a_quarantined_image() {
+    let (fixture, _) = fixture().await;
+    let cache = Cache::new(7_000);
+
+    let og = cache
+        .previews
+        .preview(&format!("http://{fixture}/p/0"), 1_000)
+        .await
+        .unwrap();
+    let held_id = og["og:image"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        cache
+            .media
+            .set_quarantine(&held_id, Some("@admin:example.org"))
+            .unwrap()
+    );
+    for n in 1..5_u64 {
+        cache
+            .previews
+            .preview(&format!("http://{fixture}/p/{n}"), 1_000 + n)
+            .await
+            .unwrap();
+    }
+
+    let record = cache.media.record(&held_id).unwrap();
+    assert!(
+        record.is_some_and(|record| record.quarantined_by.is_some()),
+        "the quarantined image is kept"
+    );
+    // The oldest preview and the newest remain; the ones between went.
+    assert_eq!(cache.held().0, 2);
+    assert_eq!(cache.blob_files(), 2);
+}
+
+#[tokio::test]
+async fn refreshing_a_stale_preview_does_not_leave_the_old_image_behind() {
+    let (fixture, _) = fixture().await;
+    let cache = Cache::new(1_000_000);
+    let url = format!("http://{fixture}/p/1");
+
+    cache.previews.preview(&url, 1_000).await.unwrap();
+    // An hour and a second later the row is stale and is fetched again,
+    // and the image is re-hosted under a new ID.
+    cache.previews.preview(&url, 1_000 + 3_601).await.unwrap();
+
+    let uploads = cache.media.records().unwrap();
+    assert_eq!(uploads.len(), 1, "the first image's record was removed");
+    assert_eq!(cache.held().0, 1);
 }

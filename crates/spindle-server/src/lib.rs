@@ -516,7 +516,8 @@ fn app_state_with(
         media::Media::new(Arc::clone(&store), blobs_for(&config), &config.server.name)
             .with_max_upload_bytes(config.media.max_upload_bytes)
             .with_quota_bytes(config.media.max_bytes_per_user)
-            .with_max_thumbnail_pixels(config.media.max_thumbnail_pixels),
+            .with_max_thumbnail_pixels(config.media.max_thumbnail_pixels)
+            .with_remote_cache_cap(Some(config.media.remote_cache_max_bytes)),
     );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),
@@ -533,6 +534,7 @@ fn app_state_with(
             Arc::clone(&media),
             &config.previews.allow_private,
         )
+        .map(|previews| previews.with_cache_cap(config.media.preview_cache_max_bytes))
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
     let federation = federation_client(&config, &store, &key, &metrics)?;

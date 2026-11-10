@@ -84,6 +84,14 @@ across a migration in either direction.
 | `POST /rooms/{id}/invite`, and `PUT /_matrix/federation/v2/invite` from other servers | invitee | `invites_per_target`: burst 5, 0.003/s | `rc_invites.per_user` | every local attempt that passed the inviter's budget, and every federated invite for a local user, before this server co-signs it |
 | `POST /createRoom` | account | `room_creation`: burst 10, 0.016/s | `rc_room_creation` | every attempt; the request's own `invite` list is not counted again |
 | `POST /media/v3/upload`, `POST /media/v1/create` | account | `media_uploads`: burst 50, 10/s | `rc_media_create` | every attempt; filling a created ID (`PUT /media/v3/upload/{server}/{id}`) is not counted again |
+| `GET /media/v1/preview_url` | account | `url_previews`: burst 20, 0.5/s | none | every request, before the cache is read; a cached answer spends too |
+| `GET /media/v1/download` and `.../thumbnail` of another server's media | requesting account | `remote_media`: burst 100, 2/s | none | only when the media is not cached yet, before the fetch; media already cached is free |
+
+Synapse has no limit for either of the two last rows, so the defaults are
+this server's own. A preview costs up to two outbound fetches. A remote
+download costs one fetch and leaves the bytes behind. Each is spent by the
+account that asks, so one account's flood does not use up the budget of
+another. The unauthenticated media routes never fetch and are not limited.
 
 The refusal is 429 `M_LIMIT_EXCEEDED`, with `retry_after_ms` and a
 `Retry-After` header. Both give the time until the bucket has one more
@@ -121,6 +129,8 @@ account can make the server *hold*.
 | Media upload body | 50 MiB by default | `[media] max_upload_bytes`; advertised by `/media/config` | 413 `M_TOO_LARGE` |
 | Media bytes held per account | none by default | `[media] max_bytes_per_user` | 403 `M_RESOURCE_LIMIT_EXCEEDED`, with `admin_contact` from `[server.support]` when set; checked before any byte is stored; deleting media gives its bytes back; appservice users and admins exempt as from the write budgets |
 | Cached remote media | kept until purged by default | `[media] remote_retention_days`; `POST /_synapse/admin/v1/purge_media_cache?before_ts=` | none; an hourly job removes cache entries older than the setting, and never quarantined or protected items or local uploads |
+| URL preview cache | 256 MiB by default | `[media] preview_cache_max_bytes` | not refused. The oldest previews are removed, each row with its re-hosted image, until the cache fits. Below 16 MiB is refused at startup |
+| Cached media from other servers | 2 GiB by default | `[media] remote_cache_max_bytes` | not refused. The oldest cached items are removed, record and bytes, until the cache fits. Quarantined items are never removed. An item bigger than the cap is refused with 413 `M_TOO_LARGE`. Zero is refused at startup |
 | Filters held per user | 1,000 | `[limits] filters_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | Account-data types per user (global + per-room) | 20,000 | `[limits] account_data_per_user` | 400 `M_LIMIT_EXCEEDED`; rewriting an existing type is free |
 | One-time keys held per device | 1,000 | `[limits] one_time_keys_per_device` | 400 `M_LIMIT_EXCEEDED`; counts held plus the batch offered |
@@ -148,11 +158,18 @@ write, and a config that quietly disables a feature is worse than one that
 will not load. `password_hashes_waiting` is the exception. A zero there
 means no queue: a login gets a 429 when all workspaces are in use.
 
-## Not yet budgeted
+Previews are not charged to the account that asked. A preview is the
+server's own copy and its image is shared by everyone who sees the link,
+so a per-user quota would charge the wrong person. The preview cache has
+its own cap above, and the per-account rate bounds how fast one account can
+fill it. A cached preview is dropped when it is replaced after an hour, so
+a refresh does not keep the old image.
 
-URL previews (`preview_url`) and downloads of remote media still have no
-budget per account. Each fetches from another host and stores the result
-with no expiry. Issue #833 tracks them.
+The cap on remote media removes by size and by age of arrival, oldest first.
+A purge by age (`[media] remote_retention_days`, #847) removes from the same
+end. The two can both be on. The cap bounds the disk whatever the age
+setting is, and the age setting frees bytes before the cap is reached.
+Neither removes quarantined media. It stays as evidence.
 
 ## Account-driven storage growth
 

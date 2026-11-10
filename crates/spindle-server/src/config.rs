@@ -1283,6 +1283,18 @@ pub struct RateLimitConfig {
     /// of a create and is not counted again.
     #[serde(default = "default_media_uploads")]
     pub media_uploads: Rate,
+    /// `GET /preview_url` (#833): each new URL costs the server up to two
+    /// outbound fetches and a stored row. A cached answer is not exempt:
+    /// the budget bounds how fast one account can ask, which is the only
+    /// thing it can see before the fetch.
+    #[serde(default = "default_url_previews")]
+    pub url_previews: Rate,
+    /// Authenticated downloads and thumbnails of another server's media
+    /// that this server has not cached yet (#833). Each spends one request
+    /// from the asking account's budget before the fetch; media already
+    /// cached is free to read.
+    #[serde(default = "default_remote_media")]
+    pub remote_media: Rate,
 }
 
 /// A per-user write budget: `burst` requests at once, refilled at
@@ -1328,6 +1340,8 @@ impl Default for RateLimitConfig {
             invites_per_target: default_invites_per_target(),
             room_creation: default_room_creation(),
             media_uploads: default_media_uploads(),
+            url_previews: default_url_previews(),
+            remote_media: default_remote_media(),
         }
     }
 }
@@ -1366,6 +1380,17 @@ const fn default_room_creation() -> Rate {
 
 const fn default_media_uploads() -> Rate {
     Rate::new(10.0, 50)
+}
+
+// No Synapse default to follow: Synapse has no per-user preview limit. A page
+// with a few links in view is a burst; a script walking URLs is a rate.
+const fn default_url_previews() -> Rate {
+    Rate::new(0.5, 20)
+}
+
+// A client opening a room with many remote avatars and images is a burst.
+const fn default_remote_media() -> Rate {
+    Rate::new(2.0, 100)
 }
 
 const fn default_true() -> bool {
@@ -1925,10 +1950,34 @@ pub struct MediaConfig {
     /// is fetched again if a client asks for it.
     #[serde(default)]
     pub remote_retention_days: Option<u32>,
+    /// Total bytes the URL preview cache may hold (#833): the stored
+    /// previews and the images re-hosted for them. Past it the oldest
+    /// previews are removed, rows and image bytes together. Separate from
+    /// `max_bytes_per_user`: a preview is the server's own copy, not an
+    /// account's upload, so it is never charged to the asking account.
+    #[serde(default = "default_preview_cache_max_bytes")]
+    pub preview_cache_max_bytes: u64,
+    /// Total bytes of other servers' media this server may cache (#833).
+    /// Past it the oldest cached items are removed, record and bytes. It
+    /// does not touch this server's own uploads. Age-based purging, where
+    /// configured, runs beside this and does not replace it.
+    #[serde(default = "default_remote_cache_max_bytes")]
+    pub remote_cache_max_bytes: u64,
 }
 
 fn default_max_thumbnail_pixels() -> u64 {
     crate::media::DEFAULT_MAX_THUMBNAIL_PIXELS
+}
+
+/// Room for one preview's largest image and its row.
+const MIN_PREVIEW_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+const fn default_preview_cache_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+const fn default_remote_cache_max_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_max_upload_bytes() -> usize {
@@ -1942,6 +1991,8 @@ impl Default for MediaConfig {
             max_bytes_per_user: None,
             max_thumbnail_pixels: default_max_thumbnail_pixels(),
             remote_retention_days: None,
+            preview_cache_max_bytes: default_preview_cache_max_bytes(),
+            remote_cache_max_bytes: default_remote_cache_max_bytes(),
         }
     }
 }
@@ -2260,6 +2311,22 @@ impl Config {
                 message: "must be an http or https URL".to_owned(),
             });
         }
+        // One preview can hold a re-hosted image of up to 10 MiB beside its
+        // row. A cap below that would evict the preview being served.
+        if self.media.preview_cache_max_bytes < MIN_PREVIEW_CACHE_BYTES {
+            return Err(ConfigError::Invalid {
+                field: "media.preview_cache_max_bytes",
+                message: format!("must be at least {MIN_PREVIEW_CACHE_BYTES} (16 MiB)"),
+            });
+        }
+        // A zero cap would evict everything at once, so remote media would
+        // never be served from the cache it fills.
+        if self.media.remote_cache_max_bytes == 0 {
+            return Err(ConfigError::Invalid {
+                field: "media.remote_cache_max_bytes",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -2282,6 +2349,8 @@ impl Config {
             ("ratelimit.invites_per_target", limits.invites_per_target),
             ("ratelimit.room_creation", limits.room_creation),
             ("ratelimit.media_uploads", limits.media_uploads),
+            ("ratelimit.url_previews", limits.url_previews),
+            ("ratelimit.remote_media", limits.remote_media),
         ] {
             // Same reasoning as the ring: zero burst or zero rate refuses
             // every request forever, and NaN or a rate whose refill

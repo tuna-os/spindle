@@ -188,7 +188,7 @@ struct PreviewQuery {
 /// `GET /_matrix/client/v1/media/preview_url`
 async fn preview_url(
     State(state): State<AppState>,
-    Authenticated(_identity): Authenticated,
+    Authenticated(identity): Authenticated,
     axum::extract::Query(query): axum::extract::Query<PreviewQuery>,
 ) -> Result<Json<Value>, MatrixError> {
     if !state.config.previews.enabled {
@@ -198,6 +198,9 @@ async fn preview_url(
             "URL previews are disabled on this server".to_owned(),
         ));
     }
+    // Before the cache lookup and the fetch: this is the only point where
+    // the server has spent nothing on the caller's say-so yet.
+    limit_write(&state, Budget::UrlPreview, &identity.user_id)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -227,10 +230,16 @@ async fn media_config(State(state): State<AppState>) -> Json<Value> {
 /// `GET /_matrix/client/v1/media/download/{server_name}/{media_id}`
 async fn download_media(
     State(state): State<AppState>,
-    AccountAuthenticated(_identity): AccountAuthenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
+    serve_media(
+        &state,
+        &server_name,
+        &media_id,
+        Remote::Fetch(&identity.user_id),
+    )
+    .await
 }
 
 /// The same, with a filename the client would like the browser to use.
@@ -241,14 +250,20 @@ async fn download_media(
 /// `.exe` in someone's downloads folder.
 async fn download_media_named(
     State(state): State<AppState>,
-    AccountAuthenticated(_identity): AccountAuthenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id, _file_name)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_media(&state, &server_name, &media_id, Remote::Fetch).await
+    serve_media(
+        &state,
+        &server_name,
+        &media_id,
+        Remote::Fetch(&identity.user_id),
+    )
+    .await
 }
 
 /// `GET /_matrix/media/v3/download/{server_name}/{media_id}`, and the
@@ -290,9 +305,10 @@ async fn download_media_legacy_named(
 /// What a media route may do about remote media this server holds no copy
 /// of.
 #[derive(Debug, Clone, Copy)]
-enum Remote {
+enum Remote<'a> {
     /// Fetch it over federation and cache it: the authenticated routes.
-    Fetch,
+    /// Carries the asking account, whose fetch budget the fetch spends.
+    Fetch(&'a str),
     /// Answer from the cache alone: the frozen unauthenticated routes. An
     /// uncached item is the plain `M_NOT_FOUND` an unknown local ID gets,
     /// with nothing about any peer in it.
@@ -305,13 +321,13 @@ async fn stored_media_id(
     state: &AppState,
     server_name: &str,
     media_id: &str,
-    remote: Remote,
+    remote: Remote<'_>,
 ) -> Result<String, MatrixError> {
     if state.media.is_ours(server_name) {
         return Ok(media_id.to_owned());
     }
     match remote {
-        Remote::Fetch => cached_remote_media(state, server_name, media_id).await,
+        Remote::Fetch(user_id) => cached_remote_media(state, server_name, media_id, user_id).await,
         Remote::CachedOnly => {
             let cache_id = crate::media::Media::remote_id(server_name, media_id);
             let cached = state
@@ -340,7 +356,7 @@ async fn serve_media(
     state: &AppState,
     server_name: &str,
     media_id: &str,
-    remote: Remote,
+    remote: Remote<'_>,
 ) -> Result<axum::response::Response, MatrixError> {
     let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     let (record, bytes) = state
@@ -385,6 +401,7 @@ async fn cached_remote_media(
     state: &AppState,
     server_name: &str,
     media_id: &str,
+    user_id: &str,
 ) -> Result<String, MatrixError> {
     let cache_id = crate::media::Media::remote_id(server_name, media_id);
     let cached = state
@@ -393,6 +410,9 @@ async fn cached_remote_media(
         .map_err(|error| media_error(&error))?
         .is_some();
     if !cached {
+        // Only a fetch spends: a hit costs this server nothing, and the
+        // budget exists for the fetch and the bytes it leaves behind.
+        limit_write(state, Budget::RemoteMedia, user_id)?;
         let (content_type, filename, bytes) = state
             .federation
             .remote_media_download(server_name, media_id)
@@ -548,11 +568,12 @@ struct ThumbnailQuery {
 /// since reading media acts on no device.
 async fn thumbnail_media(
     State(state): State<AppState>,
-    AccountAuthenticated(_identity): AccountAuthenticated,
+    AccountAuthenticated(identity): AccountAuthenticated,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<ThumbnailQuery>,
 ) -> Result<axum::response::Response, MatrixError> {
-    serve_thumbnail(&state, &server_name, &media_id, query, Remote::Fetch).await
+    let remote = Remote::Fetch(&identity.user_id);
+    serve_thumbnail(&state, &server_name, &media_id, query, remote).await
 }
 
 /// `GET /_matrix/media/v3/thumbnail/{server_name}/{media_id}`.
@@ -575,7 +596,7 @@ async fn serve_thumbnail(
     server_name: &str,
     media_id: &str,
     query: ThumbnailQuery,
-    remote: Remote,
+    remote: Remote<'_>,
 ) -> Result<axum::response::Response, MatrixError> {
     let media_id = stored_media_id(state, server_name, media_id, remote).await?;
     if query.width == 0 || query.height == 0 {

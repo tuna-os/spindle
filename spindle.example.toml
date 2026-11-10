@@ -87,6 +87,16 @@ path = "./data"
 # A background job removes older entries hourly. It never removes this
 # server's uploads or quarantined items. Zero is refused at startup.
 # remote_retention_days = 30
+# Total bytes the URL preview cache may hold: stored previews plus the images
+# re-hosted for them. Past it the oldest previews go first, row and image
+# bytes together. Previews are never charged to an account's quota above.
+# Below 16 MiB is refused at startup: one preview can hold a 10 MiB image.
+# preview_cache_max_bytes = 268435456 # 256 MiB
+# Total bytes of other servers' media this server may cache. Past it the
+# oldest cached items go first. This server's own uploads and quarantined
+# items are never touched.
+# Zero is refused at startup.
+# remote_cache_max_bytes = 2147483648 # 2 GiB
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
@@ -141,6 +151,12 @@ room_creation = { per_second = 0.016, burst = 10 }
 # New media IDs: POST /upload and POST /media/v1/create (filling a created
 # ID is not counted again).
 media_uploads = { per_second = 10.0, burst = 50 }
+# GET /preview_url: every request spends one, cached answer or not. Each new
+# URL makes the server fetch a page and maybe an image.
+url_previews = { per_second = 0.5, burst = 20 }
+# Authenticated downloads and thumbnails of remote media not yet cached: one
+# per fetch. Media already cached is free to read.
+remote_media = { per_second = 2.0, burst = 100 }
 
 [previews]
 # URL previews make the server fetch attacker-chosen URLs, which is the
