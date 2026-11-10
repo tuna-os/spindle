@@ -139,6 +139,33 @@ impl ChainHash {
     }
 }
 
+/// Where a truncated room's hash chain restarts (#817, SPEC §14.3).
+///
+/// Deleting the log entries below a watermark removes the values the chain
+/// was computed from, so the value just before the first retained entry is
+/// kept instead. Every entry below `floor` is gone or ignored, and the chain
+/// of the entries at or above it extends from `chain`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainCheckpoint {
+    /// The lowest `li` that still has a chain value.
+    pub floor: i64,
+    /// `chain[floor - 1]`: the value the first retained chain entry extends.
+    pub chain: ChainHash,
+}
+
+/// What [`RoomLog::truncate_below`] changed in memory, for the caller to
+/// make durable.
+#[derive(Clone, Debug)]
+pub struct Truncation {
+    /// The chain restart point now in force.
+    pub checkpoint: ChainCheckpoint,
+    /// Entries removed from the log, oldest first.
+    pub removed: Vec<LogEntry>,
+    /// Entries kept below the floor, rewritten without a chain value
+    /// because the checkpoint no longer covers them.
+    pub kept: Vec<LogEntry>,
+}
+
 /// One event in storage order, with its Matrix DAG relationship intact.
 #[derive(Clone, Debug)]
 pub struct LogEntry {
@@ -347,6 +374,9 @@ pub struct RoomLog {
     next_forward: i64,
     next_backward: i64,
     head_chain: ChainHash,
+    /// Where the chain restarts after a truncation; `None` for a room that
+    /// still holds its whole history.
+    checkpoint: Option<ChainCheckpoint>,
     /// Materialized state for the entries that can still be asked for it.
     ///
     /// Bounded, because the alternative is not: a snapshot per entry retains
@@ -378,6 +408,7 @@ impl RoomLog {
             next_forward: 1,
             next_backward: 0,
             head_chain: ChainHash::seed(),
+            checkpoint: None,
             resident: BTreeMap::new(),
             resident_window: DEFAULT_RESIDENT_WINDOW,
             table,
@@ -941,6 +972,79 @@ impl RoomLog {
     #[must_use]
     pub fn head_chain(&self) -> ChainHash {
         self.head_chain
+    }
+
+    /// Where the chain restarts, if the room has been truncated.
+    #[must_use]
+    pub fn chain_checkpoint(&self) -> Option<ChainCheckpoint> {
+        self.checkpoint
+    }
+
+    /// The chain value just before `floor`: what the first entry at or
+    /// above it extends.
+    ///
+    /// The newest chain value among the entries below `floor`, or the
+    /// current checkpoint's when none is left, or the seed for a room that
+    /// was never truncated and has none.
+    #[must_use]
+    pub fn chain_before(&self, floor: i64) -> ChainHash {
+        self.entries
+            .range(..floor)
+            .rev()
+            .find_map(|(_, entry)| entry.chain)
+            .or_else(|| self.checkpoint.map(|point| point.chain))
+            .unwrap_or_else(ChainHash::seed)
+    }
+
+    /// Drop every entry below `floor` except those in `keep`, which stay
+    /// without a chain value (#817).
+    ///
+    /// Returns `None` when there is nothing to do: the floor is not above
+    /// the checkpoint already in force. The caller makes the result
+    /// durable, checkpoint first. Refuses to remove an entry that is a
+    /// forward extremity, since the next append names it.
+    pub fn truncate_below(
+        &mut self,
+        floor: i64,
+        keep: &BTreeSet<LinearIndex>,
+    ) -> Option<Truncation> {
+        if self.checkpoint.is_some_and(|point| floor <= point.floor) {
+            return None;
+        }
+        let tips: BTreeSet<i64> = self
+            .forward_extremities
+            .iter()
+            .filter_map(|id| self.positions.get(id).copied())
+            .collect();
+        let checkpoint = ChainCheckpoint {
+            floor,
+            chain: self.chain_before(floor),
+        };
+        let doomed: Vec<i64> = self
+            .entries
+            .range(..floor)
+            .map(|(&li, _)| li)
+            .filter(|li| !keep.contains(&LinearIndex(*li)) && !tips.contains(li))
+            .collect();
+        let mut removed = Vec::with_capacity(doomed.len());
+        for li in doomed {
+            if let Some(entry) = self.entries.remove(&li) {
+                self.positions.remove(&entry.event_id);
+                self.resident.remove(&li);
+                removed.push(entry);
+            }
+        }
+        let mut kept = Vec::new();
+        for (_, entry) in self.entries.range_mut(..floor) {
+            entry.chain = None;
+            kept.push(entry.clone());
+        }
+        self.checkpoint = Some(checkpoint);
+        Some(Truncation {
+            checkpoint,
+            removed,
+            kept,
+        })
     }
 
     /// The entry at a position this log issued.
@@ -1743,6 +1847,20 @@ impl LogRestore {
         }
     }
 
+    /// Start the chain from a truncated room's checkpoint (#817).
+    ///
+    /// Entries below the checkpoint that still carry a chain value are the
+    /// leftovers of a truncation a crash interrupted: the checkpoint was
+    /// written first, so they are already gone as far as the room is
+    /// concerned, and [`Self::push`] drops them. Entries below it without
+    /// one are the ones the truncation kept on purpose.
+    #[must_use]
+    pub fn with_chain_checkpoint(mut self, checkpoint: ChainCheckpoint) -> Self {
+        self.log.head_chain = checkpoint.chain;
+        self.log.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Offer a recorded resolution of the room's fork. [`Self::finish`]
     /// adopts it as the current state only if `inputs` is still what the
     /// restored room's resolution depends on and its root reads back
@@ -1796,6 +1914,12 @@ impl LogRestore {
             }
         }
         self.previous = Some(li);
+        if log
+            .checkpoint
+            .is_some_and(|point| li < point.floor && restored.chain.is_some())
+        {
+            return Ok(());
+        }
         let chain = match restored.chain {
             Some(stored) => {
                 let recomputed = log.head_chain.extend(&restored.event_id);
@@ -1984,6 +2108,7 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             None,
+            None,
             table,
         )
     }
@@ -2014,6 +2139,35 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             Some(load_node),
+            None,
+            table,
+        )
+    }
+
+    /// [`Self::restore`] and [`Self::restore_with_state`] for a truncated
+    /// room: the chain starts from `checkpoint` (#817). Without a loader
+    /// the state is refolded, which a truncated room cannot do for its
+    /// first retained entries; they are reported as unverified.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::restore`].
+    pub fn restore_from_checkpoint(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: Option<NodeLoader<'_>>,
+        checkpoint: ChainCheckpoint,
+        table: Arc<dyn StateKeyTable>,
+    ) -> Result<RestoredLog, RestoreError> {
+        Self::rebuild(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            load_node,
+            Some(checkpoint),
             table,
         )
     }
@@ -2103,6 +2257,7 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         mut load_node: Option<NodeLoader<'_>>,
+        checkpoint: Option<ChainCheckpoint>,
         table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         let mut log = Self {
@@ -2118,7 +2273,8 @@ impl RoomLog {
             current: None,
             next_forward,
             next_backward,
-            head_chain: ChainHash::seed(),
+            head_chain: checkpoint.map_or_else(ChainHash::seed, |point| point.chain),
+            checkpoint,
             resident: BTreeMap::new(),
             resident_window: DEFAULT_RESIDENT_WINDOW,
         };
@@ -2143,6 +2299,9 @@ impl RoomLog {
                 }
             }
             previous = Some(li);
+            if checkpoint.is_some_and(|point| li < point.floor && restored.chain.is_some()) {
+                continue;
+            }
 
             // Refold first. It is O(1) per entry given the parent's state,
             // which is already in hand from the previous iteration, whereas

@@ -227,6 +227,7 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::RevokedDevice, 0x63),
         (Keyspace::CurrentState, 0x64),
         (Keyspace::DestinationRetry, 0x65),
+        (Keyspace::ChainCheckpoint, 0x66),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),

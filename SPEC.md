@@ -280,6 +280,13 @@ And a divergence never re-converges: two histories that differ at one index
 disagree at every index after, even where later events are identical, so the
 first differing value localises the change.
 
+**A truncated room restarts the chain from a checkpoint.** Retention (§14.3)
+deletes the entries below a floor. The room then stores `chain[floor - 1]`
+beside the floor, and every restore seeds the chain from it instead of from
+the domain seed. The checkpoint is written before the first delete, so an
+interrupted truncation still loads. Entries kept below the floor carry no
+chain value, like backfilled history.
+
 **Only forward-appended entries carry a chain value.** Backfilled history was
 sequenced by another server and arrives with its own provenance; attesting to
 an order we did not choose would be a claim we cannot back. A server's chain
@@ -1443,10 +1450,18 @@ dropping `li < X` for a room is a range delete plus a mark-and-sweep over
 There is no state-group compaction job, which removes an entire class of
 operator toil.
 
-**Status.** Retention is designed only. `purge_history` deletes the bodies of
-non-state events and keeps every log entry, because the hash chain covers the
-event IDs. The log, the stream indexes and the old state roots keep growing,
-and `spindle gc` cannot free the state of a purged room (#817).
+**Status.** The truncation primitive is built (#817). `truncate_room_log`
+records a chain checkpoint `(floor, chain[floor - 1])` in its own keyspace,
+then deletes the log entries, bodies, stream rows, relation rows and old
+membership rows below the floor. A load, `load_exhaustive` and `spindle
+verify` start the chain from the checkpoint (§5.3). The entries of the
+current state and of the parents of kept entries stay, without a chain
+value, and so do the bodies in the auth chain of kept events. `spindle gc`
+frees the state nodes that only the removed roots used. The floor never
+passes the head, an extremity or a gap anchor, and a room in hub mode, in a
+partial-state join or with a fork is left alone. The `[retention]` policy,
+`m.room.retention` and the background job are not built yet. `purge_history`
+still deletes only bodies.
 
 ---
 

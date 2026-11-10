@@ -42,8 +42,9 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, LogRestore, MemStateKeyTable, RestoreError, RestoredEntry,
-    RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot, StateSnapshot,
+    CONTENT_DIGEST_VERSION, ChainCheckpoint, EventId, LogRestore, MemStateKeyTable, RestoreError,
+    RestoredEntry, RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot,
+    StateSnapshot,
     keys::{
         KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, state_key_intern,
         state_key_intern_prefix, store_marker,
@@ -51,8 +52,8 @@ use spindle_core::{
 };
 
 use crate::codec::{
-    CodecError, CurrentStateRecord, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord,
-    decode_intern_pair, encode_intern_pair,
+    ChainCheckpointRecord, CodecError, CurrentStateRecord, EntryRecord, RECORD_VERSION, RoomRecord,
+    SidelinedRecord, decode_intern_pair, encode_intern_pair,
 };
 
 /// How hard a commit tries to be on disk before it is acknowledged.
@@ -2408,6 +2409,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
             self.store.commit_state_deferred(&writes, state.table())?;
             previous = Some(state);
         }
+        if let Some(point) = log.chain_checkpoint() {
+            self.store.put(
+                &spindle_core::keys::chain_checkpoint(&self.room_id),
+                &ChainCheckpointRecord {
+                    floor: point.floor,
+                    chain: *point.chain.as_bytes(),
+                }
+                .encode(),
+            )?;
+        }
         self.store.put(
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
             &Self::meta(log).encode(),
@@ -2432,23 +2443,67 @@ impl<'a, S: Store> RoomStore<'a, S> {
     ///
     /// Returns [`StoreError`] on a backend failure or an unreadable record.
     pub fn load_refolding(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        let Some((meta, entries, checkpoint)) = self.read_records()? else {
             return Ok(None);
         };
-        let mut restored = RoomLog::restore(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            self.store.key_table(),
-        )?;
+        let extremities = meta
+            .forward_extremities
+            .into_iter()
+            .map(|id| EventId::new(id.as_str()));
+        let mut restored = match checkpoint {
+            Some(checkpoint) => RoomLog::restore_from_checkpoint(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                None,
+                checkpoint,
+                self.store.key_table(),
+            )?,
+            None => RoomLog::restore(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                self.store.key_table(),
+            )?,
+        };
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 
-    fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
+    /// The room's chain restart point, if retention has truncated it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the row cannot be read or decoded. A row
+    /// that does not decode is an error, not an absence: loading without
+    /// it would break the chain at the first retained entry.
+    pub fn chain_checkpoint(&self) -> Result<Option<ChainCheckpoint>, StoreError> {
+        Self::checkpoint_in(self.store, &self.room_id)
+    }
+
+    fn checkpoint_in(
+        view: &dyn ReadView,
+        room_id: &str,
+    ) -> Result<Option<ChainCheckpoint>, StoreError> {
+        let Some(raw) = view.get(&spindle_core::keys::chain_checkpoint(room_id))? else {
+            return Ok(None);
+        };
+        let record = ChainCheckpointRecord::decode(&raw)?;
+        Ok(Some(ChainCheckpoint {
+            floor: record.floor,
+            chain: spindle_core::ChainHash::from_bytes(record.chain),
+        }))
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "the record, its rows and the chain seed"
+    )]
+    fn read_records(
+        &self,
+    ) -> Result<Option<(RoomRecord, Vec<RestoredEntry>, Option<ChainCheckpoint>)>, StoreError> {
         // Read metadata and log through one frozen view. Rebuilding a room
         // takes two reads, and a commit landing between them yields a room
         // whose counters and log disagree -- metadata trailing the log being
@@ -2464,6 +2519,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         let meta = RoomRecord::decode(&raw_meta)?;
+        let checkpoint = Self::checkpoint_in(view, &self.room_id)?;
 
         // The scan is already in `li` order because the key encoding is
         // order-preserving across the sign boundary; backfilled history sorts
@@ -2482,7 +2538,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 chain: record.chain,
             });
         }
-        Ok(Some((meta, entries)))
+        Ok(Some((meta, entries, checkpoint)))
     }
 
     /// Read the room's metadata and stream its log into a [`LogRestore`],
@@ -2500,6 +2556,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         let meta = RoomRecord::decode(&raw_meta)?;
+        let checkpoint = Self::checkpoint_in(view, &self.room_id)?;
         // The occupied positions are contiguous, so the counters bound the
         // row count. Only a reservation hint: `LogRestore` caps it.
         let expected = usize::try_from(
@@ -2508,7 +2565,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .saturating_sub(1),
         )
         .unwrap_or(0);
-        let mut restore = LogRestore::new(
+        let restore = LogRestore::new(
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
@@ -2517,6 +2574,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
             expected,
             view.key_table(),
         );
+        let mut restore = match checkpoint {
+            Some(checkpoint) => restore.with_chain_checkpoint(checkpoint),
+            None => restore,
+        };
         let mut profile = RestoreProfile::default();
         let prefix = room_prefix(Keyspace::Log, &self.room_id);
         let restore = if expected >= PIPELINE_ROWS {
@@ -2621,23 +2682,36 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// Returns [`StoreError`] on a backend failure, an unreadable record, or
     /// records that cannot be replayed in order.
     pub fn load(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        let Some((meta, entries, checkpoint)) = self.read_records()? else {
             return Ok(None);
         };
 
         let reader = NodeReader::new(self.store);
         let mut load_node = |address: &StateRoot| reader.load(address);
 
-        let restored = RoomLog::restore_with_state(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            &mut load_node,
-            self.store.key_table(),
-        );
+        let extremities = meta
+            .forward_extremities
+            .into_iter()
+            .map(|id| EventId::new(id.as_str()));
+        let restored = match checkpoint {
+            Some(checkpoint) => RoomLog::restore_from_checkpoint(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                Some(&mut load_node),
+                checkpoint,
+                self.store.key_table(),
+            ),
+            None => RoomLog::restore_with_state(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                &mut load_node,
+                self.store.key_table(),
+            ),
+        };
         let mut restored = reader.finish(restored)?;
         self.restore_sidelined(&mut restored.log)?;
         self.restore_historical_rejections(&mut restored.log)?;

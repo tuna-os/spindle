@@ -78,6 +78,36 @@ every state root. Run it after a crash, a restore or a disk fault. It names
 each room that fails and exits non-zero. A read error is reported as an
 error, not as a missing node. The server must be stopped.
 
+## Truncating a room's history
+
+A truncation removes the log of a room below a position (#817). It removes
+the log entries, the event bodies, the stream rows, the relation rows and
+the old membership rows. After it, `spindle gc` can free the state nodes
+that only the removed entries used.
+
+The hash chain needs the value before the first kept entry. So the server
+first writes a chain checkpoint for the room: the first position that is
+kept and the chain value just before it. A load, `spindle verify` and a
+restore start the chain from that checkpoint. A backup holds the checkpoint
+as an ordinary row.
+
+The order of the writes keeps a crash safe. One atomic batch writes the
+checkpoint, the purge watermark and the entries that stay. Every delete
+comes after it, and the log rows go last. A crash leaves a room that
+already reads as truncated. The next truncation of the room finishes the
+deletes.
+
+The server lowers the position to what is safe. It never passes the head
+or a forward extremity. It never passes a federation gap or the anchor of a
+filled gap. It refuses a room in hub mode, a room in a partial-state join
+and a room with several forward extremities. It keeps the entry of each
+event in the current state and of each event that a kept entry names as a
+parent. It keeps the body of each event in the auth chain of a kept event.
+
+A server from before this change cannot load a truncated room. Its chain
+check fails at the first kept entry. Do not run an older binary on a store
+that has a truncated room.
+
 ## Collecting unreachable state
 
 ```
