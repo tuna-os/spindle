@@ -41,9 +41,11 @@ Either way the run then:
 - builds the runtime image (the `Dockerfile` at the root) for `amd64` and
   `arm64` and publishes a manifest at `ghcr.io/tuna-os/spindle:<tag>`;
 - uses the cargo features in `FEATURES` of `release.yml` for the
-  tarballs and the image. Today, that is `mas-import` (#802);
-- stops if `spindle import-mas` does not print its usage. The MAS
-  cutover in [delegated-auth.md](delegated-auth.md) needs this command;
+  tarballs and the image. Today, that is `mas-import` (#802) and `synapse-import` (#826);
+- stops if `spindle import-mas` or `spindle import-synapse` does not print
+  its usage. The MAS cutover in [delegated-auth.md](delegated-auth.md) and
+  the Synapse migration in [migration-workspace.md](migration-workspace.md)
+  need these commands;
 - writes an SBOM for each tarball (SPDX, from `Cargo.lock`, so it names
   every crate the build pinned) and attests it to the tarball;
 - signs a provenance attestation for each tarball and each image, through

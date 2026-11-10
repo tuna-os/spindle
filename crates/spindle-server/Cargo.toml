@@ -59,8 +59,11 @@ opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 
 [features]
-# Off by default: the reader is a one-shot migration path, and neither the
-# server binary nor the hot CI gate should pay a C compile for it.
+# Off by default: the reader is a one-shot migration path, and the hot CI
+# gate and a development build should not pay a C compile for it. The
+# release builds turn it on (FEATURES in .github/workflows/release.yml and
+# the Dockerfile, #826): the importer must be the same build as the server
+# whose store it opens.
 synapse-import = ["dep:postgres", "dep:rusqlite"]
 # `spindle import-mas` (#797): reads a MAS PostgreSQL database. Off by
 # default, so the hot CI gate and a development build do not compile a

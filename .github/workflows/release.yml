@@ -56,13 +56,16 @@ env:
   # the image matches the published one.
   #
   # `mas-import` is `spindle import-mas` (#802), the MAS-to-built-in
-  # cutover. The importer opens the store, so it must be the same build as
-  # the server: in the release itself, not in a variant image that an
-  # operator must match by tag. It adds only a pure-Rust PostgreSQL client
-  # (no C build) that runs in that offline command and nowhere in the
-  # server. `synapse-import` stays out: it compiles SQLite from C and
-  # changes code in the server's room and media paths.
-  FEATURES: mas-import
+  # cutover. `synapse-import` is `spindle import-synapse` (#240, #563,
+  # #826), the Synapse migration. An importer opens the store, so it must
+  # be the same build as the server: in the release itself, not in a
+  # variant image that an operator must match by tag. The two features add
+  # a pure-Rust PostgreSQL client and a bundled SQLite (one C file, a
+  # short extra build and about a megabyte of binary). Both run in
+  # offline commands only. The server code that `synapse-import` gates is
+  # the importer's own write path (`persist_synapse_*` in rooms/mod.rs);
+  # no request handler calls it.
+  FEATURES: mas-import,synapse-import
 
 jobs:
   cut:
@@ -131,12 +134,14 @@ jobs:
           toolchain: 1.90.0
       - name: Build
         run: cargo build --release -p spindle-server --bin spindle --locked --features "$FEATURES"
-      # The importer is in the tarball (#802): without the feature the
-      # command prints a rebuild hint and not this usage line.
-      - name: Check the importer is in the binary
+      # The importers are in the tarball (#802, #826): without the feature
+      # a command prints a rebuild hint and not its usage line.
+      - name: Check the importers are in the binary
         run: |
           usage=$(target/release/spindle import-mas 2>&1 || true)
           grep -q 'usage: spindle import-mas' <<<"$usage"
+          usage=$(target/release/spindle import-synapse 2>&1 || true)
+          grep -q 'usage: spindle import-synapse' <<<"$usage"
       - name: Package
         run: |
           name="spindle-${TAG}-${TARGET}"
@@ -208,9 +213,11 @@ jobs:
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${ARCH}"
           docker build --build-arg FEATURES="$FEATURES" -t "$image" .
-          # The importer is in the image (#802), checked before the push.
+          # The importers are in the image (#802, #826), checked before the push.
           usage=$(docker run --rm "$image" import-mas 2>&1 || true)
           grep -q 'usage: spindle import-mas' <<<"$usage"
+          usage=$(docker run --rm "$image" import-synapse 2>&1 || true)
+          grep -q 'usage: spindle import-synapse' <<<"$usage"
           docker push "$image"
           # The digest is the subject of the attestation: a tag can be moved,
           # a digest cannot.
@@ -269,7 +276,7 @@ jobs:
             echo
             echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}@${DIGEST}\` (amd64, arm64)."
             echo
-            echo "The tarballs and the image include \`spindle import-mas\`, the MAS importer (docs/delegated-auth.md)."
+            echo "The tarballs and the image include \`spindle import-mas\`, the MAS importer (docs/delegated-auth.md), and \`spindle import-synapse\`, the Synapse importer (docs/migration-workspace.md)."
             echo
             echo "Every tarball and both images carry a Sigstore-signed provenance attestation, and each tarball an SBOM (\`.spdx.json\`) attested to it. To check one came from this workflow on this commit:"
             echo

@@ -18,10 +18,11 @@
 FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
 # Extra cargo features. The default is the release image's set, so that a
 # local `docker build .` makes the image release.yml publishes (its
-# FEATURES env passes the same value): `mas-import`, for `spindle
-# import-mas` (#802). The Synapse migration rehearsal image passes
-# FEATURES=synapse-import instead.
-ARG FEATURES="mas-import"
+# FEATURES env passes the same value): `mas-import` and `synapse-import`,
+# for `spindle import-mas` (#802) and `spindle import-synapse` (#826).
+# The Synapse migration rehearsal image passes FEATURES=synapse-import
+# instead, which also adds `import-synapse-rehearsal`.
+ARG FEATURES="mas-import,synapse-import"
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p spindle-server --bin spindle --locked \
