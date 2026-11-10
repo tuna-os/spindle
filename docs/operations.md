@@ -15,6 +15,7 @@ key.
 Container deployments must bind the server to `0.0.0.0:8008` inside the
 container and mount the store at `/var/lib/spindle` with UID 1000 write access.
 Pin an image tag or digest; there is no `latest` image.
+Ready-made Compose, systemd, Helm and proxy files are in [deploy.md](deploy.md).
 
 The v0.1 deployment envelope needs these controls:
 

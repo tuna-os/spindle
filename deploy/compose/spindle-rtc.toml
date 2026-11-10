@@ -1,0 +1,19 @@
+# compose.yaml's spindle.toml plus [rtc.livekit]. Keep the two in step.
+
+[server]
+name = "matrix.example.org"
+bind = "0.0.0.0:8008"
+public_base_url = "https://matrix.example.org"
+
+[storage]
+path = "/var/lib/spindle"
+
+[registration]
+require_token = true
+
+[rtc.livekit]
+# What clients get. Caddy serves this host (livekit.caddy).
+url = "wss://lk.matrix.example.org"
+key = "APIspindle"
+# The same value as keys in livekit.yaml.
+secret = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"

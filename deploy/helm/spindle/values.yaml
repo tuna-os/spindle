@@ -1,0 +1,70 @@
+# One Spindle process owns one store, so this chart runs exactly one
+# replica. There is no replicaCount value on purpose (docs/operations.md).
+
+image:
+  repository: ghcr.io/tuna-os/spindle
+  # Required. Use a release tag, such as v0.1.0. There is no latest image.
+  tag: ""
+  # Optional, and best: sha256:... from the release notes.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Written to spindle.toml. server.name is permanent: choose it first.
+config:
+  serverName: example.org
+  # What .well-known tells clients. Leave empty when it is the same as serverName.
+  publicBaseUrl: https://matrix.example.org
+  # More TOML, added as it is. See spindle.example.toml.
+  extra: |
+    [registration]
+    require_token = true
+  # Instead of all of the above: the name of a Secret whose key
+  # spindle.toml is the whole config. Use it when the config holds secrets.
+  existingSecret: ""
+
+persistence:
+  size: 20Gi
+  storageClassName: ""
+
+service:
+  type: ClusterIP
+  port: 8008
+
+# Opt-in metrics listener on its own port, and a Service and ServiceMonitor
+# for it. The port is not on the client Service (docs/metrics.md).
+metrics:
+  enabled: false
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+ingress:
+  enabled: false
+  className: ""
+  host: matrix.example.org
+  # TLS secret for the host, from cert-manager or by hand.
+  tlsSecretName: ""
+  # ingress-nginx example. Federation peers need the first one: they read
+  # /.well-known/matrix/server and Spindle does not name a port in it.
+  annotations: {}
+  #  nginx.ingress.kubernetes.io/proxy-body-size: 100m
+  #  nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+  #  nginx.ingress.kubernetes.io/server-snippet: |
+  #    location = /.well-known/matrix/server {
+  #      default_type application/json;
+  #      return 200 '{"m.server": "matrix.example.org:443"}';
+  #    }
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 2Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

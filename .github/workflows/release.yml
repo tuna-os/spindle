@@ -147,6 +147,9 @@ jobs:
           name="spindle-${TAG}-${TARGET}"
           mkdir -p "dist/$name"
           cp target/release/spindle LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          # The unit and the example config, so the tarball alone can be
+          # installed as a service (docs/deploy.md, #825).
+          cp deploy/systemd/spindle.service spindle.example.toml "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "name=$name" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,27 @@
+{{- if not .Values.config.existingSecret }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spindle.fullname" . }}
+  labels:
+    {{- include "spindle.labels" . | nindent 4 }}
+data:
+  spindle.toml: |
+    [server]
+    name = {{ .Values.config.serverName | quote }}
+    bind = "0.0.0.0:8008"
+    {{- if .Values.config.publicBaseUrl }}
+    public_base_url = {{ .Values.config.publicBaseUrl | quote }}
+    {{- end }}
+
+    [storage]
+    path = "/var/lib/spindle"
+    {{- if .Values.metrics.enabled }}
+
+    [metrics]
+    bind = "0.0.0.0:{{ .Values.metrics.port }}"
+    {{- end }}
+    {{- if .Values.config.extra }}
+    {{- printf "\n%s" (.Values.config.extra | trim) | nindent 4 }}
+    {{- end }}
+{{- end }}
