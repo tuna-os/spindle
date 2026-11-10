@@ -8,6 +8,8 @@
 //! server may see the room.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -229,4 +231,66 @@ fn clean_child(event: &Value, suggested_only: bool) -> Option<Value> {
         "sender": event["sender"].as_str().unwrap_or_default(),
         "origin_server_ts": event["origin_server_ts"].as_u64().unwrap_or(0),
     }))
+}
+
+/// How long the list behind a `next_batch` token is kept.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(300);
+/// Lists kept at once; the oldest goes first.
+const MAX_SNAPSHOTS: usize = 64;
+
+struct Snapshot {
+    at: Instant,
+    scope: String,
+    entries: Vec<crate::room_routes::HierarchyEntry>,
+}
+
+static SNAPSHOTS: Mutex<Vec<(String, Snapshot)>> = Mutex::new(Vec::new());
+
+/// Keep the list a walk that used remote rooms produced, and return the id a
+/// token carries. `scope` binds it to one user, root and parameter set.
+pub(crate) fn keep(scope: &str, entries: &[crate::room_routes::HierarchyEntry]) -> String {
+    let id = format!("{:016x}", rand::random::<u64>());
+    let mut all = SNAPSHOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|(_, kept)| kept.at.elapsed() < SNAPSHOT_TTL);
+    if all.len() >= MAX_SNAPSHOTS {
+        all.remove(0);
+    }
+    all.push((
+        id.clone(),
+        Snapshot {
+            at: Instant::now(),
+            scope: scope.to_owned(),
+            entries: entries.to_vec(),
+        },
+    ));
+    id
+}
+
+/// The list kept under `id`, if it is still there and was kept for `scope`.
+pub(crate) fn snapshot(id: &str, scope: &str) -> Option<Vec<crate::room_routes::HierarchyEntry>> {
+    let all = SNAPSHOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.iter()
+        .find(|(known, kept)| known == id && kept.scope == scope)
+        .filter(|(_, kept)| kept.at.elapsed() < SNAPSHOT_TTL)
+        .map(|(_, kept)| kept.entries.clone())
+}
+
+/// `next_batch` for the page starting at `offset`.
+pub(crate) fn token(snapshot: Option<&str>, offset: usize) -> String {
+    snapshot.map_or_else(|| offset.to_string(), |id| format!("{id}.{offset}"))
+}
+
+/// Read a `from` token: a bare offset, or a snapshot id and an offset. A
+/// snapshot that has expired still leaves the offset, so the token stays
+/// valid and the page is cut from a fresh walk.
+pub(crate) fn parse_token(token: &str) -> Option<(Option<String>, usize)> {
+    match token.split_once('.') {
+        Some((id, offset)) if !id.is_empty() => Some((Some(id.to_owned()), offset.parse().ok()?)),
+        Some(_) => None,
+        None => Some((None, token.parse().ok()?)),
+    }
 }

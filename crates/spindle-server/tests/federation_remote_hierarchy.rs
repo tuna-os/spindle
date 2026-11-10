@@ -351,3 +351,155 @@ async fn a_summary_of_a_remote_public_room_works_by_id_and_by_alias() {
     assert_ne!(status, 200, "{body}");
     assert!(!body.to_string().contains("private child"), "{body}");
 }
+
+/// A hierarchy request to `instance`, as (status, body).
+async fn hierarchy(instance: &Instance, space: &str, token: &str, query: &str) -> (u16, Value) {
+    instance
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v1/rooms/{space}/hierarchy{query}"),
+            Some(token),
+            None,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_root_this_server_does_not_hold_is_shown_by_its_own_server() {
+    let a = Instance::start().await;
+    let b = Instance::start().await;
+    let alice = a.register("alice").await;
+    let carol = b.register("carol").await;
+    let space = a.room(&alice, "the space", public()).await;
+    let open = a.room(&alice, "open child", public()).await;
+    let private = a
+        .room(&alice, "private child", json!({ "join_rule": "invite" }))
+        .await;
+    a.add_child(&space, &alice, &open, &a.name).await;
+    a.add_child(&space, &alice, &private, &a.name).await;
+
+    // B holds nothing of this space and carol is in none of it.
+    let (status, body) = hierarchy(&b, &space, &carol, "").await;
+    assert_eq!(status, 200, "{body}");
+    let mut names: Vec<&str> = body["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|room| room["name"].as_str().unwrap_or(""))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["open child", "the space"], "{body}");
+}
+
+#[tokio::test]
+async fn a_root_nobody_will_show_is_the_same_error_as_one_that_does_not_exist() {
+    let a = Instance::start().await;
+    let b = Instance::start().await;
+    let alice = a.register("alice").await;
+    let carol = b.register("carol").await;
+    let invite_only = a
+        .room(&alice, "secret", json!({ "join_rule": "invite" }))
+        .await;
+    let restricted = a
+        .room(
+            &alice,
+            "restricted",
+            json!({ "join_rule": "restricted",
+                    "allow": [{ "type": "m.room_membership", "room_id": invite_only }] }),
+        )
+        .await;
+    let unknown = format!("!nothing:{}", a.name);
+    let nowhere = "!nothing:127.0.0.1:1";
+
+    let mut answers = Vec::new();
+    for room in [&invite_only, &restricted, &unknown, &nowhere.to_owned()] {
+        let (status, body) = hierarchy(&b, room, &carol, "").await;
+        assert!(!body.to_string().contains("secret"), "{body}");
+        answers.push((status, body["errcode"].clone(), body["error"].clone()));
+    }
+    assert_eq!(answers[0].0, 403, "{answers:?}");
+    assert!(
+        answers.iter().all(|answer| *answer == answers[0]),
+        "{answers:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_next_batch_token_keeps_its_page_when_a_remote_child_appears_between_pages() {
+    let rig = rig().await;
+    for name in ["one", "two"] {
+        let child = rig.a.room(&rig.alice, name, public()).await;
+        rig.a
+            .add_child(&rig.space, &rig.alice, &child, &rig.a.name)
+            .await;
+    }
+    assert_eq!(eventually_names(&rig, "").await.len(), 3);
+
+    let (status, first) = hierarchy(&rig.b, &rig.space, &rig.bob, "?limit=1").await;
+    assert_eq!(status, 200, "{first}");
+    let mut seen: Vec<String> = vec![first["rooms"][0]["name"].as_str().unwrap().to_owned()];
+    let mut token = first["next_batch"].as_str().unwrap().to_owned();
+
+    // Another child becomes reachable from this server between two pages.
+    let late = rig.a.room(&rig.alice, "late", public()).await;
+    rig.a
+        .add_child(&rig.space, &rig.alice, &late, &rig.a.name)
+        .await;
+    let mut count = 0;
+    for _ in 0..60 {
+        count = rig
+            .b
+            .hierarchy_names(&rig.space, &rig.bob, "?limit=50")
+            .await
+            .len();
+        if count == 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(count, 4, "the newcomer reaches B");
+
+    loop {
+        let (status, page) = hierarchy(
+            &rig.b,
+            &rig.space,
+            &rig.bob,
+            &format!("?limit=1&from={token}"),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        seen.push(page["rooms"][0]["name"].as_str().unwrap().to_owned());
+        match page["next_batch"].as_str() {
+            Some(next) => token = next.to_owned(),
+            None => break,
+        }
+    }
+    // The pages are cut from the list the first page was: nothing is
+    // repeated or skipped, and the newcomer waits for the next walk.
+    seen.sort_unstable();
+    assert_eq!(seen, ["one", "the space", "two"], "{seen:?}");
+}
+
+#[tokio::test]
+async fn a_token_whose_list_is_gone_still_pages_and_a_foreign_one_is_refused() {
+    let rig = rig().await;
+    let child = rig.a.room(&rig.alice, "one", public()).await;
+    rig.a
+        .add_child(&rig.space, &rig.alice, &child, &rig.a.name)
+        .await;
+    assert_eq!(eventually_names(&rig, "").await.len(), 2);
+
+    // An id the server no longer (or never) kept: the offset still holds.
+    let (status, page) = hierarchy(
+        &rig.b,
+        &rig.space,
+        &rig.bob,
+        "?limit=1&from=00000000deadbeef.1",
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["rooms"].as_array().unwrap().len(), 1, "{page}");
+    // A token that is neither shape is a client error, as before.
+    let (status, _) = hierarchy(&rig.b, &rig.space, &rig.bob, "?from=garbage").await;
+    assert_eq!(status, 400);
+}
