@@ -1648,6 +1648,17 @@ pub struct MediaConfig {
     /// the write rates: a bridge mirrors other networks' media by design.
     #[serde(default)]
     pub max_bytes_per_user: Option<u64>,
+    /// Most pixels (width times height) a source image may declare and still
+    /// be thumbnailed. A small, highly compressible file can declare a huge
+    /// canvas, and decoding it costs memory and CPU out of proportion to its
+    /// size, so the header is read first and an image over this is refused
+    /// with 413 `M_TOO_LARGE` before any pixel is decoded.
+    #[serde(default = "default_max_thumbnail_pixels")]
+    pub max_thumbnail_pixels: u64,
+}
+
+fn default_max_thumbnail_pixels() -> u64 {
+    crate::media::DEFAULT_MAX_THUMBNAIL_PIXELS
 }
 
 fn default_max_upload_bytes() -> usize {
@@ -1659,6 +1670,7 @@ impl Default for MediaConfig {
         Self {
             max_upload_bytes: default_max_upload_bytes(),
             max_bytes_per_user: None,
+            max_thumbnail_pixels: default_max_thumbnail_pixels(),
         }
     }
 }
@@ -1914,6 +1926,12 @@ impl Config {
                 field: "media.max_upload_bytes",
                 message: "must be greater than zero and leave room for the HTTP rejection sentinel"
                     .to_owned(),
+            });
+        }
+        if self.media.max_thumbnail_pixels == 0 {
+            return Err(ConfigError::Invalid {
+                field: "media.max_thumbnail_pixels",
+                message: "must be greater than zero".to_owned(),
             });
         }
         // Zero is not "no quota" -- that is leaving it out -- but a quota

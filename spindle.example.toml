@@ -57,6 +57,10 @@ path = "./data"
 # deleting media gives the bytes back. Appservice users and server admins
 # are exempt, as from the write rates below. Zero is refused at startup.
 # max_bytes_per_user = 10737418240 # 10 GiB
+# Most pixels (width times height) a source image may declare and still be
+# thumbnailed. The header is read first; an image over this is refused with
+# 413 M_TOO_LARGE before any pixel is decoded. Zero is refused at startup.
+# max_thumbnail_pixels = 40000000
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a

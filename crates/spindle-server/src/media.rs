@@ -12,7 +12,9 @@
 //! from ID to hash lives in the store.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use spindle_core::keys;
@@ -184,6 +186,43 @@ pub struct Media {
     /// a crash, an import or a restore, and there is no second keyspace to
     /// back up. One scan per process, and only on a server with a quota.
     usage: Mutex<Option<HashMap<String, u64>>>,
+    /// `[media] max_thumbnail_pixels`: the most pixels a source image may
+    /// declare before it is refused rather than decoded.
+    max_thumbnail_pixels: u64,
+    /// Bounds how many image decodes run at once. A decode holds a blocking
+    /// thread and a pixel buffer, so unbounded concurrency lets a burst of
+    /// requests for large images exhaust memory even under the pixel budget.
+    decode_slots: Arc<tokio::sync::Semaphore>,
+    /// Source hashes that failed to thumbnail, and when, so a bad image is
+    /// refused from memory instead of being fetched and decoded again on
+    /// every request. Only successes were cached before.
+    decode_failures: Mutex<HashMap<String, (Instant, DecodeFailure)>>,
+    /// Decodes that got as far as reading pixel data. Counted so a test can
+    /// show an over-budget image never reached the decoder.
+    decodes_started: Arc<AtomicU64>,
+}
+
+/// Most image decodes in flight at once.
+const DECODE_CONCURRENCY: usize = 4;
+/// How long a failed decode is remembered.
+const DECODE_FAILURE_TTL: Duration = Duration::from_secs(300);
+/// Most failures remembered; past it the map is pruned, then cleared.
+const DECODE_FAILURE_CAP: usize = 1024;
+
+/// Why a source image could not be thumbnailed, kept for the failure cache.
+#[derive(Clone, Debug)]
+enum DecodeFailure {
+    TooManyPixels { pixels: u64, limit: u64 },
+    Unreadable(String),
+}
+
+impl DecodeFailure {
+    fn into_error(self) -> MediaError {
+        match self {
+            Self::TooManyPixels { pixels, limit } => MediaError::ImageTooLarge { pixels, limit },
+            Self::Unreadable(message) => MediaError::Unreadable(message),
+        }
+    }
 }
 
 impl Media {
@@ -200,7 +239,49 @@ impl Media {
             max_upload_bytes: MAX_UPLOAD,
             quota_bytes: None,
             usage: Mutex::new(None),
+            max_thumbnail_pixels: DEFAULT_MAX_THUMBNAIL_PIXELS,
+            decode_slots: Arc::new(tokio::sync::Semaphore::new(DECODE_CONCURRENCY)),
+            decode_failures: Mutex::new(HashMap::new()),
+            decodes_started: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Refuse to thumbnail sources declaring more than `pixels` pixels.
+    #[must_use]
+    pub fn with_max_thumbnail_pixels(mut self, pixels: u64) -> Self {
+        self.max_thumbnail_pixels = pixels;
+        self
+    }
+
+    /// How many thumbnail decodes have started reading pixel data.
+    #[must_use]
+    pub fn decodes_started(&self) -> u64 {
+        self.decodes_started.load(Ordering::Relaxed)
+    }
+
+    fn remembered_failure(&self, hash: &str) -> Option<DecodeFailure> {
+        let failures = self
+            .decode_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        failures
+            .get(hash)
+            .filter(|(at, _)| at.elapsed() < DECODE_FAILURE_TTL)
+            .map(|(_, failure)| failure.clone())
+    }
+
+    fn remember_failure(&self, hash: &str, failure: DecodeFailure) {
+        let mut failures = self
+            .decode_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failures.len() >= DECODE_FAILURE_CAP {
+            failures.retain(|_, (at, _)| at.elapsed() < DECODE_FAILURE_TTL);
+            if failures.len() >= DECODE_FAILURE_CAP {
+                failures.clear();
+            }
+        }
+        failures.insert(hash.to_owned(), (Instant::now(), failure));
     }
 
     /// Use the configured cap for uploads and remote media caching.
@@ -694,26 +775,50 @@ impl Media {
                 media_id: media_id.to_owned(),
                 hash: record.hash.clone(),
             })?;
-        let decoded = image::load_from_memory(&source)
-            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
-        let resized = if crop {
-            decoded.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
-        } else {
-            decoded.resize(width, height, image::imageops::FilterType::Triangle)
-        };
-        let mut bytes = Vec::new();
-        resized
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
+        let bytes = self
+            .decode_thumbnail(&record.hash, source, width, height, crop)
+            .await?;
 
         // Cached exactly like an upload — the backend's atomicity story
         // (rename locally, atomic object PUT on S3) means a concurrent
         // request never reads a half-written thumbnail.
         self.blobs.put(&cache_hash, &bytes).await?;
         Ok(("image/png".to_owned(), bytes))
+    }
+
+    /// Decode `source` and render the thumbnail, off the async workers and
+    /// behind [`DECODE_CONCURRENCY`] slots. A failure is remembered by source
+    /// hash for [`DECODE_FAILURE_TTL`].
+    async fn decode_thumbnail(
+        &self,
+        hash: &str,
+        source: Vec<u8>,
+        width: u32,
+        height: u32,
+        crop: bool,
+    ) -> Result<Vec<u8>, MediaError> {
+        if let Some(failure) = self.remembered_failure(hash) {
+            return Err(failure.into_error());
+        }
+        let permit = Arc::clone(&self.decode_slots)
+            .acquire_owned()
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        let limit = self.max_thumbnail_pixels;
+        let started = Arc::clone(&self.decodes_started);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            render_thumbnail(&source, width, height, crop, limit, &started)
+        })
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+        match outcome {
+            Ok(bytes) => Ok(bytes),
+            Err(failure) => {
+                self.remember_failure(hash, failure.clone());
+                Err(failure.into_error())
+            }
+        }
     }
 
     /// Every media record, with its ID: what the admin API lists a user's
@@ -802,6 +907,67 @@ fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
 /// The thumbnail sizes this server makes; every cached thumbnail is one.
 const THUMBNAIL_LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
 
+/// Pixels a source image may declare unless `[media] max_thumbnail_pixels`
+/// says otherwise: about 6000x6000, above any photo a phone takes.
+pub const DEFAULT_MAX_THUMBNAIL_PIXELS: u64 = 40_000_000;
+
+/// Read the declared size first and refuse past `max_pixels`, then decode
+/// under limits that cap the allocation too.
+///
+/// The header is read before anything else because a small, highly
+/// compressible file can declare a huge canvas; decoding it first would
+/// allocate the canvas before any error. The decoder limits back that up for
+/// formats whose header can lie about the allocation it needs.
+fn render_thumbnail(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    crop: bool,
+    max_pixels: u64,
+    started: &AtomicU64,
+) -> Result<Vec<u8>, DecodeFailure> {
+    let unreadable = |error: &dyn std::fmt::Display| DecodeFailure::Unreadable(error.to_string());
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(source))
+            .with_guessed_format()
+            .map_err(|error| unreadable(&error))
+    };
+    let (declared_width, declared_height) = reader()?
+        .into_dimensions()
+        .map_err(|error| unreadable(&error))?;
+    let pixels = u64::from(declared_width) * u64::from(declared_height);
+    if pixels > max_pixels {
+        return Err(DecodeFailure::TooManyPixels {
+            pixels,
+            limit: max_pixels,
+        });
+    }
+
+    let mut limits = image::Limits::default();
+    let side = u32::try_from(max_pixels).unwrap_or(u32::MAX);
+    limits.max_image_width = Some(side);
+    limits.max_image_height = Some(side);
+    // Eight bytes a pixel covers the widest sample layout the decoders emit.
+    limits.max_alloc = Some(max_pixels.saturating_mul(8));
+    let mut reader = reader()?;
+    reader.limits(limits);
+    started.fetch_add(1, Ordering::Relaxed);
+    let decoded = reader.decode().map_err(|error| unreadable(&error))?;
+    let resized = if crop {
+        decoded.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
+    } else {
+        decoded.resize(width, height, image::imageops::FilterType::Triangle)
+    };
+    let mut bytes = Vec::new();
+    resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| unreadable(&error))?;
+    Ok(bytes)
+}
+
 /// An opaque, unguessable media ID.
 ///
 /// Random rather than derived from the content, for the reason the module
@@ -851,6 +1017,11 @@ pub enum MediaError {
     Unsupported(String),
     /// Bytes that do not decode as the format they were declared to be.
     Unreadable(String),
+    /// An image declaring more pixels than `[media] max_thumbnail_pixels`.
+    ImageTooLarge {
+        pixels: u64,
+        limit: u64,
+    },
     Storage(StoreError),
     Io(String),
     Codec(String),
@@ -911,6 +1082,10 @@ impl std::fmt::Display for MediaError {
                     "the bytes do not decode as their declared type: {message}"
                 )
             }
+            Self::ImageTooLarge { pixels, limit } => write!(
+                formatter,
+                "the image declares {pixels} pixels, over the {limit}-pixel thumbnail limit"
+            ),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Io(message) => write!(formatter, "filesystem: {message}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
@@ -923,6 +1098,73 @@ impl std::error::Error for MediaError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Declares 5000x5000 with junk where the pixels should be.
+    fn oversize_png() -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            let mut crc = !0_u32;
+            for byte in &body {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&(!crc).to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::new();
+        header.extend_from_slice(&5000_u32.to_be_bytes());
+        header.extend_from_slice(&5000_u32.to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &header);
+        chunk(&mut out, b"IDAT", &[0x78, 0x9c, 0x01, 0x02, 0x03]);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_image_never_reaches_the_decoder_and_is_remembered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Media::new(store, blobs, "example.org").with_max_thumbnail_pixels(1_000_000);
+        let id = media
+            .put(
+                &oversize_png(),
+                "image/png",
+                None,
+                "@a:example.org",
+                Quota::Exempt,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let error = media.thumbnail(&id, 32, 32, false).await.unwrap_err();
+            assert!(matches!(
+                error,
+                MediaError::ImageTooLarge {
+                    pixels: 25_000_000,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(media.decodes_started(), 0, "no pixel data was decoded");
+        assert_eq!(
+            media.decode_failures.lock().unwrap().len(),
+            1,
+            "one hash remembered"
+        );
+    }
 
     #[test]
     fn a_filename_cannot_inject_a_header() {
