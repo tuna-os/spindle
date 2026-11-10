@@ -182,6 +182,8 @@ pub enum AppError {
     Appservice(String),
     Email(String),
     Upstream(String),
+    /// The store could not be read to resume the stream (#815).
+    Store(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -194,6 +196,7 @@ impl std::fmt::Display for AppError {
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
             Self::Email(why) => write!(formatter, "email: {why}"),
             Self::Upstream(why) => write!(formatter, "upstream identity provider: {why}"),
+            Self::Store(why) => write!(formatter, "store: {why}"),
         }
     }
 }
@@ -450,6 +453,22 @@ pub fn app_with_mailer(
     Ok(routes::router(state))
 }
 
+/// The rooms of a store, refusing to start when it cannot be read to find
+/// where the stream resumes (#815).
+fn open_rooms(
+    config: &Config,
+    store: &Arc<FjallStore>,
+    metrics: &Arc<metrics::Metrics>,
+) -> Result<Arc<rooms::Rooms>, AppError> {
+    rooms::Rooms::try_with_metrics(
+        Arc::clone(store),
+        config.server.name.clone(),
+        Arc::clone(metrics),
+    )
+    .map(Arc::new)
+    .map_err(|error| AppError::Store(error.to_string()))
+}
+
 fn app_state_with(
     config: Config,
     store: Arc<FjallStore>,
@@ -459,11 +478,7 @@ fn app_state_with(
     passwords::configure(&config.limits);
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
-    let rooms = Arc::new(rooms::Rooms::with_metrics(
-        Arc::clone(&store),
-        config.server.name.clone(),
-        Arc::clone(&metrics),
-    ));
+    let rooms = open_rooms(&config, &store, &metrics)?;
     let limiter = Arc::new(ratelimit::RateLimiter::with_enabled(
         config.ratelimit.enabled,
     ));
