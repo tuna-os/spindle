@@ -966,6 +966,7 @@ async fn serve() -> ExitCode {
 
     tracing::info!("spindle listening on {bind} as {name}");
     warn_if_proxy_unset(&bind, &config.server.trusted_proxies);
+    warn_if_registration_open(&config, &bind);
     // The key is established before the listener accepts anything. A server
     // that binds and then discovers it cannot sign has already told a client it
     // was ready to take events it cannot create.
@@ -1840,6 +1841,15 @@ fn shutdown() -> impl Future<Output = ()> {
             let _ = signal::ctrl_c().await;
             tracing::info!("interrupted, draining");
         }
+    }
+}
+
+fn warn_if_registration_open(config: &Config, bind: &str) {
+    if config.open_registration_exposed() {
+        tracing::warn!(
+            "registration is open to anyone who can reach {bind}: set [registration] \
+             require_token = true, or bind to a loopback address behind a proxy that limits sign-ups"
+        );
     }
 }
 

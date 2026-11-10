@@ -143,6 +143,12 @@ allow_private = []
 # account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
 # [registration]
 # require_token = false
+# A policy new accounts must accept before they register (`m.login.terms`,
+# the legacy registration flow). The client shows the link and sends the
+# acceptance. Change `terms_version` when the policy changes.
+# terms_url = "https://example.org/terms"
+# terms_version = "1"
+# terms_name = "Terms of Service"
 # Synapse-compatible `/_synapse/admin/v1/register`. Leave unset unless an
 # integration explicitly needs it: this secret can create administrator users.
 # shared_secret = "replace-with-a-long-random-secret"
