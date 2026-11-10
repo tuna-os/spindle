@@ -171,6 +171,9 @@ pub use partial::PartialState;
 pub struct Rooms {
     policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,
     store: Arc<FjallStore>,
+    /// Which destinations have PDUs queued, shared with the delivery loop
+    /// ([`Self::outbox`]).
+    outbox: Arc<crate::federation::outbox::OutboxIndex>,
     server_name: String,
     /// Where appends, lock acquisitions and sync waits are counted; the
     /// server's one registry, shared with everything else that records.
@@ -537,6 +540,12 @@ impl Drop for SideStreamWrite<'_> {
 }
 
 impl Rooms {
+    /// Which destinations have PDUs queued; the delivery loop plans from it.
+    #[must_use]
+    pub fn outbox(&self) -> Arc<crate::federation::outbox::OutboxIndex> {
+        Arc::clone(&self.outbox)
+    }
+
     /// A `Rooms` with a registry of its own, for tests and tools that do
     /// not scrape it; the server uses [`Rooms::with_metrics`].
     #[must_use]
@@ -589,6 +598,7 @@ impl Rooms {
         let checkpointed = read_stream_checkpoint(store_for_stream.as_ref())?;
         Ok(Self {
             policy_federation: Mutex::new(None),
+            outbox: Arc::new(crate::federation::outbox::OutboxIndex::load(&store)),
             store,
             server_name: server_name.into(),
             metrics,
@@ -2538,9 +2548,11 @@ impl Rooms {
             }
             let stream_write = self.reserve_stream_id();
             let seq = stream_write.id();
-            spindle_store::Store::put(
+            self.outbox.enqueue(
                 self.store.as_ref(),
-                &spindle_core::keys::federation_outbox(destination, seq),
+                &self.metrics,
+                destination,
+                seq,
                 pdu.to_string().as_bytes(),
             )?;
         }
@@ -6486,9 +6498,11 @@ impl Rooms {
         {
             let stream_write = self.reserve_stream_id();
             let seq = stream_write.id();
-            spindle_store::Store::put(
+            self.outbox.enqueue(
                 self.store.as_ref(),
-                &spindle_core::keys::federation_outbox(destination, seq),
+                &self.metrics,
+                destination,
+                seq,
                 json.to_string().as_bytes(),
             )?;
         }

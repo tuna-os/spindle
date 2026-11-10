@@ -24,6 +24,7 @@ use crate::signing::ServerKey;
 
 mod edu_outbox;
 mod keyring;
+pub mod outbox;
 mod retry;
 mod srv;
 pub use keyring::{PeerKeys, signing_key_ids};
@@ -3066,6 +3067,7 @@ struct Delivered {
 pub async fn drain_outbox(
     store: Weak<FjallStore>,
     federation: Weak<Federation>,
+    outbox: Arc<outbox::OutboxIndex>,
     retry_base: Duration,
 ) {
     // Where the last process left off with each failing destination.
@@ -3079,6 +3081,7 @@ pub async fn drain_outbox(
         }
         stored
     };
+    let mut rescanned = Instant::now();
     let mut in_flight: tokio::task::JoinSet<Delivered> = tokio::task::JoinSet::new();
     let mut busy: HashMap<tokio::task::Id, String> = HashMap::new();
     let poll = retry_base
@@ -3123,7 +3126,14 @@ pub async fn drain_outbox(
             collect(done, &mut busy);
         }
         for delivered in outcomes {
-            if !settle(&store, &federation, &mut backoff, retry_base, delivered) {
+            if !settle(
+                &store,
+                &federation,
+                &outbox,
+                &mut backoff,
+                retry_base,
+                delivered,
+            ) {
                 return;
             }
         }
@@ -3135,6 +3145,7 @@ pub async fn drain_outbox(
                 return;
             };
             take_resets(&store, &federation, &mut backoff, retry_base);
+            refresh_outbox_index(&store, &federation, &outbox, &backoff, &mut rescanned);
             let retrying_in_flight = busy
                 .values()
                 .filter(|destination| backoff.contains_key(*destination))
@@ -3147,7 +3158,7 @@ pub async fn drain_outbox(
             // The registry is not something the store's close waits on,
             // so holding it across a send is as harmless as the request.
             (
-                plan_transactions(&store, &federation, &backoff, &slots),
+                plan_transactions(&store, &federation, &outbox, &backoff, &slots),
                 Arc::clone(&federation.metrics),
             )
         };
@@ -3157,6 +3168,32 @@ pub async fn drain_outbox(
             busy.insert(handle.id(), name);
         }
     }
+}
+
+/// Keep the index true to the store and say which queues are bounded.
+///
+/// Rows the index was not told about (written outside the send path) are
+/// found when it has nothing to go on, and now and then. A destination
+/// down a long time, with no patience setting, has its queue bounded.
+fn refresh_outbox_index(
+    store: &FjallStore,
+    federation: &Federation,
+    outbox: &outbox::OutboxIndex,
+    backoff: &HashMap<String, retry::Backoff>,
+    rescanned: &mut Instant,
+) {
+    if outbox.is_empty() || rescanned.elapsed() >= outbox::RESCAN_EVERY {
+        outbox.rescan(store);
+        *rescanned = Instant::now();
+    }
+    outbox.set_shedding(
+        backoff
+            .iter()
+            .filter(|(destination, entry)| {
+                entry.long && federation.peer_max_backoff(destination).is_none()
+            })
+            .map(|(destination, _)| destination.clone()),
+    );
 }
 
 /// End the wait of every destination reset since the last pass -- by an
@@ -3233,6 +3270,7 @@ async fn send_transaction(
 fn settle(
     store: &Weak<FjallStore>,
     federation: &Weak<Federation>,
+    outbox: &outbox::OutboxIndex,
     backoff: &mut HashMap<String, retry::Backoff>,
     retry_base: Duration,
     delivered: Delivered,
@@ -3252,6 +3290,7 @@ fn settle(
             for key in &keys {
                 let _ = Store::delete(store.as_ref(), key);
             }
+            outbox.release(&destination, keys.len() as u64);
             if backoff.remove(&destination).is_some() {
                 retry::forget(&store, &destination);
             }
@@ -3293,6 +3332,7 @@ fn settle(
                 retry::cut(
                     &store,
                     federation.metrics(),
+                    outbox,
                     &destination,
                     retry::queued(&store, &destination),
                 );
@@ -3323,74 +3363,40 @@ struct Slots {
 fn plan_transactions(
     store: &FjallStore,
     federation: &Federation,
+    outbox: &outbox::OutboxIndex,
     backoff: &HashMap<String, retry::Backoff>,
     slots: &Slots,
 ) -> Vec<OutboundTransaction> {
-    let Ok(rows) = ReadView::scan_prefix(store, &keys::federation_outbox_all()) else {
-        return Vec::new();
-    };
-    let mut by_destination: BTreeMap<String, Vec<OutboxRow>> = BTreeMap::new();
-    for (key, value) in rows {
-        if let Some(destination) = keys::federation_outbox_destination(&key) {
-            by_destination
-                .entry(destination)
-                .or_default()
-                .push((key, value));
-        }
-    }
+    // The destinations with PDUs come from the index, not from a read of
+    // the outbox: a destination backing off costs nothing here however
+    // long its queue is (#821).
+    let queues = outbox.snapshot();
     let mut durable = edu_outbox::EduOutbox::waiting(store);
+    let mut owed: std::collections::BTreeSet<String> = queues.keys().cloned().collect();
     // A destination with only EDUs waiting still gets a transaction:
     // typing must not wait for the next event, nor a to-device message.
-    for destination in federation
-        .edu_destinations()
-        .into_iter()
-        .chain(durable.keys().cloned())
-    {
-        by_destination.entry(destination).or_default();
-    }
+    owed.extend(
+        federation
+            .edu_destinations()
+            .into_iter()
+            .chain(durable.keys().cloned()),
+    );
     // A destination `[federation] allow`/`deny` refuses is not planned at
     // all: its rows wait, unsent and without backoff, so removing it from
     // the deny list delivers them. Planning it would only fail in `address`.
-    by_destination.retain(|destination, _| federation.server_permitted(destination));
+    owed.retain(|destination| federation.server_permitted(destination));
+    set_queue_gauge(federation, &owed, &queues);
     let now = now_millis();
-    let (healthy, due): (Vec<&String>, Vec<&String>) = by_destination
-        .keys()
-        .filter(|destination| !slots.busy.contains(*destination))
-        .filter(|destination| backoff.get(*destination).is_none_or(|entry| entry.due(now)))
-        .partition(|destination| !backoff.contains_key(*destination));
-    let healthy_taken = healthy.len().min(slots.free);
-    let retry_taken = due
-        .len()
-        .min(slots.retry_free)
-        .min(slots.free - healthy_taken);
-    let chosen: std::collections::HashSet<String> = healthy
-        .into_iter()
-        .take(healthy_taken)
-        .chain(due.into_iter().take(retry_taken))
-        .cloned()
-        .collect();
-    for destination in &chosen {
-        if backoff.get(destination).is_some_and(|entry| entry.long)
-            && federation.peer_max_backoff(destination).is_none()
-            && let Some(rows) = by_destination.get_mut(destination)
-        {
-            *rows = retry::cut(
-                store,
-                federation.metrics(),
-                destination,
-                std::mem::take(rows),
-            );
-        }
-    }
-    set_queue_gauge(federation, &by_destination);
     let mut transactions = Vec::new();
-    for (destination, rows) in by_destination {
-        if !chosen.contains(&destination) {
-            continue;
-        }
-        // At most fifty PDUs per transaction, by spec; the rest wait
-        // for the next pass.
-        let batch: Vec<_> = rows.into_iter().take(50).collect();
+    for destination in choose_destinations(outbox, backoff, slots, &owed, now) {
+        let batch = load_batch(
+            store,
+            federation,
+            outbox,
+            backoff,
+            &destination,
+            queues.get(&destination).copied(),
+        );
         let pdus: Vec<Value> = batch
             .iter()
             .filter_map(|(_, value)| serde_json::from_slice(value).ok())
@@ -3436,15 +3442,99 @@ fn plan_transactions(
     transactions
 }
 
-/// Set the queue depth gauge from a pass's rows. The pass already holds
-/// the whole picture, so the gauge is set from it rather than counted
-/// separately — a second traversal could disagree with the one that
-/// actually delivers.
-fn set_queue_gauge(federation: &Federation, by_destination: &BTreeMap<String, Vec<OutboxRow>>) {
+/// The destinations among `owed` this pass starts a transaction for:
+/// those not in flight and not backing off -- the ones that answered last
+/// time first, then those due a retry -- within `slots`.
+///
+/// Each list starts after where the last pass stopped, so that under a
+/// backlog every destination gets its turn and the names that sort first
+/// do not keep the slots.
+fn choose_destinations(
+    outbox: &outbox::OutboxIndex,
+    backoff: &HashMap<String, retry::Backoff>,
+    slots: &Slots,
+    owed: &std::collections::BTreeSet<String>,
+    now: u64,
+) -> Vec<String> {
+    let (healthy, due): (Vec<String>, Vec<String>) = owed
+        .iter()
+        .filter(|destination| !slots.busy.contains(*destination))
+        .filter(|destination| backoff.get(*destination).is_none_or(|entry| entry.due(now)))
+        .cloned()
+        .partition(|destination| !backoff.contains_key(destination));
+    let healthy_taken = healthy.len().min(slots.free);
+    let retry_taken = due
+        .len()
+        .min(slots.retry_free)
+        .min(slots.free - healthy_taken);
+    let mut chosen = Vec::with_capacity(healthy_taken + retry_taken);
+    for (turn, list, taken) in [
+        (outbox::Turn::Healthy, healthy, healthy_taken),
+        (outbox::Turn::Retry, due, retry_taken),
+    ] {
+        let taken: Vec<String> = outbox.rotate(turn, list).into_iter().take(taken).collect();
+        if let Some(last) = taken.last() {
+            outbox.stopped_at(turn, last);
+        }
+        chosen.extend(taken);
+    }
+    chosen
+}
+
+/// At most fifty PDUs per transaction, by spec; the rest wait for the next
+/// pass.
+const PDUS_PER_TRANSACTION: usize = 50;
+
+/// The rows `destination`'s next transaction carries, oldest first. Reads
+/// only the first page of its queue -- except for a destination back from a
+/// long outage, whose whole queue is cut to a catch-up first
+/// ([`retry::cut`]).
+fn load_batch(
+    store: &FjallStore,
+    federation: &Federation,
+    outbox: &outbox::OutboxIndex,
+    backoff: &HashMap<String, retry::Backoff>,
+    destination: &str,
+    queue: Option<outbox::Queue>,
+) -> Vec<OutboxRow> {
+    let Some(queue) = queue else {
+        return Vec::new();
+    };
+    let catching_up = backoff.get(destination).is_some_and(|entry| entry.long)
+        && federation.peer_max_backoff(destination).is_none();
+    let rows = if catching_up {
+        retry::cut(
+            store,
+            federation.metrics(),
+            outbox,
+            destination,
+            retry::queued(store, destination),
+        )
+    } else {
+        outbox::head(store, destination, PDUS_PER_TRANSACTION)
+    };
+    if rows.is_empty() {
+        outbox.found_empty(destination, queue);
+    }
+    rows.into_iter().take(PDUS_PER_TRANSACTION).collect()
+}
+
+/// Set the queue depth gauge from the index. A destination that only has
+/// EDUs waiting is shown with an empty queue.
+fn set_queue_gauge(
+    federation: &Federation,
+    owed: &std::collections::BTreeSet<String>,
+    queues: &BTreeMap<String, outbox::Queue>,
+) {
     federation.metrics().set_federation_queue(
-        &by_destination
+        &owed
             .iter()
-            .map(|(destination, rows)| (destination.clone(), rows.len() as u64))
+            .map(|destination| {
+                (
+                    destination.clone(),
+                    queues.get(destination).map_or(0, |queue| queue.rows),
+                )
+            })
             .collect::<Vec<_>>(),
     );
 }
@@ -4088,5 +4178,157 @@ mod key_fetch_capacity_tests {
             federation.key_fetch_slots.available_permits(),
             MAX_CONCURRENT_KEY_FETCHES
         );
+    }
+}
+
+#[cfg(test)]
+mod outbox_planning_tests {
+    use super::*;
+
+    struct Rig {
+        _directory: tempfile::TempDir,
+        store: Arc<FjallStore>,
+        federation: Federation,
+        next_seq: u64,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let directory = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+            let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+            let federation =
+                Federation::new(Arc::clone(&store), "example.org", key, false, &[]).unwrap();
+            Self {
+                _directory: directory,
+                store,
+                federation,
+                next_seq: 1,
+            }
+        }
+
+        fn queue(&mut self, destination: &str, rows: usize) {
+            for _ in 0..rows {
+                let body =
+                    json!({ "type": "m.room.message", "room_id": "!r:x", "n": self.next_seq });
+                Store::put(
+                    self.store.as_ref(),
+                    &keys::federation_outbox(destination, self.next_seq),
+                    body.to_string().as_bytes(),
+                )
+                .unwrap();
+                self.next_seq += 1;
+            }
+        }
+
+        fn plan(
+            &self,
+            outbox: &outbox::OutboxIndex,
+            backoff: &HashMap<String, retry::Backoff>,
+            free: usize,
+        ) -> Vec<OutboundTransaction> {
+            let slots = Slots {
+                busy: std::collections::HashSet::new(),
+                free,
+                retry_free: free,
+            };
+            plan_transactions(&self.store, &self.federation, outbox, backoff, &slots)
+        }
+    }
+
+    /// Waiting out a long outage: the next attempt is a day away.
+    fn backing_off() -> retry::Backoff {
+        retry::Backoff {
+            failures: 20,
+            since: Some(0),
+            last: now_millis(),
+            interval: 86_400_000,
+            unreachable: true,
+            long: false,
+        }
+    }
+
+    #[test]
+    fn a_pass_reads_rows_only_for_destinations_it_can_send_to() {
+        let mut rig = Rig::new();
+        let mut backoff = HashMap::new();
+        for number in 0..20 {
+            let name = format!("dead{number}.example");
+            rig.queue(&name, 200);
+            backoff.insert(name, backing_off());
+        }
+        rig.queue("live.example", 5);
+        let outbox = outbox::OutboxIndex::load(&rig.store);
+
+        let before = rig.store.scanned();
+        let planned = rig.plan(&outbox, &backoff, 8);
+        let scanned = rig.store.scanned() - before;
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].destination, "live.example");
+        assert_eq!(planned[0].keys.len(), 5);
+        assert_eq!(
+            scanned, 5,
+            "rows read for 4,000 queued for backed-off destinations"
+        );
+    }
+
+    #[test]
+    fn a_pass_reads_one_page_of_a_long_queue() {
+        let mut rig = Rig::new();
+        rig.queue("slow.example", 500);
+        let outbox = outbox::OutboxIndex::load(&rig.store);
+        let before = rig.store.scanned();
+        let planned = rig.plan(&outbox, &HashMap::new(), 8);
+        assert_eq!(planned[0].keys.len(), PDUS_PER_TRANSACTION);
+        assert_eq!(
+            rig.store.scanned() - before,
+            u64::try_from(PDUS_PER_TRANSACTION).unwrap()
+        );
+    }
+
+    #[test]
+    fn under_a_backlog_successive_passes_reach_every_destination() {
+        let mut rig = Rig::new();
+        let names: Vec<String> = (0..10)
+            .map(|number| format!("peer{number}.example"))
+            .collect();
+        for name in &names {
+            rig.queue(name, 1);
+        }
+        let outbox = outbox::OutboxIndex::load(&rig.store);
+        let mut reached = std::collections::BTreeSet::new();
+        // Nothing is delivered, so every row stays and every destination
+        // stays owed; two slots a pass.
+        for _ in 0..5 {
+            let planned = rig.plan(&outbox, &HashMap::new(), 2);
+            assert_eq!(planned.len(), 2);
+            reached.extend(planned.into_iter().map(|plan| plan.destination));
+        }
+        assert_eq!(reached.len(), names.len(), "reached only {reached:?}");
+    }
+
+    #[test]
+    fn delivered_rows_leave_the_index_and_the_rest_keep_their_order() {
+        let mut rig = Rig::new();
+        rig.queue("peer.example", 120);
+        let outbox = outbox::OutboxIndex::load(&rig.store);
+        let mut delivered = Vec::new();
+        loop {
+            let planned = rig.plan(&outbox, &HashMap::new(), 8);
+            let Some(transaction) = planned.into_iter().next() else {
+                break;
+            };
+            for key in &transaction.keys {
+                Store::delete(rig.store.as_ref(), key).unwrap();
+            }
+            outbox.release("peer.example", transaction.keys.len() as u64);
+            delivered.extend(transaction.keys);
+        }
+        let expected: Vec<Vec<u8>> = (1..=120)
+            .map(|seq| keys::federation_outbox("peer.example", seq))
+            .collect();
+        assert_eq!(delivered, expected);
+        assert_eq!(outbox.queued("peer.example"), 0);
     }
 }

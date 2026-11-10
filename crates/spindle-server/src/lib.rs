@@ -662,6 +662,7 @@ fn spawn_delivery_loops(state: &AppState) {
         tokio::spawn(federation::drain_outbox(
             Arc::downgrade(&state.store),
             Arc::downgrade(&state.federation),
+            state.rooms.outbox(),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
         ));
     }

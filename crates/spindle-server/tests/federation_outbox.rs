@@ -713,6 +713,56 @@ async fn pending_rows_survive_a_rebuild_and_deliver_after() {
     );
 }
 
+/// Rows queued while a peer is down are all delivered, in the order they
+/// were queued, by a server rebuilt over the same store: the index the
+/// planner works from is rebuilt from the rows, not from memory (#821).
+#[tokio::test]
+async fn a_backlog_is_delivered_in_order_and_whole_after_a_restart() {
+    let stub = Stub::start().await;
+    stub.refuse.store(usize::MAX / 2, Ordering::SeqCst);
+    let mut harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.room_with_remote_invite(&alice, &stub.user()).await;
+    for number in 0..8 {
+        harness
+            .say(
+                &room,
+                &alice,
+                &format!("backlog {number}"),
+                &format!("b{number}"),
+            )
+            .await;
+    }
+    harness.restart();
+    stub.refuse.store(0, Ordering::SeqCst);
+    assert!(
+        stub.wait_for(|stub| {
+            (0..8).all(|number| {
+                stub.pdus()
+                    .iter()
+                    .any(|pdu| pdu["content"]["body"] == json!(format!("backlog {number}")))
+            })
+        })
+        .await,
+        "the whole backlog arrived: {:?}",
+        stub.pdus()
+    );
+    let order: Vec<String> = stub
+        .pdus()
+        .iter()
+        .filter_map(|pdu| pdu["content"]["body"].as_str().map(str::to_owned))
+        .filter(|body| body.starts_with("backlog "))
+        .collect();
+    let mut first_seen: Vec<String> = Vec::new();
+    for body in order {
+        if !first_seen.contains(&body) {
+            first_seen.push(body);
+        }
+    }
+    let expected: Vec<String> = (0..8).map(|number| format!("backlog {number}")).collect();
+    assert_eq!(first_seen, expected);
+}
+
 fn flat_edus<'a>(bodies: impl Iterator<Item = &'a Value>) -> Vec<Value> {
     bodies
         .flat_map(|body| body["edus"].as_array().cloned().unwrap_or_default())
