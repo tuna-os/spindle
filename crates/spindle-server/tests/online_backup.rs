@@ -421,6 +421,43 @@ async fn the_stream_buffers_no_more_than_its_bound() {
     spindle_store::backup::verify_backup(&mut &received[..]).unwrap();
 }
 
+/// The slot is free by the time the `done` callback runs. The callback used to
+/// run first and the slot was dropped when the task ended, so anything that
+/// acted on "done" (a test, an audit hook, the next request) could still find
+/// the slot taken. Checked from inside the callback, so there is no race to
+/// win: on the old code this is false every time.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slot_is_free_when_the_done_callback_runs() {
+    use spindle_server::backup_stream::{BackupStream, Limits};
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    store
+        .commit(&[(pair("a", 1), vec![1; 64])], Durability::Relaxed)
+        .unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let slot = metrics.begin_backup_owned().unwrap();
+    let (free_tx, free_rx) = tokio::sync::oneshot::channel();
+    let in_callback = Arc::clone(&metrics);
+    let mut stream = BackupStream::start(
+        Arc::clone(&store),
+        slot,
+        Limits {
+            chunk_bytes: 4096,
+            queued_chunks: 2,
+        },
+        move |_, _| {
+            let _ = free_tx.send(in_callback.begin_backup().is_some());
+        },
+    );
+    while stream.next_chunk().await.is_some() {}
+    let free = tokio::time::timeout(std::time::Duration::from_secs(10), free_rx)
+        .await
+        .expect("the writer finished")
+        .unwrap();
+    assert!(free, "the slot was still taken when `done` ran");
+}
+
 /// Dropping the reader stops the writer within a few chunks: it does not scan
 /// on to the end of the store.
 #[tokio::test(flavor = "multi_thread")]
