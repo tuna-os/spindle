@@ -355,6 +355,9 @@ pub struct Metrics {
     destinations_backing_off: [AtomicU64; 2],
     /// Queued PDUs dropped for destinations catching up (#801).
     catch_up_dropped: AtomicU64,
+    /// Queued PDUs dropped because a long-unreachable destination's queue
+    /// was full (#821).
+    outbox_capped: AtomicU64,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
     /// Inbound PDUs by what became of them ([`PduOutcome`]): the
@@ -464,6 +467,7 @@ impl Default for Metrics {
             federation_queue: RwLock::default(),
             destinations_backing_off: Default::default(),
             catch_up_dropped: AtomicU64::new(0),
+            outbox_capped: AtomicU64::new(0),
             sync_subscribers: AtomicU64::new(0),
             sync_lag: Family::default(),
             pdu_outcomes: Default::default(),
@@ -844,6 +848,18 @@ impl Metrics {
     #[must_use]
     pub fn catch_up_dropped(&self) -> u64 {
         self.catch_up_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Count `dropped` queued PDUs shed from a full queue for a
+    /// long-unreachable destination.
+    pub fn record_outbox_capped(&self, dropped: u64) {
+        self.outbox_capped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Queued PDUs shed from full queues, for tests.
+    #[must_use]
+    pub fn outbox_capped(&self) -> u64 {
+        self.outbox_capped.load(Ordering::Relaxed)
     }
 
     /// The warm-up has `pending` rooms left to load.
@@ -1303,6 +1319,14 @@ impl Metrics {
              # TYPE spindle_federation_catch_up_dropped_total counter\n\
              spindle_federation_catch_up_dropped_total {}",
             self.catch_up_dropped.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_outbox_capped_total Queued events dropped because the \
+             queue of a destination that has been down a long time was full.\n\
+             # TYPE spindle_federation_outbox_capped_total counter\n\
+             spindle_federation_outbox_capped_total {}",
+            self.outbox_capped.load(Ordering::Relaxed)
         );
     }
 

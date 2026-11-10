@@ -252,6 +252,7 @@ pub(super) fn queued(store: &FjallStore, destination: &str) -> Vec<OutboxRow> {
 pub(super) fn cut(
     store: &FjallStore,
     metrics: &crate::metrics::Metrics,
+    outbox: &super::outbox::OutboxIndex,
     destination: &str,
     rows: Vec<OutboxRow>,
 ) -> Vec<OutboxRow> {
@@ -265,6 +266,7 @@ pub(super) fn cut(
         for key in &dropped {
             let _ = Store::delete(store, key);
         }
+        outbox.release(destination, dropped.len() as u64);
         metrics.record_catch_up_dropped(dropped.len() as u64);
     }
     kept
