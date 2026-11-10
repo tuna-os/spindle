@@ -6,7 +6,7 @@ clients and suites that test it. It also says what a maintainer does when one
 of them moves.
 
 The principle throughout: **a gate holds every claim to the code, and a job
-watches every upstream.** Nothing here is a checklist that a person must
+watches every upstream**. Nothing here is a checklist that a person must
 remember. Each item is a script. It runs in CI or on a schedule, prints what it found,
 and fails or files an issue. A person still makes the judgement calls. These are whether to bump a pin,
 whether a new endpoint is in scope, and what to do when a proposal dies.
