@@ -410,6 +410,11 @@ impl Rooms {
         if !known {
             return Err(RoomError::MissingBody(target.to_owned()));
         }
+        // Refuse before anything is appended, so a refused request stores no
+        // redaction event.
+        self.with_room_read(room_id, |rooms, log| {
+            rooms.check_may_redact(log, room_id, sender, target)
+        })?;
         let mut content = serde_json::json!({"redacts": target});
         if let Some(reason) = reason {
             content["reason"] = Value::String(reason.to_owned());

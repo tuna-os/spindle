@@ -527,6 +527,9 @@ impl Rooms {
                 }));
             }
             let redaction_target = rooms.redaction_target(log, room_id, json)?;
+            let redaction_power = redaction_target.is_some().then(|| {
+                rooms.redact_power_in(room_id, &state, json["sender"].as_str().unwrap_or_default())
+            });
 
             let event_type = json["type"].as_str().unwrap_or_default().to_owned();
             let state_key = json["state_key"].as_str().map(str::to_owned);
@@ -572,7 +575,13 @@ impl Rooms {
                 if log.get(&EventId::new(target.as_str())).is_some()
                     || rooms.gap_position(room_id, &target)?.is_some()
                 {
-                    rooms.apply_redaction(room_id, &target, event_id)?;
+                    rooms.apply_received_redaction(
+                        room_id,
+                        &target,
+                        event_id,
+                        &sender,
+                        redaction_power.unwrap_or(false),
+                    )?;
                 } else {
                     rooms.note_unheld_redaction(log, room_id, &target, event_id, json)?;
                 }
