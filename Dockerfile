@@ -15,7 +15,7 @@
 # ship a compiler or runtime nobody reviewed, with no diff here to show
 # it. The tag stays for the reader and for Dependabot, which rewrites the
 # tag and the digest together. complement/Dockerfile pins the same two.
-FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
+FROM rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 # Extra cargo features. The default is the release image's set, so that a
 # local `docker build .` makes the image release.yml publishes (its
 # FEATURES env passes the same value): `mas-import` and `synapse-import`,
