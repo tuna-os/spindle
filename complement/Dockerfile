@@ -11,7 +11,7 @@
 # Pinned by digest, and to the same two bases as the release Dockerfile
 # (#652, #687), so conformance runs test the compiler and runtime a
 # release ships rather than whatever the tags point at that day.
-FROM rust:1.99-bookworm@sha256:7085845219c18e7c5b1f34ed9ce89b84f822f2e3d54a02774cedc996ac0f304f AS build
+FROM rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 WORKDIR /src
 
 # Cargo features to build with, e.g. `hub-mode` for the hub-mode interop job
