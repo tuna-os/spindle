@@ -8,16 +8,25 @@ A tag is a pointer somebody else can move. `actions/checkout@v5` means
 branch -- this repository ran `dtolnay/rust-toolchain@master` for its whole
 history -- means "whatever was pushed there most recently". Either one is a
 third party with write access to a step that runs before our code does, in a
-job holding a token. Pinning to a commit SHA is the only form of the
-reference that names a specific tree.
+job holding a token. A reference has to name a specific tree.
 
-The pin is only half of it, and the cheaper half. A SHA with nothing
-maintaining it is *worse* than a tag: it freezes the action at whatever it
-was the day somebody pinned it, security fixes included. `.github/
-dependabot.yml` is what keeps them moving, which is why it landed first
-(#182) and this check second.
+`.github/workflows/actions.lock` is how it does that now. `gh actions-lock`
+records the commit each `uses: owner/repo@tag` resolves to, and the
+actions transitive ones resolve to, and the `actions-security` workflow
+fails when a pin no longer verifies upstream. So an action named by tag
+passes here only if the lockfile lists that exact reference for that
+workflow. A cross-repository reusable workflow
+(`owner/repo/.github/workflows/x.yml@ref`) is outside what the lockfile
+covers, so it is still pinned to a commit SHA.
 
-The trailing `# v5` comment is not decoration. Dependabot reads it to know
+The pin is only half of it, and the cheaper half. A pin with nothing
+maintaining it is *worse* than a moving tag: it freezes the action at
+whatever it was the day somebody pinned it, security fixes included.
+`.github/dependabot.yml` is what keeps them moving, which is why it landed
+first (#182) and this check second. Dependabot updates the tag and the
+lockfile together.
+
+A SHA pin keeps its trailing `# v5` comment. Dependabot reads it to know
 which version a SHA stands for, and rewrites both together; without it the
 pin is opaque to the thing meant to maintain it, and to the next person
 reading the file.
@@ -57,6 +66,95 @@ USES = re.compile(
     r"(?:\s+#\s*(?P<comment>.*?))?\s*$"
 )
 SHA = re.compile(r"^[0-9a-f]{40}$")
+# One workflow and one of its pinned references in actions.lock, which
+# `gh actions-lock` writes in a fixed shape:
+#     '.github/workflows/ci.yml':
+#         - 'actions/checkout@v7.0.1'
+LOCK_WORKFLOW = re.compile(r"^ {4}'(?P<path>[^']+)':")
+LOCK_ENTRY = re.compile(r"^ {8}- '(?P<ref>[^']+)'$")
+
+
+def locked_refs(text: str) -> dict[str, set[str]]:
+    """The references actions.lock pins, by workflow path.
+
+    Only the `workflows:` section: it maps each workflow to the exact
+    `owner/repo@ref` strings it uses, which is what a `uses:` line has to
+    match. GitHub matches owner and repository without case, so the lock
+    writes them in lower case and the lookup lowers them too.
+    """
+    locked: dict[str, set[str]] = {}
+    current: set[str] | None = None
+    in_workflows = False
+    for raw in text.splitlines():
+        if not raw.startswith(" "):
+            in_workflows = raw.startswith("workflows:")
+            current = None
+            continue
+        if not in_workflows:
+            continue
+        workflow = LOCK_WORKFLOW.match(raw)
+        if workflow:
+            current = locked.setdefault(workflow["path"], set())
+            continue
+        entry = LOCK_ENTRY.match(raw)
+        if entry and current is not None:
+            current.add(entry["ref"].lower())
+    return locked
+
+
+def unpinned_uses(
+    where_file: str, text: str, locked: set[str]
+) -> tuple[int, list[tuple[int, str]]]:
+    """How many `uses:` references are pinned, and every one that is not.
+
+    `locked` is what actions.lock lists for this workflow. An action named
+    by tag passes when its `owner/repo@ref` is in it; a subdirectory action
+    (`actions/cache/restore@v6`) is locked under its repository. A
+    cross-repository reusable workflow is pinned by SHA, because the lock
+    does not cover it.
+    """
+    pinned = 0
+    problems: list[tuple[int, str]] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        match = USES.match(line)
+        if not match:
+            continue
+        action, ref = match["action"], match["ref"]
+        repository = "/".join(action.split("/")[:2])
+        if SHA.match(ref):
+            if not match["comment"]:
+                # Not cosmetic: this is the only record of which version the
+                # SHA is, and what Dependabot rewrites alongside it.
+                problems.append(
+                    (
+                        number,
+                        f"{action} is pinned but unlabelled; add the version "
+                        "it stands for as a trailing `# vN` comment",
+                    )
+                )
+                continue
+        elif "/.github/workflows/" in action:
+            problems.append(
+                (
+                    number,
+                    f"{action}@{ref} is a mutable ref to a reusable workflow, "
+                    "which actions.lock does not cover; pin the commit SHA it "
+                    f"points at today and label it `# {ref}`",
+                )
+            )
+            continue
+        elif f"{repository}@{ref}".lower() not in locked:
+            problems.append(
+                (
+                    number,
+                    f"{action}@{ref} is a mutable ref that "
+                    f".github/workflows/actions.lock does not pin for "
+                    f"{where_file}; run `gh actions-lock`",
+                )
+            )
+            continue
+        pinned += 1
+    return pinned, problems
 
 
 KEY = re.compile(r"^(?P<indent>\s*)(?P<dash>-\s+)?(?P<key>[A-Za-z0-9_.-]+):(?:\s|$)")
@@ -235,6 +333,8 @@ def main() -> int:
         print("actions-pinned: no workflows found", file=sys.stderr)
         return 1
 
+    lockfile = root / ".github" / "workflows" / "actions.lock"
+    locked = locked_refs(lockfile.read_text()) if lockfile.exists() else {}
     problems: list[str] = []
     pinned = 0
     for path in workflows:
@@ -263,26 +363,12 @@ def main() -> int:
                 f"{where_file}:{number}: top-level `{grant}` reaches every job; "
                 "move it to the jobs that use it"
             )
-        for number, line in enumerate(text.splitlines(), 1):
-            match = USES.match(line)
-            if not match:
-                continue
-            where = f"{where_file}:{number}"
-            action, ref = match["action"], match["ref"]
-            if not SHA.match(ref):
-                problems.append(
-                    f"{where}: {action}@{ref} is a mutable ref; pin the commit "
-                    f"SHA it points at today and label it `# {ref}`"
-                )
-            elif not match["comment"]:
-                # Not cosmetic: this is the only record of which version the
-                # SHA is, and what Dependabot rewrites alongside it.
-                problems.append(
-                    f"{where}: {action} is pinned but unlabelled; add the "
-                    f"version it stands for as a trailing `# vN` comment"
-                )
-            else:
-                pinned += 1
+        count, unpinned = unpinned_uses(
+            str(where_file), text, locked.get(str(where_file), set())
+        )
+        pinned += count
+        for number, problem in unpinned:
+            problems.append(f"{where_file}:{number}: {problem}")
 
     files = image_files(root)
     for name in files:
@@ -297,8 +383,8 @@ def main() -> int:
     if problems:
         return 1
     print(
-        f"actions-pinned: all {pinned} action references are SHA-pinned "
-        f"and labelled across {len(workflows)} workflows, no `run:` script "
+        f"actions-pinned: all {pinned} action references are locked or "
+        f"SHA-pinned across {len(workflows)} workflows, no `run:` script "
         f"pastes an expression, no workflow grants a write to every job, and "
         f"every image named in {len(files)} tracked Dockerfiles and YAML files is digest-pinned"
     )

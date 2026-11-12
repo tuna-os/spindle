@@ -52,6 +52,8 @@ updates:
       rust-dependencies:
         patterns: ["*"]
         update-types: [minor, patch]
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: /
@@ -61,6 +63,8 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    cooldown:
+      default-days: 7
 
   # The two Dockerfiles: the runtime image at the root, which release.yml
   # publishes, and the Complement image the conformance suite runs. Both
@@ -78,6 +82,8 @@ updates:
       base-images:
         patterns: ["*"]
         group-by: dependency-name
+    cooldown:
+      default-days: 7
 
   # The Kubernetes rigs under scripts/. Their versions are chosen, not
   # current: Synapse and MAS match the deployment a rehearsal copies, so a
@@ -96,6 +102,8 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+    cooldown:
+      default-days: 7
 
   # The mautrix bridge harness under evidence/. Small, but it is a Go module
   # with its own lockfile, and "nothing updates it" was the finding that
@@ -105,3 +113,5 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
