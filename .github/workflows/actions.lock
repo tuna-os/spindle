@@ -21,7 +21,7 @@ workflows:
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
-        - 'crate-ci/typos@v1.52.0'
+        - 'crate-ci/typos@v1.52.1'
         - 'dtolnay/rust-toolchain@v1'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/compliance.yml':
@@ -151,9 +151,9 @@ dependencies:
         commit: 'sha1-66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c'
         owner_id: 16208487
         repo_id: 399925381
-    'crate-ci/typos@v1.52.0':
-        ref: 'v1.52.0'
-        commit: 'sha1-4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85'
+    'crate-ci/typos@v1.52.1':
+        ref: 'v1.52.1'
+        commit: 'sha1-2611abd15acb0c2e317fb9e45855aabb8b35a414'
         owner_id: 36412122
         repo_id: 181782286
     'docker/build-push-action@v7.4.0':
