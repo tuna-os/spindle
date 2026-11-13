@@ -15,5 +15,6 @@ require_token = true
 # What clients get. Caddy serves this host (livekit.caddy).
 url = "wss://lk.matrix.example.org"
 key = "APIspindle"
-# The same value as keys in livekit.yaml.
+# The same value as keys in livekit.yaml. Spindle does not start until
+# you replace it.
 secret = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
