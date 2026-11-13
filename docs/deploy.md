@@ -54,6 +54,35 @@ The unit uses `DynamicUser`, so the package creates no account. The package does
 
 The release job builds the packages apart from the tarballs and the image. If that job fails, the release ships without them. Verify a package with `gh attestation verify` like a tarball.
 
+A pull request that changes the package files builds both packages too. That job unpacks the `.deb` into a scratch directory and runs the binary from there.
+
+## Nix
+
+The repository has a flake. It builds Spindle with the release image's features, `mas-import` and `synapse-import`.
+
+```sh
+nix build github:tuna-os/spindle
+nix develop github:tuna-os/spindle
+```
+
+The `flake.lock` file pins nixpkgs. To move to a newer nixpkgs, run `nix flake update` and commit the result. CI builds the flake when the flake, the Cargo files or the systemd unit change.
+
+The flake also has a NixOS module. It runs the same sandboxed unit as `deploy/systemd`.
+
+```nix
+{
+  inputs.spindle.url = "github:tuna-os/spindle";
+  # in your NixOS configuration:
+  imports = [ spindle.nixosModules.default ];
+  services.spindle = {
+    enable = true;
+    settings.server.name = "example.org";
+  };
+}
+```
+
+The module writes `settings` as TOML and sets `[storage] path` to `/var/lib/spindle`. Your settings override that. The Nix store is readable by every local user, so keep secrets out of `settings`. Point `services.spindle.configFile` at a file outside the store instead. Use `services.spindle.package` to run another build.
+
 ## Kubernetes with Helm
 
 Use `deploy/helm/spindle`. It makes one StatefulSet replica, a volume claim, a Service and optional Ingress and ServiceMonitor objects.

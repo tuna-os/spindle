@@ -1,4 +1,5 @@
 /target/
+/crates/spindle-server/package-staging/
 *.profraw
 
 # Benchmark and interop scratch: databases, signing keys, logs and result

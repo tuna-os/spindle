@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -251,3 +252,98 @@ jobs:
           persist-credentials: false
       - name: Start the Compose service and register a user
         run: scripts/deploy-smoke.sh
+
+  # Builds the .deb and .rpm on pull requests, not only at release, so a
+  # broken asset path or tool flag shows up before a tag (#825). It runs the
+  # same scripts as the release `packages` job, so the pinned tool versions
+  # live in one place. The workflow has no `paths:` filter (the other jobs
+  # must always run), so the first step decides whether this job has work.
+  packages:
+    name: Packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether packaging changed
+        id: changed
+        run: |
+          run=false
+          if [ "$EVENT" = workflow_dispatch ]; then
+            run=true
+          elif git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            if git diff --name-only "$BASE" HEAD | grep -Eq '^(crates/spindle-server/Cargo\.toml|deploy/|Dockerfile|scripts/(build|check)-packages\.sh|\.github/workflows/(ci|release)\.yml|spindle\.example\.toml|LICENSE-)'; then
+              run=true
+            fi
+          else
+            # No usable base (a new branch): build rather than skip.
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@v1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2.9.3
+        if: steps.changed.outputs.run == 'true'
+      - name: Install the tools the check needs
+        if: steps.changed.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+      # A debug build: the packages only need a binary that starts, and the
+      # release profile would add minutes. Same features as the release.
+      - name: Build the binary
+        if: steps.changed.outputs.run == 'true'
+        run: cargo build -p spindle-server --bin spindle --locked --features mas-import,synapse-import
+      - name: Build the packages
+        if: steps.changed.outputs.run == 'true'
+        run: scripts/build-packages.sh 0.0.0 amd64 x86_64 dist target/debug/spindle
+      - name: Check the packages and start the binary from the .deb
+        if: steps.changed.outputs.run == 'true'
+        run: scripts/check-packages.sh 0.0.0 dist/spindle-v0.0.0-amd64.deb dist/spindle-v0.0.0-x86_64.rpm amd64 x86_64
+
+  # Builds the Nix flake (#825).
+  nix-build:
+    name: Nix flake
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether the flake changed
+        id: changed
+        run: |
+          run=false
+          if [ "$EVENT" = workflow_dispatch ]; then
+            run=true
+          elif git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            if git diff --name-only "$BASE" HEAD | grep -Eq '^(flake\.(nix|lock)|Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|vendor/|deploy/systemd/)'; then
+              run=true
+            fi
+          else
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - uses: DeterminateSystems/nix-installer-action@v23
+        if: steps.changed.outputs.run == 'true'
+      - name: Check the flake
+        if: steps.changed.outputs.run == 'true'
+        run: nix flake check --print-build-logs
+      - name: Build the package and run it
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          nix build --print-build-logs
+          result/bin/spindle gc --help
