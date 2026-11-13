@@ -1,8 +1,7 @@
 {
   description = "Spindle, a Matrix homeserver in one binary over an embedded store";
 
-  # No flake.lock is committed yet: it could not be generated offline. The
-  # first `nix flake lock` pins nixpkgs; commit the result.
+  # flake.lock pins nixpkgs. `nix flake update` moves it; commit the result.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
@@ -34,6 +33,10 @@
             "--features"
             features
           ];
+          # nixpkgs' cargo hook sets AWS_LC_SYS_USE_SYSTEM=1, so aws-lc-sys
+          # links the system AWS-LC and must find it through pkg-config.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.aws-lc ];
           # The test suite is CI's job; building it here would double the build.
           doCheck = false;
           meta = {

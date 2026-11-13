@@ -65,7 +65,7 @@ nix build github:tuna-os/spindle
 nix develop github:tuna-os/spindle
 ```
 
-The flake has no `flake.lock` yet. Run `nix flake lock` in a clone to pin nixpkgs, and commit the result. Nobody has run the flake in CI so far.
+The `flake.lock` file pins nixpkgs. To move to a newer nixpkgs, run `nix flake update` and commit the result. CI builds the flake when the flake, the Cargo files or the systemd unit change.
 
 The flake also has a NixOS module. It runs the same sandboxed unit as `deploy/systemd`.
 
