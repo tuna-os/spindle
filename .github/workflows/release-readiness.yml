@@ -1,14 +1,22 @@
 name: Release readiness
 
-# Prose-only changes cannot move the lifecycle, so they do not start this
-# (no job here is a required check, so a run that never starts blocks
-# nothing); the nightly run covers every day regardless.
+# Runs on a pull request only when something the lifecycle rehearsal builds
+# or runs changed (Rust sources, the vendored crate, the manifests, the
+# toolchain pin, the rehearsal script, this file). Prose and unrelated
+# scripts cannot move it, and no job here is a required check, so a run that
+# never starts blocks nothing. It no longer runs on every push to main: each
+# merge was a PR whose head already ran it; the nightly run below covers
+# main every day, including an interaction between two PRs.
 on:
   pull_request:
-    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
-  push:
-    branches: [main]
-    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - scripts/release-lifecycle.py
+      - .github/workflows/release-readiness.yml
   schedule:
     - cron: '37 4 * * *'
   workflow_dispatch:

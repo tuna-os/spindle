@@ -240,17 +240,41 @@ jobs:
   # Dockerfile and walks the first operator steps: register, log in, create
   # a room, send a message (#825). The render checks above cannot tell that
   # the stack runs.
+  #
+  # It builds the release image from scratch (no layer cache), the costliest
+  # job a pull request starts, and what it proves is that the packaging
+  # boots, not that the server's logic is right (the Rust gate does that). So
+  # a pull request runs it only when the packaging, the manifests or the
+  # server's start-up and config code changed, as the two jobs below decide
+  # the same way. A push to main or a manual run always runs it, so the
+  # merged tree is still smoke-tested after every merge.
   deploy-smoke:
     name: Deployment smoke test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      BASE: ${{ github.event.pull_request.base.sha }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Decide whether the deployment inputs changed
+        id: changed
+        run: |
+          run=true
+          if [ "$EVENT" = pull_request ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            run=false
+            if git diff --name-only "$BASE" HEAD | grep -Eq '^(Dockerfile|deploy/|scripts/deploy-smoke\.sh|spindle\.example\.toml|Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|vendor/|crates/spindle-server/src/(main|config)|\.github/workflows/ci\.yml)'; then
+              run=true
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
       - name: Start the Compose service and register a user
+        if: steps.changed.outputs.run == 'true'
         run: scripts/deploy-smoke.sh
 
   # Builds the .deb and .rpm on pull requests, not only at release, so a

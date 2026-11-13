@@ -1,13 +1,25 @@
 name: Performance
 
-# Prose-only changes cannot move a budget, so they do not start this (no
-# job here is a required check, so a run that never starts blocks nothing).
+# Runs on a pull request only when something that can move a budget changed
+# (Rust sources, the vendored crate, the manifests, the toolchain pin, this
+# file). Scripts, deploy files, evidence and prose cannot, so they do not
+# start it. No job here is a required check, so a run that never starts
+# blocks nothing. It no longer runs on every push to main: each merge was a
+# PR whose head already ran it, so the post-merge run re-proved the same
+# result; a nightly run on main takes its place and catches an interaction
+# between two PRs the same day.
 on:
   pull_request:
-    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
-  push:
-    branches: [main]
-    paths-ignore: ['**.md', '**.mdx', 'docs/**', .ste-budget]
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/performance.yml
+  schedule:
+    - cron: '53 4 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
