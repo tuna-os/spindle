@@ -835,6 +835,49 @@ fn the_secret_is_given_exactly_one_way() {
     assert!(blank.contains("empty"), "{blank}");
 }
 
+/// The Compose kit ships a placeholder secret so that its two files agree
+/// before anybody edits them, and the placeholder is public. A server that
+/// still holds it does not start, whether the secret is inline or in a
+/// file, and the refusal does not print it. The placeholder is read from
+/// the shipped file, so this fails if the kit changes to one the server
+/// would accept.
+#[test]
+fn the_placeholder_secret_of_the_compose_kit_is_refused() {
+    let kit = include_str!("../../../deploy/compose/spindle-rtc.toml");
+    let placeholder = kit
+        .lines()
+        .find_map(|line| line.strip_prefix("secret = "))
+        .expect("the kit's [rtc.livekit] sets a secret")
+        .trim_matches('"');
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("livekit-secret");
+    std::fs::write(&file, format!("{placeholder}\n")).unwrap();
+    let parse = |keys: &str| {
+        spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[rtc.livekit]\nurl = \"wss://sfu.example.org\"\n\
+             key = \"k\"\n{keys}"
+        ))
+    };
+
+    for keys in [
+        format!("secret = \"{placeholder}\"\n"),
+        format!("secret_file = \"{}\"\n", file.display()),
+    ] {
+        let refusal = match parse(&keys) {
+            Ok(_) => panic!("should have been refused:\n{keys}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(refusal.starts_with("rtc.livekit"), "{refusal}");
+        assert!(refusal.contains("placeholder"), "{refusal}");
+        assert!(!refusal.contains(placeholder), "{refusal}");
+    }
+
+    // The same configuration with a secret of the operator's own starts.
+    if let Err(error) = parse("secret = \"a-secret-the-operator-made\"\n") {
+        panic!("only the placeholder is refused: {error}");
+    }
+}
+
 /// The request's shape is the external service's: a missing device is a
 /// missing parameter, because the identity is user *and* device.
 #[tokio::test]

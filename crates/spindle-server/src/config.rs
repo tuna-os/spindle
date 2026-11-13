@@ -922,6 +922,12 @@ fn default_livekit_ttl() -> u64 {
     900
 }
 
+/// How the placeholder `LiveKit` secret in the shipped example files
+/// begins (`deploy/compose/spindle-rtc.toml`, `deploy/compose/livekit.yaml`).
+/// A prefix and not the whole string, so a placeholder that somebody
+/// started to edit is refused too.
+const PLACEHOLDER_SECRET_PREFIX: &str = "CHANGE_ME";
+
 /// One transport description, as MSC4143 renders it to clients.
 ///
 /// `type` is the discriminator and the rest of the object is that type's
@@ -2537,6 +2543,21 @@ impl Config {
                     field: "rtc.livekit",
                     message: "key and secret are LiveKit's API key and secret, and \
                               a token signed with an empty one admits nobody"
+                        .to_owned(),
+                });
+            }
+            // The example files carry a placeholder so that Spindle's copy
+            // and the SFU's agree before anybody edits them. It is public:
+            // an SFU and a minter that both keep it honour tokens and
+            // webhooks that anybody can sign, and calls still work, so
+            // nothing else would tell the operator. A secret read from
+            // `secret_file` is here by now too, and is held to the same.
+            if livekit.secret.starts_with(PLACEHOLDER_SECRET_PREFIX) {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit",
+                    message: "secret is still the placeholder from the example \
+                              files, which anybody can read: put a random secret \
+                              here and in the SFU's config (openssl rand -hex 32)"
                         .to_owned(),
                 });
             }
