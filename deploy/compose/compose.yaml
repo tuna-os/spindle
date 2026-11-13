@@ -1,0 +1,43 @@
+# Spindle behind Caddy, which gets the TLS certificate and answers
+# `.well-known` (#825). See docs/deploy.md.
+#
+#   cp .env.example .env     # set SPINDLE_IMAGE and SPINDLE_DOMAIN
+#   $EDITOR spindle.toml     # set server.name and public_base_url
+#   docker compose up -d
+#
+# Only Caddy publishes ports. Spindle stays on the compose network.
+services:
+  spindle:
+    # Pin a tag and a digest from the release notes; there is no `latest`.
+    image: ${SPINDLE_IMAGE:?set SPINDLE_IMAGE in .env, for example ghcr.io/tuna-os/spindle:v0.1.0@sha256:...}
+    restart: unless-stopped
+    command: ["/etc/spindle/spindle.toml"]
+    volumes:
+      - ./spindle.toml:/etc/spindle/spindle.toml:ro
+      # The image runs as UID 1000. A new named volume takes its owner
+      # from the image's /var/lib/spindle.
+      - spindle-data:/var/lib/spindle
+    # Set a ceiling from your own measurements (docs/operations.md).
+    mem_limit: ${SPINDLE_MEM_LIMIT:-2g}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2.10@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    restart: unless-stopped
+    depends_on: [spindle]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SPINDLE_DOMAIN: ${SPINDLE_DOMAIN:?set SPINDLE_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  spindle-data:
+  caddy-data:
+  caddy-config:

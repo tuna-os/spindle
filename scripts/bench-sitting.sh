@@ -23,6 +23,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$GROUP" ] || { echo "--group is required" >&2; exit 2; }
+# A positive whole number and nothing else: the value reaches bench-rounds.sh and
+# the sidecar's Python verbatim, and the workflow passes it from a
+# dispatch input anybody with write access can type (#516).
+case $ROUNDS in
+  '' | *[!0-9]* | 0*) echo "--rounds must be a positive integer, not '$ROUNDS'" >&2; exit 2 ;;
+esac
 BIN=${BENCH_BIN:-tmp/bench-bin}; VENV=${SYNAPSE_VENV:-tmp/synvenv}
 [ -x target/release/spindle ] || { echo "no target/release/spindle: run \`just bench-build\`" >&2; exit 1; }
 [ -x "$VENV/bin/python" ] || { echo "no Synapse venv at $VENV: run \`just bench-field\`" >&2; exit 1; }

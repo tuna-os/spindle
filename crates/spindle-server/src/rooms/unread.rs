@@ -350,7 +350,7 @@ impl Rooms {
         // spec does not stop a client acknowledging one -- and taking the
         // receipt alone there would walk back into history the user was never
         // present for.
-        let joined_at = self.membership_event(room_id, user_id)?.map(|(_, li)| li);
+        let joined_at = self.membership_li(room_id, user_id)?;
         let boundary = match (read_up_to.as_ref().map(|receipt| receipt.li), joined_at) {
             (Some(receipt), Some(joined)) => receipt.max(joined),
             (Some(receipt), None) => receipt,

@@ -20,11 +20,11 @@ const MAX_TIPS: usize = u64::BITS as usize;
 
 /// How many recent entries keep their materialized state resident, by default.
 ///
-/// Matched to SPEC §9.1's `max_fork_window`, and that coupling is the whole
-/// argument: a fork deeper than the window already falls back to full state
-/// resolution, which reads the trie from the store. So a window this size holds
-/// every snapshot the fast path can ask for, and nothing that only the slow
-/// path can.
+/// A bound on memory, not on which forks can be resolved: an older parent's
+/// state is rehydrated from the store by its root ([`RoomLog::state_after_any`]),
+/// so the window only decides which forks pay a store read. 512 was SPEC
+/// §9.1's old `max_fork_window`; ADR 0005 retired that cap, and nothing caps
+/// fork depth now.
 pub const DEFAULT_RESIDENT_WINDOW: usize = 512;
 
 /// A Matrix event ID, treated as an opaque value.
@@ -139,6 +139,33 @@ impl ChainHash {
     }
 }
 
+/// Where a truncated room's hash chain restarts (#817, SPEC §14.3).
+///
+/// Deleting the log entries below a watermark removes the values the chain
+/// was computed from, so the value just before the first retained entry is
+/// kept instead. Every entry below `floor` is gone or ignored, and the chain
+/// of the entries at or above it extends from `chain`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainCheckpoint {
+    /// The lowest `li` that still has a chain value.
+    pub floor: i64,
+    /// `chain[floor - 1]`: the value the first retained chain entry extends.
+    pub chain: ChainHash,
+}
+
+/// What [`RoomLog::truncate_below`] changed in memory, for the caller to
+/// make durable.
+#[derive(Clone, Debug)]
+pub struct Truncation {
+    /// The chain restart point now in force.
+    pub checkpoint: ChainCheckpoint,
+    /// Entries removed from the log, oldest first.
+    pub removed: Vec<LogEntry>,
+    /// Entries kept below the floor, rewritten without a chain value
+    /// because the checkpoint no longer covers them.
+    pub kept: Vec<LogEntry>,
+}
+
 /// One event in storage order, with its Matrix DAG relationship intact.
 #[derive(Clone, Debug)]
 pub struct LogEntry {
@@ -213,6 +240,32 @@ pub struct SidelinedEntry {
     /// The state after it: the state before it, plus the event itself when
     /// it soft-failed.
     pub state_root: StateRoot,
+}
+
+/// What [`RoomLog::fill_partial_state`] changed: the entries and sidelined
+/// events whose state moved, each with the state it replaced, so the store
+/// writes only the trie nodes the fill created.
+#[derive(Clone, Debug, Default)]
+pub struct FilledStates {
+    pub entries: Vec<FilledEntry>,
+    pub sidelined: Vec<FilledSidelined>,
+}
+
+/// One entry whose state [`RoomLog::fill_partial_state`] filled.
+#[derive(Clone, Debug)]
+pub struct FilledEntry {
+    /// The entry as it now reads, its `state_root` the filled state's.
+    pub entry: LogEntry,
+    pub state: StateSnapshot,
+    pub replaced: StateSnapshot,
+}
+
+/// One sidelined event whose state [`RoomLog::fill_partial_state`] filled.
+#[derive(Clone, Debug)]
+pub struct FilledSidelined {
+    pub entry: SidelinedEntry,
+    pub state: StateSnapshot,
+    pub replaced: StateSnapshot,
 }
 
 /// The room version's state resolution algorithm, supplied from above.
@@ -299,8 +352,12 @@ pub struct RoomLog {
     forward_extremities: BTreeSet<EventId>,
     /// Soft-failed and rejected events: in the DAG, out of the timeline.
     sidelined: HashMap<EventId, SidelinedEntry>,
-    /// Their states, held resident: they are few, and a child naming one
-    /// needs its state at once.
+    /// Their states, for the ones this process sidelined: a child naming
+    /// one usually arrives right behind it. A restored room leaves them
+    /// out ([`RoomLog::restore_sidelined_entry`]) and reads one through
+    /// [`RoomLog::state_after_any`] when something names it: a busy room
+    /// accumulates thousands, almost none of which anything names again,
+    /// and hydrating each was a quarter of a large room's cold load (#724).
     sidelined_state: HashMap<EventId, StateSnapshot>,
     /// Rejection decisions imported from a former homeserver and preserved
     /// by operator choice. These IDs remain auth-graph references, never
@@ -317,6 +374,9 @@ pub struct RoomLog {
     next_forward: i64,
     next_backward: i64,
     head_chain: ChainHash,
+    /// Where the chain restarts after a truncation; `None` for a room that
+    /// still holds its whole history.
+    checkpoint: Option<ChainCheckpoint>,
     /// Materialized state for the entries that can still be asked for it.
     ///
     /// Bounded, because the alternative is not: a snapshot per entry retains
@@ -348,10 +408,18 @@ impl RoomLog {
             next_forward: 1,
             next_backward: 0,
             head_chain: ChainHash::seed(),
+            checkpoint: None,
             resident: BTreeMap::new(),
             resident_window: DEFAULT_RESIDENT_WINDOW,
             table,
         }
+    }
+
+    /// Whether the log has several forward extremities: a fork nobody has
+    /// merged yet.
+    #[must_use]
+    pub fn is_forked(&self) -> bool {
+        self.forward_extremities.len() > 1
     }
 
     /// The table this log's snapshots belong to.
@@ -656,6 +724,95 @@ impl RoomLog {
         }
     }
 
+    /// Keep only `keep` of the forward extremities and forget the rest.
+    ///
+    /// For tips the server has shown to be stuck (#626): extremities no
+    /// event will cite, whose states lost the room's resolution to the
+    /// others'. Every kept tip must hold one and the same state. That state
+    /// is the room's current state, with no resolution to record, and an
+    /// event built on the kept tips is linear again instead of one more
+    /// resolution against the stuck branch. The dropped events stay in the
+    /// log; only the extremity set forgets them.
+    ///
+    /// Returns `false` and changes nothing unless `keep` is a non-empty
+    /// subset of the extremities whose states are resident and equal.
+    pub fn retain_forward_extremities(&mut self, keep: &BTreeSet<EventId>) -> bool {
+        if keep.is_empty() || !keep.is_subset(&self.forward_extremities) {
+            return false;
+        }
+        let mut states = keep.iter().map(|tip| self.state_after_event(tip));
+        let Some(Some(state)) = states.next() else {
+            return false;
+        };
+        let root = state.root();
+        if !states.all(|other| other.is_some_and(|other| other.root() == root)) {
+            return false;
+        }
+        self.current = (keep.len() > 1).then(|| state.clone());
+        self.forward_extremities.clone_from(keep);
+        true
+    }
+
+    /// What the resolution of this room's forward extremities depends on,
+    /// as one digest: each tip with the root of its state, the native
+    /// rejections and the imported ones. `None` with one extremity or
+    /// none, where there is nothing to resolve.
+    ///
+    /// A recorded resolution whose digest equals this one is the answer
+    /// the resolver would give again, so a reopened room can take it
+    /// instead of resolving its fork afresh (#724). The rejection sets are
+    /// hashed sorted rather than taken from
+    /// [`Self::resolution_policy_id`], which chains decisions in the order
+    /// they arrived: a restore replays them in key order, and a digest
+    /// that depended on arrival order would never match across a restart.
+    #[must_use]
+    pub fn current_inputs(&self) -> Option<[u8; 32]> {
+        if self.forward_extremities.len() <= 1 {
+            return None;
+        }
+        let framed = |hash: &mut blake3::Hasher, bytes: &[u8]| {
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        };
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"spindle current-state inputs v1");
+        hash.update(&(self.forward_extremities.len() as u64).to_be_bytes());
+        for tip in &self.forward_extremities {
+            let entry = self.get(tip)?;
+            framed(&mut hash, tip.as_str().as_bytes());
+            hash.update(entry.state_root.as_bytes());
+        }
+        let mut rejected: Vec<&str> = self
+            .sidelined
+            .values()
+            .filter(|entry| entry.kind == Sideline::Rejected)
+            .map(|entry| entry.event_id.as_str())
+            .collect();
+        rejected.sort_unstable();
+        hash.update(&(rejected.len() as u64).to_be_bytes());
+        for id in rejected {
+            framed(&mut hash, id.as_bytes());
+        }
+        hash.update(&(self.historical_rejections.len() as u64).to_be_bytes());
+        for id in &self.historical_rejections {
+            framed(&mut hash, id.as_str().as_bytes());
+        }
+        Some(*hash.finalize().as_bytes())
+    }
+
+    /// The recorded resolution of an open fork, if there is one: what
+    /// [`Self::set_current`] last stored while the room had several
+    /// extremities. `None` in a linear room, whose current state is its
+    /// tip's and needs no record.
+    #[must_use]
+    pub fn resolved_current(&self) -> Option<&StateSnapshot> {
+        if self.forward_extremities.len() > 1 {
+            self.current.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// How many snapshots are currently held in memory.
     ///
     /// Exposed so a test can assert the bound holds rather than assume it. A
@@ -768,7 +925,8 @@ impl RoomLog {
             .map(|(_, entry)| entry)
     }
 
-    /// Every tip of the federation DAG, including any set aside.
+    /// Every tip of the federation DAG, including any beyond the newest
+    /// [`MAX_AUTHORED_PREV_EVENTS`] that a local event leaves unnamed.
     ///
     /// This is what a peer would compute from the same events, and what
     /// the store persists. It is not what a local event names -- that is
@@ -814,6 +972,79 @@ impl RoomLog {
     #[must_use]
     pub fn head_chain(&self) -> ChainHash {
         self.head_chain
+    }
+
+    /// Where the chain restarts, if the room has been truncated.
+    #[must_use]
+    pub fn chain_checkpoint(&self) -> Option<ChainCheckpoint> {
+        self.checkpoint
+    }
+
+    /// The chain value just before `floor`: what the first entry at or
+    /// above it extends.
+    ///
+    /// The newest chain value among the entries below `floor`, or the
+    /// current checkpoint's when none is left, or the seed for a room that
+    /// was never truncated and has none.
+    #[must_use]
+    pub fn chain_before(&self, floor: i64) -> ChainHash {
+        self.entries
+            .range(..floor)
+            .rev()
+            .find_map(|(_, entry)| entry.chain)
+            .or_else(|| self.checkpoint.map(|point| point.chain))
+            .unwrap_or_else(ChainHash::seed)
+    }
+
+    /// Drop every entry below `floor` except those in `keep`, which stay
+    /// without a chain value (#817).
+    ///
+    /// Returns `None` when there is nothing to do: the floor is not above
+    /// the checkpoint already in force. The caller makes the result
+    /// durable, checkpoint first. Refuses to remove an entry that is a
+    /// forward extremity, since the next append names it.
+    pub fn truncate_below(
+        &mut self,
+        floor: i64,
+        keep: &BTreeSet<LinearIndex>,
+    ) -> Option<Truncation> {
+        if self.checkpoint.is_some_and(|point| floor <= point.floor) {
+            return None;
+        }
+        let tips: BTreeSet<i64> = self
+            .forward_extremities
+            .iter()
+            .filter_map(|id| self.positions.get(id).copied())
+            .collect();
+        let checkpoint = ChainCheckpoint {
+            floor,
+            chain: self.chain_before(floor),
+        };
+        let doomed: Vec<i64> = self
+            .entries
+            .range(..floor)
+            .map(|(&li, _)| li)
+            .filter(|li| !keep.contains(&LinearIndex(*li)) && !tips.contains(li))
+            .collect();
+        let mut removed = Vec::with_capacity(doomed.len());
+        for li in doomed {
+            if let Some(entry) = self.entries.remove(&li) {
+                self.positions.remove(&entry.event_id);
+                self.resident.remove(&li);
+                removed.push(entry);
+            }
+        }
+        let mut kept = Vec::new();
+        for (_, entry) in self.entries.range_mut(..floor) {
+            entry.chain = None;
+            kept.push(entry.clone());
+        }
+        self.checkpoint = Some(checkpoint);
+        Some(Truncation {
+            checkpoint,
+            removed,
+            kept,
+        })
     }
 
     /// The entry at a position this log issued.
@@ -1206,6 +1437,20 @@ impl RoomLog {
         // at the door, so everything this log persists resolves through one
         // table. Same table is a no-op clone.
         let state = state.with_table(&self.table);
+        self.sidelined_state.insert(entry.event_id.clone(), state);
+        self.record_sidelined(entry);
+    }
+
+    /// Put back a sidelined event read from storage without its state,
+    /// which [`Self::state_after_any`] reads from the store, verified, if
+    /// anything names the event. What a runtime restore does: the root is
+    /// the record's, so nothing is lost but the hydration nobody asked for.
+    pub fn restore_sidelined_entry(&mut self, entry: SidelinedEntry) {
+        self.sidelined_state.remove(&entry.event_id);
+        self.record_sidelined(entry);
+    }
+
+    fn record_sidelined(&mut self, entry: SidelinedEntry) {
         let previous = self.sidelined.get(&entry.event_id).map(|old| old.kind);
         if previous != Some(entry.kind)
             && (entry.kind == Sideline::Rejected || previous == Some(Sideline::Rejected))
@@ -1217,7 +1462,6 @@ impl RoomLog {
             hash.update(&[u8::from(entry.kind == Sideline::Rejected)]);
             self.native_rejection_policy_id = *hash.finalize().as_bytes();
         }
-        self.sidelined_state.insert(entry.event_id.clone(), state);
         self.sidelined.insert(entry.event_id.clone(), entry);
     }
 
@@ -1283,6 +1527,125 @@ impl RoomLog {
         self.entries.insert(li, entry);
         self.make_resident(li, state_after);
         Ok(self.issued_entry(li))
+    }
+
+    /// Fill the state slots a partial-state join left empty (MSC3706), in
+    /// the state after every entry from `from` on, every sidelined event,
+    /// and the recorded resolution of a fork.
+    ///
+    /// A resident answering `send_join` with `members_omitted` leaves most
+    /// member events out of the state before the join, so every snapshot
+    /// this server built from the join onward lacks them. The full state at
+    /// the join, fetched later, names them; each snapshot then gains the
+    /// ones it has no value for. A slot it does hold is kept: an event at or
+    /// after the join wrote it, and that is newer than anything the state
+    /// *before* the join can say. This is Synapse's de-partial-stating of
+    /// each partial-state event, done in place: the order, the chain and
+    /// the events are untouched, only the content address of the state
+    /// after each entry moves.
+    ///
+    /// The first snapshot is filled whole; each later one is the previous
+    /// filled snapshot patched with only the slots that changed between the
+    /// two old snapshots, so the cost is the fill once plus the room's state
+    /// changes since the join -- not the fill once per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AppendError::StateNotResident`] for a snapshot that is neither
+    /// resident nor readable through `load`; nothing has changed then.
+    pub fn fill_partial_state(
+        &mut self,
+        from: LinearIndex,
+        fill: &BTreeMap<StateKey, EventId>,
+        load: &mut dyn FnMut(&StateRoot) -> Option<Vec<u8>>,
+    ) -> Result<FilledStates, AppendError> {
+        let filled_whole = |state: &StateSnapshot| -> StateSnapshot {
+            let mut out = state.clone();
+            for (key, id) in fill {
+                if out.get(key).is_none() {
+                    out = out.apply(key, id.as_str());
+                }
+            }
+            out
+        };
+
+        // Read every old snapshot first and change nothing until all of
+        // them are in hand, so a failed rehydration leaves the log as it
+        // was rather than half filled.
+        let ids: Vec<(i64, EventId)> = self
+            .entries
+            .range(from.get()..)
+            .map(|(li, entry)| (*li, entry.event_id.clone()))
+            .collect();
+        let mut old: Vec<(i64, StateSnapshot)> = Vec::with_capacity(ids.len());
+        for (li, id) in &ids {
+            old.push((*li, self.state_after_any(id, load)?));
+        }
+        let sidelined_ids: Vec<EventId> = self.sidelined.keys().cloned().collect();
+        let mut old_sidelined = Vec::with_capacity(sidelined_ids.len());
+        for id in sidelined_ids {
+            let state = self.state_after_any(&id, load)?;
+            old_sidelined.push((id, state));
+        }
+
+        let mut entries = Vec::with_capacity(old.len());
+        let mut previous: Option<(StateSnapshot, StateSnapshot)> = None;
+        for (li, replaced) in old {
+            let state = match &previous {
+                None => filled_whole(&replaced),
+                Some((old_previous, new_previous)) => {
+                    let mut state = new_previous.clone();
+                    for (key, _, now) in old_previous.diff(&replaced) {
+                        state = match now.or_else(|| fill.get(&key).map(EventId::as_str)) {
+                            Some(id) => state.apply(&key, id),
+                            None => state.remove(&key),
+                        };
+                    }
+                    state
+                }
+            };
+            previous = Some((replaced.clone(), state.clone()));
+            if state.root() == replaced.root() {
+                continue;
+            }
+            let Some(entry) = self.entries.get_mut(&li) else {
+                continue;
+            };
+            entry.state_root = state.root();
+            let entry = entry.clone();
+            if let Some(resident) = self.resident.get_mut(&li) {
+                *resident = state.clone();
+            }
+            entries.push(FilledEntry {
+                entry,
+                state,
+                replaced,
+            });
+        }
+
+        let mut sidelined = Vec::with_capacity(old_sidelined.len());
+        for (id, replaced) in old_sidelined {
+            let state = filled_whole(&replaced);
+            if state.root() == replaced.root() {
+                continue;
+            }
+            let Some(entry) = self.sidelined.get_mut(&id) else {
+                continue;
+            };
+            entry.state_root = state.root();
+            let entry = entry.clone();
+            self.sidelined_state.insert(id, state.clone());
+            sidelined.push(FilledSidelined {
+                entry,
+                state,
+                replaced,
+            });
+        }
+
+        if let Some(current) = self.current.take() {
+            self.current = Some(filled_whole(&current));
+        }
+        Ok(FilledStates { entries, sidelined })
     }
 
     /// Place one backfilled event before everything currently held.
@@ -1454,6 +1817,9 @@ pub struct LogRestore {
     /// and a good part of the time.
     entries: Vec<(i64, LogEntry)>,
     previous: Option<i64>,
+    /// A recorded resolution of the room's fork: the digest of what it
+    /// resolved ([`RoomLog::current_inputs`]) and its state's root.
+    current: Option<([u8; 32], StateRoot)>,
 }
 
 impl LogRestore {
@@ -1477,7 +1843,54 @@ impl LogRestore {
             log,
             entries: Vec::with_capacity(reserve),
             previous: None,
+            current: None,
         }
+    }
+
+    /// Start the chain from a truncated room's checkpoint (#817).
+    ///
+    /// Entries below the checkpoint that still carry a chain value are the
+    /// leftovers of a truncation a crash interrupted: the checkpoint was
+    /// written first, so they are already gone as far as the room is
+    /// concerned, and [`Self::push`] drops them. Entries below it without
+    /// one are the ones the truncation kept on purpose.
+    #[must_use]
+    pub fn with_chain_checkpoint(mut self, checkpoint: ChainCheckpoint) -> Self {
+        self.log.head_chain = checkpoint.chain;
+        self.log.checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Offer a recorded resolution of the room's fork. [`Self::finish`]
+    /// adopts it as the current state only if `inputs` is still what the
+    /// restored room's resolution depends on and its root reads back
+    /// verified; anything else leaves the fork unresolved, for the caller
+    /// to resolve as it would have without the record.
+    #[must_use]
+    pub fn with_current(mut self, inputs: [u8; 32], root: StateRoot) -> Self {
+        self.current = Some((inputs, root));
+        self
+    }
+
+    /// Restore a sidelined event without its state (see
+    /// [`RoomLog::restore_sidelined_entry`]). Before [`Self::finish`], so
+    /// the rejections it carries are part of what a recorded resolution
+    /// is checked against.
+    pub fn sideline(&mut self, entry: SidelinedEntry) {
+        self.log.restore_sidelined_entry(entry);
+    }
+
+    /// Restore an imported historical rejection, as
+    /// [`RoomLog::preserve_historical_rejection`]. Before [`Self::finish`]
+    /// for the reason [`Self::sideline`] is.
+    pub fn preserve_historical_rejection(&mut self, event_id: EventId) {
+        self.log.preserve_historical_rejection(event_id);
+    }
+
+    /// Whether an accepted record holds `event_id`.
+    #[must_use]
+    pub fn holds_entry(&self, event_id: &EventId) -> bool {
+        self.log.positions.contains_key(event_id)
     }
 
     /// Accept the next record, which must sort after every one before it.
@@ -1501,6 +1914,12 @@ impl LogRestore {
             }
         }
         self.previous = Some(li);
+        if log
+            .checkpoint
+            .is_some_and(|point| li < point.floor && restored.chain.is_some())
+        {
+            return Ok(());
+        }
         let chain = match restored.chain {
             Some(stored) => {
                 let recomputed = log.head_chain.extend(&restored.event_id);
@@ -1649,6 +2068,18 @@ impl LogRestore {
                 log.resident.insert(li, state);
             }
         }
+        // After the tips, so the resolved state -- built on one tip's state
+        // and differing from it in the contested slots only -- reads back
+        // as those slots' paths rather than a second walk of the whole
+        // trie. A record that no longer matches, or will not read back
+        // verified, is a stale cache, not damage: the fork stays open and
+        // the caller resolves it.
+        if let Some((inputs, root)) = self.current
+            && log.current_inputs() == Some(inputs)
+            && let Ok(state) = hydrate(root, 0, &mut verified_nodes)
+        {
+            log.current = Some(state);
+        }
         Ok(log)
     }
 }
@@ -1676,6 +2107,7 @@ impl RoomLog {
             next_forward,
             next_backward,
             forward_extremities,
+            None,
             None,
             table,
         )
@@ -1707,6 +2139,35 @@ impl RoomLog {
             next_backward,
             forward_extremities,
             Some(load_node),
+            None,
+            table,
+        )
+    }
+
+    /// [`Self::restore`] and [`Self::restore_with_state`] for a truncated
+    /// room: the chain starts from `checkpoint` (#817). Without a loader
+    /// the state is refolded, which a truncated room cannot do for its
+    /// first retained entries; they are reported as unverified.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::restore`].
+    pub fn restore_from_checkpoint(
+        entries: impl IntoIterator<Item = RestoredEntry>,
+        next_forward: i64,
+        next_backward: i64,
+        forward_extremities: impl IntoIterator<Item = EventId>,
+        load_node: Option<NodeLoader<'_>>,
+        checkpoint: ChainCheckpoint,
+        table: Arc<dyn StateKeyTable>,
+    ) -> Result<RestoredLog, RestoreError> {
+        Self::rebuild(
+            entries,
+            next_forward,
+            next_backward,
+            forward_extremities,
+            load_node,
+            Some(checkpoint),
             table,
         )
     }
@@ -1796,6 +2257,7 @@ impl RoomLog {
         next_backward: i64,
         forward_extremities: impl IntoIterator<Item = EventId>,
         mut load_node: Option<NodeLoader<'_>>,
+        checkpoint: Option<ChainCheckpoint>,
         table: Arc<dyn StateKeyTable>,
     ) -> Result<RestoredLog, RestoreError> {
         let mut log = Self {
@@ -1811,7 +2273,8 @@ impl RoomLog {
             current: None,
             next_forward,
             next_backward,
-            head_chain: ChainHash::seed(),
+            head_chain: checkpoint.map_or_else(ChainHash::seed, |point| point.chain),
+            checkpoint,
             resident: BTreeMap::new(),
             resident_window: DEFAULT_RESIDENT_WINDOW,
         };
@@ -1836,6 +2299,9 @@ impl RoomLog {
                 }
             }
             previous = Some(li);
+            if checkpoint.is_some_and(|point| li < point.floor && restored.chain.is_some()) {
+                continue;
+            }
 
             // Refold first. It is O(1) per entry given the parent's state,
             // which is already in hand from the previous iteration, whereas

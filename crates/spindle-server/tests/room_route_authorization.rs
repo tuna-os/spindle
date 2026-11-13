@@ -291,12 +291,17 @@ const TABLE: &[Route] = &[
 /// such literal counts -- so that the failure mode is "the table lists a
 /// path the router does not" rather than a route slipping past.
 fn routes_in_source() -> Vec<String> {
-    let source = ["routes.rs", "moderation_routes.rs"]
-        .into_iter()
-        .map(|module| {
-            std::fs::read_to_string(format!("{}/src/{module}", env!("CARGO_MANIFEST_DIR")))
-                .expect("the router's source is beside this test")
+    // `routes.rs` and every `*_routes.rs` module split out of it (#689).
+    let src = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_dir(&src)
+        .expect("the router's source is beside this test")
+        .map(|entry| entry.expect("a readable source entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "routes.rs" || name.ends_with("_routes.rs"))
         })
+        .map(|path| std::fs::read_to_string(path).expect("a readable route module"))
         .collect::<Vec<_>>()
         .join("\n");
     let mut found: Vec<String> = source

@@ -216,9 +216,18 @@ pub fn configured(state: &AppState) -> bool {
 /// address is folded, the local part included — strictly a mail server
 /// may tell `Alice@` from `alice@`, but no person means two accounts by
 /// it, and treating them as two would let one inbox own two identities.
+///
+/// ASCII only. Unicode lowercasing folds different characters together (U+212A
+/// KELVIN SIGN becomes `k`), so a non-ASCII address could be stored or
+/// matched as someone else's; such an address is refused rather than
+/// folded.
 #[must_use]
 pub fn normalize(address: &str) -> Option<String> {
-    let folded = address.trim().to_lowercase();
+    let trimmed = address.trim();
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    let folded = trimmed.to_ascii_lowercase();
     (folded.len() <= 254 && folded.parse::<lettre::Address>().is_ok()).then_some(folded)
 }
 
@@ -279,17 +288,31 @@ pub(crate) fn addresses_of(
 }
 
 /// Who an address belongs to, if anyone.
-fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixError> {
-    Ok(
-        ReadView::get(state.store.as_ref(), &keys::email_owner(address))
-            .map_err(|e| storage(&e))?
-            .and_then(|raw| String::from_utf8(raw).ok()),
-    )
+pub(crate) fn owner_of(state: &AppState, address: &str) -> Result<Option<String>, MatrixError> {
+    owner_in(state.store.as_ref(), address)
 }
 
-fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
-    state
-        .store
+/// [`owner_of`] against a store directly, for the offline MAS importer.
+pub(crate) fn owner_in(
+    store: &(impl ReadView + ?Sized),
+    address: &str,
+) -> Result<Option<String>, MatrixError> {
+    Ok(ReadView::get(store, &keys::email_owner(address))
+        .map_err(|e| storage(&e))?
+        .and_then(|raw| String::from_utf8(raw).ok()))
+}
+
+pub(crate) fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
+    bind_in(state.store.as_ref(), localpart, address)
+}
+
+/// [`bind`] against a store directly, for the offline MAS importer.
+pub(crate) fn bind_in(
+    store: &(impl Store + ?Sized),
+    localpart: &str,
+    address: &str,
+) -> Result<(), MatrixError> {
+    store
         .commit(
             &[
                 (keys::email_owner(address), localpart.as_bytes().to_vec()),
@@ -305,7 +328,7 @@ fn bind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixEr
         .map_err(|e| storage(&e))
 }
 
-fn unbind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
+pub(crate) fn unbind(state: &AppState, localpart: &str, address: &str) -> Result<(), MatrixError> {
     let store = state.store.as_ref();
     if owner_of(state, address)?.as_deref() == Some(localpart) {
         Store::delete(store, &keys::email_owner(address)).map_err(|e| storage(&e))?;
@@ -485,7 +508,7 @@ pub fn issue_reset_link(
 
 /// Hand a message to the mailer in a task of its own, counting the
 /// outcome. The caller's response never waits on, or varies with, it.
-fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
+pub(crate) fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
     let Some(mailer) = state.mailer.clone() else {
         return;
     };
@@ -499,7 +522,7 @@ fn dispatch(state: &AppState, kind: EmailKind, email: OutgoingEmail) {
     });
 }
 
-fn link(state: &AppState, path: &str, token: &str) -> String {
+pub(crate) fn link(state: &AppState, path: &str, token: &str) -> String {
     format!("{}{path}?token={token}", crate::oidc::issuer(state))
 }
 
@@ -678,7 +701,7 @@ struct TokenQuery {
     token: Option<String>,
 }
 
-fn dead_link(state: &AppState) -> Response {
+pub(crate) fn dead_link(state: &AppState) -> Response {
     crate::account::message_page(
         state,
         StatusCode::BAD_REQUEST,
@@ -756,7 +779,7 @@ async fn verify(
     ))
 }
 
-fn not_configured() -> MatrixError {
+pub(crate) fn not_configured() -> MatrixError {
     MatrixError::new(
         StatusCode::NOT_FOUND,
         "M_UNRECOGNIZED",
@@ -1022,7 +1045,7 @@ async fn reset(
     }
     let changed = accounts
         .set_password(&row.localpart, &form.new_password)
-        .map_err(|e| storage(&e))?;
+        .map_err(|e| crate::routes::internal(&e))?;
     if !changed {
         return Ok(dead_link(&state));
     }
@@ -1048,10 +1071,10 @@ async fn reset(
 }
 
 /// `GET /_matrix/client/v3/account/3pid` — the account's confirmed
-/// addresses. Adding and removing them is the account pages' job (the
-/// client API's `requestToken` flows are not served); this is the read
-/// clients show in their settings. Under delegation the provider owns
-/// identity, and this answers as the endpoint always did there: absent.
+/// addresses, however they were added: the account pages, or the client
+/// API's `requestToken` and `/3pid/add` (`threepid.rs`). Under delegation
+/// the provider owns identity, and this answers as the endpoint always did
+/// there: absent.
 async fn threepids(
     State(state): State<AppState>,
     Authenticated(identity): Authenticated,
@@ -1187,5 +1210,9 @@ mod tests {
         assert!(normalize("not an address").is_none());
         assert!(normalize("a@").is_none());
         assert!(normalize(&format!("{}@example.org", "a".repeat(250))).is_none());
+        // KELVIN SIGN lowercases to an ASCII `k` under Unicode rules: it
+        // must not become kim@example.org.
+        assert!(normalize("\u{212A}im@example.org").is_none());
+        assert!(normalize("j\u{fc}rgen@example.org").is_none());
     }
 }

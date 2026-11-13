@@ -120,8 +120,8 @@ needing no resolution; both compute `auth_chain_difference` only inside
 Any framing of this project as "we skip state resolution and they don't" is
 false, and #56 measures the consequence: on a real fork our advantage over
 `ruma-state-res` is a flat 2.2–3.1× constant factor across the whole range out
-to a full `max_fork_window` — not the superlinear gap the cost column invites a
-reader to expect.
+to a 512-event fork, the window cap §9.1 then had — not the superlinear gap the
+cost column invites a reader to expect.
 
 What survives is the bottom four rows, and they have one thing in common:
 **they are bookkeeping, not algorithms.** Maintaining the extremity set,
@@ -280,6 +280,13 @@ And a divergence never re-converges: two histories that differ at one index
 disagree at every index after, even where later events are identical, so the
 first differing value localises the change.
 
+**A truncated room restarts the chain from a checkpoint.** Retention (§14.3)
+deletes the entries below a floor. The room then stores `chain[floor - 1]`
+beside the floor, and every restore seeds the chain from it instead of from
+the domain seed. The checkpoint is written before the first delete, so an
+interrupted truncation still loads. Entries kept below the floor carry no
+chain value, like backfilled history.
+
 **Only forward-appended entries carry a chain value.** Backfilled history was
 sequenced by another server and arrives with its own provenance; attesting to
 an order we did not choose would be a claim we cannot back. A server's chain
@@ -363,6 +370,10 @@ A room with 50k state events holds on the order of a few MB resident; rooms
 evict to disk under an LRU keyed by last activity, retaining only the 32-byte
 root.
 
+**Status.** The eviction of idle rooms in the paragraph above is designed only.
+An open room keeps its whole log index in memory until the process stops
+(#816). The snapshot window below is built.
+
 Within a room the same rule applies per entry. Every log entry keeps its state
 root — 32 bytes, forever — but the materialized snapshot it names is held only
 while something can still ask for it. Retaining one snapshot per entry sounds
@@ -373,11 +384,10 @@ rather than with the size of the state.
 
 Snapshots are therefore retained for:
 
-- the most recent `resident_window` entries, defaulting to `max_fork_window`
-  (§9.1). The coupling is the argument: a fork deeper than the window already
-  falls back to full state resolution, which reads the trie from the store, so
-  a window this size holds everything the fast path can reach and nothing that
-  only the slow path can;
+- the most recent `resident_window` entries (512 by default). This window
+  limits memory only. Spindle can still resolve a fork of any depth. If a
+  resolution needs the state of an older parent, Spindle reads it from the
+  store by its root. The window decides only which forks pay for that read;
 - every forward extremity, at any age. A class-D stale peer event can leave an
   extremity arbitrarily far back (ADR 0001), and the next local event has to
   merge that extremity's state with the head's;
@@ -388,6 +398,26 @@ Snapshots are therefore retained for:
 Anything else is rehydrated from `state_nodes` by its root, which is `O(log n)`
 in the size of the state. The bound is asserted rather than assumed: a room
 whose resident count tracks its length has lost it.
+
+**Status.** The number of resident rooms is bounded. The number of events kept
+per resident room is not.
+
+- `[storage] max_resident_rooms` (default 4096, `0` for no limit) caps the
+  open rooms. When a load or a new room takes the count past it, the rooms
+  untouched for longest are dropped. The metrics are
+  `spindle_rooms_resident` and `spindle_rooms_evicted_total`.
+- A room is dropped only when nothing holds it: no reader, writer or
+  federation task has its lock, no load is in flight for it, it is not
+  mid-resync (partial state), and it has no unmerged fork. A busy room
+  keeps the count above the limit until it is idle.
+- A dropped room loads from the store like a restart. Every cache kept for
+  it is cleared with it. Only `receipt_marks` and the extremity merge
+  bookkeeping stay, because the store cannot rebuild them.
+- A resident room still keeps its whole log index in memory (`entries` and
+  `positions` in `RoomLog`). Memory per resident room is `O(events)`. A tail
+  window over `EventIndex` is not built.
+- The retention rule in the first paragraph is therefore only half true
+  today: rooms evict, but the log index of a room that stays open does not.
 
 ### 6.5 Backfilled history
 
@@ -456,7 +486,11 @@ until backfill brings the target in.
 
 Peers are chosen as for recovery — the server that served `G`'s state, `G`'s
 origin, then the servers with the most joined members — leaving out any still
-cooling down from a 429 or a 403 for that room. Chunks are paced
+cooling down from a 429 or a 403 for that room. Only a server with a member
+joined now is asked. A server whose users all left is not asked, and a gap
+with no such server waits. The ranking comes from the membership index and is
+cached against the state root. In a partial-state room, the resident's
+`servers_in_room` follow the ranked servers. Chunks are paced
 (`gap_backfill_interval_ms`), a failed gap backs off, and a gap that outgrows
 `gap_backfill_max_events` is left truncated rather than fetched without end.
 
@@ -581,6 +615,14 @@ microseconds. Three configurable modes:
 | `group` *(default)* | fsync batched, ≤1 ms window, response after batch | General |
 | `relaxed` | OS page cache, periodic fsync | Ephemeral / test |
 
+**Status.** All three modes are built. `[storage] durability` chooses one, and
+`group` is the default. The mode applies to room commits. Account, token,
+device, one-time key and signing key writes never fall below `group`: `strict`
+raises them to `strict`, and `relaxed` leaves them at `group`. Under `relaxed`
+a timer fsyncs the journal every `[storage] relaxed_sync_interval_ms` (1 s by
+default), so a crash loses at most that window. A batch can now delete as well
+as write. There is one journal for the whole store, not one for each shard.
+
 Because ordering is decided before durability, a crash can only lose a suffix of
 the log — never reorder it, never fork it. Recovery truncates to the last
 complete chain-hash entry and resumes; any client whose event was in the lost
@@ -691,7 +733,7 @@ linear log underneath.
 | Events | `/send`, `/state`, `/event`, `/context`, `/messages`, `/relations`, `/redact` | §10.4–10.5 |
 | Threads | `/relations/{id}/m.thread`, `m.thread` aggregation, `/threads` (MSC3856) | Server-side aggregation from the `relations` index |
 | Receipts | `/receipt`, `/read_markers`, `m.fully_read` | Ephemeral stream |
-| Typing / presence | `/typing`, `/presence` | Presence off by default (§18.4) |
+| Typing / presence | `/typing`, `/presence` | Presence switchable, on by default (§18.4) |
 | E2EE | `/keys/upload`, `/keys/query`, `/keys/claim`, `/keys/changes`, `/sendToDevice`, `/room_keys/*`, cross-signing, key backup, dehydrated devices | Server is a transport; §16 |
 | Media | `/_matrix/client/v1/media/*` (authenticated media, Matrix 1.11) with legacy `/_matrix/media/v3` for compatibility | §17.3 |
 | Spaces | `/hierarchy`, `m.space.child`, `m.space.parent` | Hierarchy walked from the `relations` and state indexes |
@@ -724,6 +766,26 @@ s{events}_{receipts}_{account_data}_{to_device}_{device_lists}_{presence}
 
 Each component is an independent stream position, so a burst on one stream
 cannot stall another.
+
+#### Current-state deltas
+
+A client folds the timeline into its state, and the timeline is in arrival
+order. That is wrong when an event is not the newest word on its key. An event
+on a stale parent can lose state resolution. A fork can put a key back to an
+older event. An event accepted across a gap brings the peer's state with it.
+
+When an append moves the room's current state by more than the event itself,
+the server writes a delta row under the event's stream id, keyed
+`(room_id, stream_id)`. It lists each `(type, state_key, event_id)` that
+changed. The row is written before the stream id is released, so a sync that
+reads the event also reads the delta. A linear append has no row.
+
+An incremental `/sync` takes the current event of every key that its events or
+its deltas touched. With `use_state_after` that is the `state_after` block.
+Without it, events the timeline already carries are left out of `state`.
+Sliding sync counts the events a delta names as changed. A classic client still
+folds a losing event that sits inside its own timeline window, because the
+protocol gives it no way to undo that.
 
 ### 10.3 Sync as push, not poll
 
@@ -814,15 +876,23 @@ about it is non-standard, and no peer needs to know Spindle exists.
 | Misc | `/openid/userinfo`, `3pid/onbind`, `/exchange_third_party_invite` |
 | EDUs | `m.typing`, `m.receipt`, `m.presence`, `m.direct_to_device`, `m.device_list_update`, `m.signing_key_update` |
 
+**Status.** Two parts of this table are designed only. The server does not
+serve `3pid/onbind` or `/exchange_third_party_invite`
+([spec-gaps.md](docs/spec-gaps.md)). The client `/hierarchy` and room summary
+read only rooms that this server holds, and they do not ask other servers
+(#823).
+
 ### 11.3 Outbound
 
 One ordered queue per destination, drained by a dedicated task: up to 50 PDUs
 and 100 EDUs per transaction, one transaction in flight per destination as the
-spec requires. Exponential backoff with jitter on failure; destinations are
-marked down after a threshold and probed. On recovery, catch-up walks the
-`stream` index forward from the destination's last acknowledged position — a
-sequential scan, not a graph traversal, which is precisely the operation that
-makes federation catch-up expensive on DAG servers.
+spec requires. Exponential backoff on failure, capped at about a minute
+while the outage is young; after ten minutes each wait is as long as the
+outage so far, up to a day, and a request from the destination ends it. The
+backoff is stored, so a restart resumes it. On recovery from a long outage,
+catch-up sends the newest events of each room rather than the backlog, and
+the peer fetches the gap through `prev_events`; to-device messages and
+device-list updates are never dropped (#801).
 
 Hub fan-out in class H broadcasts to all participant destinations in parallel
 from the room's executor, with the per-destination queues absorbing slow peers.
@@ -839,7 +909,10 @@ Rate limiting is per-origin and per-room, with a separate budget for events that
 trigger `/get_missing_events` — the classic amplification vector. Accepting an
 event across a gap (§6.6) fetches a room's state and auth chain, so it is
 capped separately, per room and per origin over a window
-(`gap_acceptances_per_room`, `gap_acceptances_per_origin`).
+(`gap_acceptances_per_room`, `gap_acceptances_per_origin`). When a dependency
+fails verification, Spindle does not get it again for
+`dependency_failure_ttl_secs`. In that time, Spindle refuses at once each event
+that names it, and sends no request to a peer.
 
 ### 11.5 Joining an existing large room
 
@@ -853,12 +926,26 @@ capped separately, per room and per origin over a window
 4. Records the history before the join as a gap at the join, and fills it
    in the background per §6.6.
 
-Faster room joins (MSC3706 partial state / MSC3902) are designed for on the
-receive side, and not yet built: the room would be usable with partial state,
-marked `partial_state`, with the remaining state resynced in the background and
-membership-dependent operations blocking only until the relevant slice of state
-has arrived. Nothing handles `members_omitted` today; `docs/mscs.md` records
-MSC3706 as planned, and this paragraph is the design it will be built to.
+Faster room joins (MSC3706, spec v1.6) are built on both sides. Every remote
+join asks `send_join` for `omit_members`; a resident that answers
+`members_omitted` hands over the non-member state, the joiner's own member
+event and, in an unnamed room, the heroes', with `servers_in_room`. The join
+returns with the room marked partial (a persisted record), usable at once for
+reading and sending: this server's events also go to `servers_in_room`, and an
+incoming event takes a member slot the partial state lacks from its own,
+already verified auth events. Membership-dependent operations wait instead:
+`/members`, `/joined_members` and a membership change aimed at another
+server's user. A background resync asks the joined-through server, then the
+others, for `/state_ids` at the join, fetches what it lacks (one `/state` when
+that is a tenth or more), verifies and authorizes it, and fills the missing
+member slots of every snapshot from the join on in place, in one batch. An
+incremental `/sync` spanning the resync tells its client the room afresh, and
+a sync's state block carries any slot of the current state that neither the
+state before its window nor an event in it set -- the filled members, when the
+history before the join has not been backfilled. A restart resumes an
+unfinished resync. As a resident, Spindle serves
+`omit_members` the way Synapse does. `docs/divergence.md` §4.9 records where
+the joining side differs from Synapse's.
 
 ### 11.6 Room versions
 
@@ -1363,10 +1450,30 @@ dropping `li < X` for a room is a range delete plus a mark-and-sweep over
 There is no state-group compaction job, which removes an entire class of
 operator toil.
 
+**Status.** The truncation primitive is built (#817). `truncate_room_log`
+records a chain checkpoint `(floor, chain[floor - 1])` in its own keyspace,
+then deletes the log entries, bodies, stream rows, state-delta rows, relation rows and old
+membership rows below the floor. A load, `load_exhaustive` and `spindle
+verify` start the chain from the checkpoint (§5.3). The entries of the
+current state and of the parents of kept entries stay, without a chain
+value, and so do the bodies in the auth chain of kept events. `spindle gc`
+frees the state nodes that only the removed roots used. The floor never
+passes the head, an extremity or a gap anchor, and a room in hub mode, in a
+partial-state join or with a fork is left alone. The `[retention]` policy
+(off by default) and the room's `m.room.retention` event (MSC1763) set a
+maximum lifetime for each room, and a background job truncates each room
+below the events that lifetime has expired. The server limits clamp the
+room's choice. `purge_history` truncates when it is sent `"truncate": true`
+and otherwise deletes only bodies. Media retention is not built.
+
 ---
 
 ## 15. Concurrency and process model
 
+- **Status.** The next two points are the design, not the code. The server
+  has one lock for each open room, a registry lock and several shared maps,
+  and request handlers run on the Tokio pool. Rooms have no executors of
+  their own.
 - **Rooms shard by `hash(room_id) % N`** across `N` executors, `N` = available
   cores. Each executor is a single-threaded async task owning its rooms'
   mutable state: head, state root, hot tail, subscriber list.
@@ -1445,7 +1552,7 @@ implements them, and G1 (unmodified existing clients) forbids depending on them.
 
 Single TOML file, no external dependencies required for a default deployment
 (embedded store, embedded media, no separate cache tier). Explicit knobs for
-everything this document names a default for: `max_fork_window`,
+everything this document names a default for:
 `durability`, `hot_tail_len`, `presence.enabled`, `shard_count`,
 `hub_failover_timeout`, retention.
 
@@ -1529,10 +1636,17 @@ measurements. They exist so the design can be falsified.
 ### 18.4 Presence
 
 Presence is the single largest source of federation traffic in the Matrix
-network and delivers little. It is **off by default**, configurable, and when
-enabled is rate-limited and coalesced per destination. This is a policy choice,
-stated explicitly because it materially affects the numbers above and because
-operators deserve to know it was deliberate.
+network and delivers little. It is switchable (`[presence] enabled`), and on
+by default because clients render an online indicator and Synapse ships it
+on; an operator who would rather not carry the traffic turns it off, and the
+server then answers `PUT /presence` without storing it, sends no `presence`
+section in `/sync`, and neither sends nor applies `m.presence`. When on, a
+change is announced only to servers sharing a room with the user, a sync's
+activity rewrites the row at most once a minute, and only visible changes
+(state, message, currently-active) take a stream position or an EDU. The
+EDUs ride the ephemeral queue one per change; they are not yet coalesced per
+destination, which is the next step if the volume measured by
+`spindle_federation_edus_sent_total{edu_type="m.presence"}` calls for it.
 
 ---
 
@@ -1637,15 +1751,15 @@ forward extremities.
 
 | # | Risk | Assessment / mitigation |
 |---|---|---|
-| R1 | **Case-3 forks are more common than assumed.** If real federation produces frequent conflicting concurrent state changes, the exception path becomes the normal path. | Instrumented from day one (§17.2). The window cap bounds the worst case to correct-but-slow, never incorrect. If the assumption is wrong, the design degrades to a well-optimized DAG server — still a net improvement, but the headline claim would need retracting. |
+| R1 | **Case-3 forks are more common than assumed.** If real federation produces frequent conflicting concurrent state changes, the exception path becomes the normal path. | Instrumented from day one (§17.2). The exception path is the room version's resolver (§9.2, ADR 0005), so a frequent case 3 is slower, never incorrect: parents with equal state roots skip it, and its results are cached by input roots, so the merging send, current state and a peer's event over the same tips pay for one resolution. If the assumption is wrong, the design degrades to a well-optimized DAG server — still a net improvement, but the headline claim would need retracting. |
 | R2 | **Hub liveness.** A partitioned participant cannot send. DAG Matrix can. | Explicit trade (§13.1). Failover in 60 s (§13.2); clients already retry sends. Deployments that require partition-tolerant writes should keep class-D rooms. |
-| R3 | **`max_fork_window` overflow.** A long partition with a busy legacy peer exceeds the cap. | Falls back to full spec state resolution over the affected range. Correct, slow, logged, alerted. |
+| R3 | **A deep fork.** A long partition with a busy legacy peer leaves a fork far deeper than usual. | There is no fork-window cap and no fallback (ADR 0005): resolution takes the parents' whole states, which every entry addresses by root (§6), at any depth. Depth costs the auth-difference walk and store reads for states older than `resident_window`; `RoomLog::fork_window` is diagnostic only. Every resolution is counted (`spindle_fork_resolutions_total{case="3"}`) and logged with its duration. |
 | R4 | **Pre-rendered `client_json` doubles event storage and must be regenerated when spec rendering changes.** | Versioned; regeneration is a background range scan. Storage is the cheapest resource in the system. |
 | R5 | **Spec drift.** Matrix moves; a from-scratch server must keep up. | Ruma tracks the spec and is used by multiple servers; Complement is the gate. Budget continuous spec-tracking work, not a one-time implementation. |
 | R6 | **Client dependence on Synapse-specific behavior** not covered by the spec. | §19.3 finds it empirically; each instance is a Spindle bug. This is the historical failure mode for every alternative homeserver and should be assumed to cost real time. |
 | R7 | **MSC3995 and MSC4244 are unstable and may change.** | Gated behind Cargo features and unstable prefixes; nothing in the v1 critical path depends on them (native rooms are plain v11). |
 | R8 | **Single-node scale ceiling.** | v1 targets vertical scale. The shard-by-room design admits horizontal partitioning, but cross-node room migration and a distributed stream watermark are genuine v2 work, not a config flag. |
-| R9 | **The equivalence theorem (§9.3) is wrong in some edge case.** | §19.2 tests it against the reference implementation continuously. A counterexample is a release blocker, not a bug report. |
+| R9 | **The live resolver disagrees with the reference algorithm in some edge case.** `RoomResolver` computes the auth difference and v2.1's conflicted subgraph itself and caches by input roots (§9.2); a mistake in either diverges from peers. | §19.2 tests it against ruma over full auth chains in every room-version family, and the partition tests and Complement compare its result with other servers'. A counterexample is a release blocker, not a bug report. |
 
 ---
 

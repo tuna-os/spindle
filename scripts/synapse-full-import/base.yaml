@@ -66,7 +66,7 @@ spec:
     seccompProfile: {type: RuntimeDefault}
   containers:
   - name: shell
-    image: rust:1.94-bookworm
+    image: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
     command: [sleep, infinity]
     securityContext:
       allowPrivilegeEscalation: false

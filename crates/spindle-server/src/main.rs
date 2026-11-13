@@ -1,5 +1,8 @@
 //! The `spindle` binary.
 
+mod migrate_command;
+
+use migrate_command::migrate;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +70,10 @@ async fn main() -> ExitCode {
         }
     }
 
+    if let Some(code) = mas_import_command() {
+        return code;
+    }
+
     // `spindle promote-admin <config> <localpart>` — the offline path
     // that mints the FIRST admin (#83). Every later admin is granted
     // through the API by an existing one, which keeps the grant in the
@@ -128,25 +135,214 @@ async fn main() -> ExitCode {
         };
         return verify_media(&config_path).await;
     }
-    // `spindle migrate <config> [--dry-run]` -- move a store forward to the
-    // schema this binary speaks (#20).
-    //
-    // Its own command rather than something the server does on start. An
-    // upgrade that rewrites the store the moment a new binary boots is the
-    // change an operator cannot back out of: by the time they know it
-    // happened, the old bytes are gone. So `open` refuses and names this,
-    // and the rewrite waits for somebody to ask -- having had the chance to
-    // take a backup first.
-    if std::env::args().nth(1).as_deref() == Some("migrate") {
-        let Some(config_path) = std::env::args().nth(2) else {
-            eprintln!("usage: spindle migrate <config> [--dry-run]");
-            return ExitCode::FAILURE;
-        };
-        let dry_run = std::env::args().any(|argument| argument == "--dry-run");
-        return migrate(&config_path, dry_run);
+    if let Some(code) = store_maintenance_command() {
+        return code;
     }
 
     serve().await
+}
+
+/// The commands that rewrite the store in place, offline: `migrate` and
+/// `gc`. `None` when the command is neither.
+fn store_maintenance_command() -> Option<ExitCode> {
+    let command = std::env::args().nth(1)?;
+    match command.as_str() {
+        // `spindle migrate <config> [--dry-run] [--progress text|json]` and
+        // `spindle migrate --list [<config>]` -- move a store forward to
+        // the schema this binary speaks (#20), or say which steps that
+        // takes.
+        //
+        // Its own command rather than something the server does on start.
+        // An upgrade that rewrites the store the moment a new binary boots
+        // is the change an operator cannot back out of: by the time they
+        // know it happened, the old bytes are gone. So `open` refuses and
+        // names this, and the rewrite waits for somebody to ask -- having
+        // had the chance to take a backup first.
+        "migrate" => Some(migrate(&std::env::args().skip(2).collect::<Vec<_>>())),
+        // `spindle gc <config> [--dry-run]` -- delete the state-trie nodes
+        // no stored root reaches (#742). Offline for the reason the
+        // collector's module docs give: a sweep racing an append can delete
+        // a node the append has just made live again. Opening the store
+        // takes the engine's directory lock, so a running server refuses it.
+        "gc" => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            Some(gc_command(&args))
+        }
+        // `spindle verify <config>` -- check every room exhaustively and
+        // exit non-zero when anything is wrong (#818). Offline like `gc`:
+        // opening the store takes the directory lock.
+        "verify" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle verify <config>");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(verify(&config_path))
+        }
+        // `spindle reindex-search <config>` -- rebuild the `/search` word
+        // index from the log (#830). Offline like `verify`.
+        "reindex-search" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle reindex-search <config>");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(reindex_search(&config_path))
+        }
+        _ => None,
+    }
+}
+
+/// Rebuild every room's search index from its log.
+fn reindex_search(config_path: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_server::search_index::reindex(&store) {
+        Ok(report) => {
+            println!(
+                "reindex-search: {} rooms, {} log entries, {} index rows written",
+                report.rooms, report.entries, report.rows
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("reindex-search: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Check every room's records, chain and state roots.
+fn verify(config_path: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_store::verify::verify_store(&store) {
+        Ok(report) => {
+            println!(
+                "verify: {} rooms, {} log entries checked",
+                report.rooms, report.entries
+            );
+            if report.unverified_rooms > 0 {
+                println!(
+                    "verify: {} rooms hold backfilled state that is not re-derivable here (expected)",
+                    report.unverified_rooms
+                );
+            }
+            for (room, error) in &report.problems {
+                eprintln!("verify: {room}: {error}");
+            }
+            if report.is_intact() {
+                println!("verify: the store is intact");
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("verify: {} rooms have problems", report.problems.len());
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("verify: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// `concat!` of whole lines, not a `\` continuation: a continuation drops the
+// next line's leading spaces, which flattened the option list.
+const GC_USAGE: &str = concat!(
+    "usage: spindle gc <config> [--dry-run] [--max-marks N]\n",
+    "  Deletes state-trie nodes that no stored record reaches. The server must be stopped.\n",
+    "  --dry-run      report what would be deleted and delete nothing\n",
+    "  --max-marks N  hold at most N reachable-node addresses in memory (default 4194304,\n",
+    "                 about 200 MB); the rest go to a scratch database next to the store,\n",
+    "                 removed when the run ends. The result does not depend on N.",
+);
+
+/// Parse `gc`'s arguments and run it.
+fn gc_command(args: &[String]) -> ExitCode {
+    let mut config_path = None;
+    let mut dry_run = false;
+    let mut max_marks = spindle_store::gc::DEFAULT_MAX_MARKS;
+    let mut iter = args.iter();
+    while let Some(argument) = iter.next() {
+        match argument.as_str() {
+            "--dry-run" => dry_run = true,
+            "--max-marks" => match iter.next().and_then(|value| value.parse::<usize>().ok()) {
+                Some(value) if value > 0 => max_marks = value,
+                _ => {
+                    eprintln!("{GC_USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--help" | "-h" => {
+                println!("{GC_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with('-') && config_path.is_none() => {
+                config_path = Some(other.to_owned());
+            }
+            _ => {
+                eprintln!("{GC_USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(config_path) = config_path else {
+        eprintln!("{GC_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    gc(&config_path, dry_run, max_marks)
+}
+
+/// Collect the store's unreachable state-trie nodes, or with `dry_run`
+/// count them.
+fn gc(config_path: &str, dry_run: bool, max_marks: usize) -> ExitCode {
+    let Some((store, config)) = open_store_with_config(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    // Beside the store, not in the system temp directory: the spill can
+    // reach gigabytes and the store's disk is the one sized for that.
+    let mut scratch = config.storage.path.clone().into_os_string();
+    scratch.push(".gc-scratch");
+    let options = spindle_store::gc::GcOptions {
+        max_marks,
+        scratch: Some(scratch.into()),
+    };
+    match spindle_store::gc::collect_state_nodes_with(&store, dry_run, &options) {
+        Ok(report) => {
+            println!(
+                "gc: {} root-holding rows; {} reachable state nodes ({} bytes, {} node reads)",
+                report.holders, report.marked, report.marked_bytes, report.node_reads
+            );
+            println!(
+                "gc: at most {} marked addresses in memory, {} spilled to disk",
+                report.peak_marked, report.spilled
+            );
+            let verb = if dry_run { "would sweep" } else { "swept" };
+            println!(
+                "gc: {verb} {} unreachable state nodes ({} bytes)",
+                report.swept, report.swept_bytes
+            );
+            if report.dropped_cache_rows > 0 {
+                println!(
+                    "gc: {} unreadable current-state cache rows {}",
+                    report.dropped_cache_rows,
+                    if dry_run {
+                        "would be dropped"
+                    } else {
+                        "dropped"
+                    }
+                );
+            }
+            if dry_run {
+                println!("gc: dry run, nothing deleted");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gc: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Split a comma-separated command-line list, dropping empty entries.
@@ -188,6 +384,123 @@ fn rehearsal_password(localpart: &str) -> Result<String, String> {
         return Err(format!("the rehearsal password for {localpart} is empty"));
     }
     Ok(password)
+}
+
+/// `spindle import-mas <config> --mas-database <postgres> [--mas-config
+/// <file>] [--dry-run]` -- carry MAS's accounts into the built-in provider
+/// (#797); see `import_mas`. `None` for any other command.
+fn mas_import_command() -> Option<ExitCode> {
+    if std::env::args().nth(1).as_deref() != Some("import-mas") {
+        return None;
+    }
+    #[cfg(feature = "mas-import")]
+    {
+        let arguments: Vec<String> = std::env::args().skip(2).collect();
+        // The postgres client runs a runtime of its own, which must not
+        // start inside this one.
+        Some(
+            if let Ok(code) = std::thread::spawn(move || import_mas(&arguments)).join() {
+                code
+            } else {
+                eprintln!("spindle: MAS import worker panicked");
+                ExitCode::FAILURE
+            },
+        )
+    }
+    #[cfg(not(feature = "mas-import"))]
+    {
+        eprintln!("spindle: rebuild with --features mas-import to use this command");
+        Some(ExitCode::FAILURE)
+    }
+}
+
+#[cfg(feature = "mas-import")]
+const IMPORT_MAS_USAGE: &str = "usage: spindle import-mas <config> --mas-database <postgres> \
+    [--mas-config <MAS config.yaml>] [--dry-run]";
+
+/// `spindle import-mas`: carry MAS's users, passwords, addresses, upstream
+/// links, admin flags and locks into the store (#797), offline.
+///
+/// * `--mas-database`: MAS's `PostgreSQL`, as a URL or key=value string.
+///   The password may come from `SPINDLE_MAS_DB_PASSWORD` instead.
+/// * `--mas-config`: the `config.yaml` MAS runs with. Its
+///   `passwords.schemes` say how each stored hash was made, secrets
+///   (peppers) included; without it MAS's default scheme is assumed.
+/// * `--dry-run`: decide and count everything, write nothing.
+///
+/// The JSON report goes to stdout. The exit is non-zero when anything MAS
+/// has was refused, so a script can tell a clean import from one that
+/// needs a look.
+#[cfg(feature = "mas-import")]
+fn import_mas(arguments: &[String]) -> ExitCode {
+    use spindle_server::import::mas;
+    let mut positional = Vec::new();
+    let (mut database, mut mas_config, mut dry_run) = (None, None, false);
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--mas-database" => database = rest.next(),
+            "--mas-config" => mas_config = rest.next(),
+            "--dry-run" => dry_run = true,
+            _ => positional.push(argument),
+        }
+    }
+    let ([config_path], Some(database)) = (positional.as_slice(), database) else {
+        eprintln!("{IMPORT_MAS_USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let schemes = match mas_config {
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|error| format!("{path}: {error}"))
+            .and_then(|yaml| mas::Schemes::from_mas_config(&yaml))
+        {
+            Ok(schemes) => schemes,
+            Err(error) => {
+                eprintln!("spindle: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => mas::Schemes::default(),
+    };
+    let Some((store, config)) = open_store_with_config(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    let password = std::env::var("SPINDLE_MAS_DB_PASSWORD").ok();
+    let snapshot = match mas::postgres::connect_no_tls(database, password.as_deref())
+        .and_then(|mut client| mas::postgres::read(&mut client))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match mas::apply(&store, &config, &snapshot, &schemes, dry_run) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("spindle: MAS import stopped: {error}; run it again to continue");
+            return ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) => println!("{text}"),
+        Err(error) => {
+            eprintln!("spindle: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if dry_run {
+        eprintln!("spindle: dry run, nothing written");
+    }
+    if report.refused.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "spindle: {} item(s) refused; see \"refused\" in the report",
+            report.refused.len()
+        );
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(feature = "synapse-import")]
@@ -676,64 +989,6 @@ fn import_synapse_rehearsal(
     ExitCode::SUCCESS
 }
 
-/// Move a store forward to the schema this binary speaks.
-fn migrate(config_path: &str, dry_run: bool) -> ExitCode {
-    let config = match Config::load(config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("cannot read {config_path}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Unchecked on purpose: the store this is being run on is one the
-    // ordinary open has already refused.
-    let store = match spindle_store::FjallStore::open_unchecked(&config.storage.path) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("cannot open store: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let report =
-        match spindle_store::migrate::run(&store, spindle_store::migrate::MIGRATIONS, dry_run) {
-            Ok(report) => report,
-            Err(error) => {
-                eprintln!("migrate: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-    if report.steps.is_empty() {
-        println!("migrate: the store is already at this binary's schema");
-        return ExitCode::SUCCESS;
-    }
-    // The irreversibility notice comes first, and on a dry run it is the
-    // whole point of the exercise: the operator is being told what they
-    // cannot undo while they can still choose not to do it.
-    if report.irreversible() {
-        println!(
-            "migrate: this plan CANNOT be undone -- going back means restoring \
-             a backup taken before it runs"
-        );
-    }
-    for (summary, reversible, rows) in &report.steps {
-        let note = match reversible {
-            spindle_store::migrate::Reversible::Yes => "reversible",
-            spindle_store::migrate::Reversible::No => "IRREVERSIBLE",
-        };
-        if dry_run {
-            println!("migrate: would apply [{note}] {summary}");
-        } else {
-            println!("migrate: applied [{note}] {summary} ({rows} rows)");
-        }
-    }
-    if dry_run {
-        println!("migrate: dry run, nothing written");
-    } else {
-        println!("migrate: done, store is now at this binary's schema");
-    }
-    ExitCode::SUCCESS
-}
-
 /// Run the server itself, which is what every argument form above declines
 /// to do.
 async fn serve() -> ExitCode {
@@ -750,11 +1005,7 @@ async fn serve() -> ExitCode {
         }
     };
 
-    let filter = config
-        .logging
-        .filter
-        .clone()
-        .unwrap_or_else(|| "info".to_owned());
+    let filter = config.logging.filter_directive().to_owned();
     let tracer_provider = match init_logging(&config, filter) {
         Ok(provider) => provider,
         Err(code) => return code,
@@ -779,6 +1030,7 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let periodic_sync = apply_durability(&store, &config.storage);
 
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
@@ -798,6 +1050,8 @@ async fn serve() -> ExitCode {
     };
 
     tracing::info!("spindle listening on {bind} as {name}");
+    warn_if_proxy_unset(&bind, &config.server.trusted_proxies);
+    warn_if_registration_open(&config, &bind);
     // The key is established before the listener accepts anything. A server
     // that binds and then discovers it cannot sign has already told a client it
     // was ready to take events it cannot create.
@@ -860,6 +1114,7 @@ async fn serve() -> ExitCode {
             tracing::error!("federation listener did not stop cleanly: {error}");
         }
     }
+    drop(periodic_sync);
     close_store(store).await;
     flush_traces(tracer_provider);
     match served {
@@ -922,6 +1177,18 @@ fn flush_traces(provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>) {
     {
         tracing::warn!("trace exporter did not flush: {error}");
     }
+}
+
+/// Apply `[storage] durability` to the open store, and start the timer
+/// that `relaxed` promises. The guard syncs once more when dropped, so keep
+/// it until just before the store closes.
+fn apply_durability(
+    store: &Arc<FjallStore>,
+    storage: &spindle_server::config::StorageConfig,
+) -> Option<spindle_store::PeriodicSync> {
+    store.set_durability(storage.durability.into());
+    (storage.durability == spindle_server::config::DurabilityMode::Relaxed)
+        .then(|| store.spawn_periodic_sync(Duration::from_millis(storage.relaxed_sync_interval_ms)))
 }
 
 /// Close the store here, on the thread that opened it, once nothing else
@@ -1086,11 +1353,12 @@ fn promote_admin(config_path: &str, localpart: &str) -> ExitCode {
 }
 
 /// The credential commands, offline against the store:
-/// `spindle set-password-hash <config> [<localpart>]` stores Argon2 PHC
-/// hashes computed elsewhere (#611), read from stdin so they never sit in a
-/// process listing or shell history (with a localpart, stdin is that
-/// account's one hash; without, each line is `<localpart> <hash>`, the bulk
-/// path a MAS migration takes); and `spindle issue-reset-link <config>
+/// `spindle set-password-hash <config> [<localpart>]` stores Argon2 PHC or
+/// bcrypt hashes computed elsewhere (#611), read from stdin so they never
+/// sit in a process listing or shell history (with a localpart, stdin is
+/// that account's one hash; without, each line is `<localpart> <hash>`;
+/// a MAS migration takes `import-mas`, which also carries each hash's
+/// scheme); and `spindle issue-reset-link <config>
 /// <localpart> [--ttl 24h]` prints a password-reset link for a server that
 /// sends no mail (the running server's equivalent is the admin API's
 /// `reset_link`). `None` when the command is neither.
@@ -1275,18 +1543,13 @@ fn backup(config_path: &str, file: &str) -> ExitCode {
         eprintln!("spindle: {file} already exists — refusing to overwrite a backup");
         return ExitCode::FAILURE;
     }
-    let mut out = match std::fs::File::create(path) {
-        Ok(file) => std::io::BufWriter::new(file),
-        Err(error) => {
-            eprintln!("spindle: cannot write {file}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     // Through a snapshot: every row from one moment, so the backup cannot
     // hold metadata that trails its own log.
     let snapshot = spindle_store::Store::snapshot(&store);
     let view: &dyn spindle_store::ReadView = snapshot.as_deref().unwrap_or(&store);
-    match spindle_store::backup::write_backup(view, &mut out) {
+    // Synced and renamed into place, so "wrote" is true of the disk and a
+    // failure leaves no partial file to block the retry (#812).
+    match spindle_store::backup::write_backup_file(view, path) {
         Ok(rows) => {
             println!("wrote {rows} rows to {file}");
             ExitCode::SUCCESS
@@ -1317,20 +1580,41 @@ async fn restore(config_path: &str, file: &str) -> ExitCode {
     // Counting that as content would refuse every restore, including the only
     // one that is supposed to work.
     let marker = spindle_core::keys::store_marker();
-    match spindle_store::ReadView::scan_prefix(store.as_ref(), &[]) {
-        Ok(rows) => {
-            let existing = rows.iter().filter(|(key, _)| *key != marker).count();
-            if existing > 0 {
-                eprintln!(
-                    "spindle: the store already holds {existing} rows — restore into \
-                     an empty store, so the result is the backup rather than a merge \
-                     of the two"
-                );
+    // A probe that stops at the first row of data, not a scan that copies the
+    // store into memory to count it (#811).
+    let mut found = false;
+    let probed = spindle_store::ReadView::visit_prefix(store.as_ref(), &[], &mut |key, _| {
+        if key == marker.as_slice() {
+            return Ok(());
+        }
+        found = true;
+        // Stops the scan; `found` is the answer.
+        Err(spindle_store::StoreError::Backend("probe done".to_owned()))
+    });
+    if !found && let Err(error) = probed {
+        eprintln!("spindle: cannot read the store: {error}");
+        return ExitCode::FAILURE;
+    }
+    if found {
+        eprintln!(
+            "spindle: the store already holds data — restore into an empty \
+             store, so the result is the backup rather than a merge of the two"
+        );
+        return ExitCode::FAILURE;
+    }
+    // The file is read twice. The first pass checks it end to end and writes
+    // nothing, so a truncated or altered backup is refused while the target
+    // is still empty (#811).
+    match std::fs::File::open(file) {
+        Ok(handle) => {
+            let mut reader = std::io::BufReader::new(handle);
+            if let Err(error) = spindle_store::backup::verify_backup(&mut reader) {
+                eprintln!("spindle: {file} is not a usable backup, nothing was restored: {error}");
                 return ExitCode::FAILURE;
             }
         }
         Err(error) => {
-            eprintln!("spindle: cannot read the store: {error}");
+            eprintln!("spindle: cannot read {file}: {error}");
             return ExitCode::FAILURE;
         }
     }
@@ -1655,5 +1939,39 @@ fn shutdown() -> impl Future<Output = ()> {
             let _ = signal::ctrl_c().await;
             tracing::info!("interrupted, draining");
         }
+    }
+}
+
+fn warn_if_registration_open(config: &Config, bind: &str) {
+    if !config.open_registration_exposed() {
+        return;
+    }
+    // Recommending the token is deliberate: it is the only control that
+    // lets an operator choose who joins. A CAPTCHA only slows bots, so it
+    // gets its own wording and does not silence the warning.
+    let advice = if config.registration.captcha.is_some() {
+        "the CAPTCHA slows bots, but anyone can still register. Set [registration] \
+         require_token = true to choose who joins"
+    } else {
+        "anyone can create accounts and use this server's storage. Set [registration] \
+         require_token = true (recommended), or set [registration.captcha] to slow bots"
+    };
+    tracing::warn!(
+        "registration is open to anyone who can reach {bind}: {advice}. A loopback bind \
+         behind a proxy that limits sign-ups is also safe"
+    );
+}
+
+/// A loopback listener almost always sits behind a reverse proxy, and then
+/// every client's source limit is the proxy's (#831).
+fn warn_if_proxy_unset(bind: &str, trusted: &[spindle_server::client_addr::TrustedProxy]) {
+    let loopback = bind
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback());
+    if loopback && trusted.is_empty() {
+        tracing::warn!(
+            "listening on loopback with no [server] trusted_proxies: behind a reverse proxy \
+             all clients share one source address and one login and registration limit"
+        );
     }
 }

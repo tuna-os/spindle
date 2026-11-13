@@ -1,0 +1,20 @@
+# Element Call specs Spindle must pass with its built-in LiveKit minter in
+# the first seat and upstream's Synapse and lk-jwt-service in the second
+# (#796, #795): run.sh with SPINDLE_RTC=builtin SPINDLE_PEER=synapse,
+# checked by scripts/element-call-check.py like allowlist-synapse-peer.txt.
+#
+# Each entry names the run that recorded it passing.
+#
+# Recorded on workflow run 42315846545 (element-call pin 9f7c35c,
+# chromium): seven of seven. Calls in both directions and both membership
+# modes, with the Spindle user minted by the built-in minter and the
+# Synapse user subscribing to Spindle's SFU on a token the minter
+# confirmed over federation; and the DM rings, including the one past
+# three dead servers.
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Spindle, callee on Synapse (2_0)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Spindle, callee on Synapse (compat)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Synapse, callee on Spindle (2_0)
+spindle/synapse-peer-call.spec.ts :: Federated call, caller on Synapse, callee on Spindle (compat)
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Spindle rings Synapse in time and connects
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Spindle rings Synapse in time with three dead servers in the room
+spindle/synapse-peer-ring.spec.ts :: DM call across federation, Synapse rings Spindle in time and connects

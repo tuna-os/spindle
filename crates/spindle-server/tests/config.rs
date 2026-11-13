@@ -230,6 +230,28 @@ fn the_shipped_example_parses() {
     );
 }
 
+/// The Element Call rig's seats (contrib/element-call/) run only on a
+/// Docker host in CI, an hour into a nightly job; a config that does not
+/// parse would surface there as a homeserver that never answered. Every
+/// seat's config is parsed here instead.
+#[test]
+fn the_element_call_rig_configs_parse() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contrib/element-call");
+    let mut seats = 0;
+    for entry in std::fs::read_dir(dir).expect("the rig directory exists") {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let text = std::fs::read_to_string(&path).unwrap();
+            parse(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            seats += 1;
+        }
+    }
+    assert!(seats >= 4, "both seats, in both minter variants: {seats}");
+}
+
 /// #36 asks for both delayed-event caps to be "rejected loudly". A zero is
 /// the case worth naming: it reads like "no limit" and means the opposite,
 /// so a server that accepted it would start with the dead-man's switch
@@ -310,6 +332,69 @@ fn a_zero_ring_budget_is_refused_and_the_default_is_ten() {
     assert!(rendered.contains("refuses every ring"), "{rendered}");
     let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
     assert_eq!(config.ratelimit.rings_per_minute, 10);
+}
+
+/// The write budgets (#741) default to Synapse's numbers, take an
+/// operator's own, and refuse a budget that would refuse everything.
+#[test]
+fn write_budgets_default_to_synapse_and_refuse_an_empty_bucket() {
+    let config = parse("[server]\nname = \"example.org\"\n").expect("no section is fine");
+    assert_eq!(
+        config.ratelimit.messages,
+        spindle_server::config::Rate::new(0.2, 10)
+    );
+    assert_eq!(
+        config.ratelimit.joins_remote,
+        spindle_server::config::Rate::new(0.01, 10)
+    );
+    assert_eq!(config.media.max_bytes_per_user, None, "no quota by default");
+
+    let config = parse(
+        "[server]\nname = \"example.org\"\n[ratelimit]\n\
+         messages = { per_second = 5.0, burst = 100 }\n\
+         [media]\nmax_bytes_per_user = 1024\n",
+    )
+    .expect("an operator's numbers are taken");
+    assert_eq!(
+        config.ratelimit.messages,
+        spindle_server::config::Rate::new(5.0, 100)
+    );
+    assert_eq!(config.media.max_bytes_per_user, Some(1024));
+
+    for (budget, field) in [
+        (
+            "invites_per_target = { per_second = 1.0, burst = 0 }",
+            "ratelimit.invites_per_target",
+        ),
+        (
+            "room_creation = { per_second = 0.0, burst = 5 }",
+            "ratelimit.room_creation",
+        ),
+        (
+            "media_uploads = { per_second = -1.0, burst = 5 }",
+            "ratelimit.media_uploads",
+        ),
+        (
+            "joins_local = { per_second = nan, burst = 5 }",
+            "ratelimit.joins_local",
+        ),
+        (
+            "joins_remote = { per_second = 1e-300, burst = 5 }",
+            "ratelimit.joins_remote",
+        ),
+    ] {
+        let error = parse(&format!(
+            "[server]\nname = \"example.org\"\n[ratelimit]\n{budget}\n"
+        ))
+        .expect_err(budget);
+        assert!(error.to_string().contains(field), "{budget}: {error}");
+    }
+    let error = parse("[server]\nname = \"example.org\"\n[media]\nmax_bytes_per_user = 0\n")
+        .expect_err("a zero quota refuses every upload");
+    assert!(
+        error.to_string().contains("media.max_bytes_per_user"),
+        "{error}"
+    );
 }
 
 /// `[rooms]` (#626): Synapse's defaults without the section, and a
@@ -503,8 +588,32 @@ fn the_builtin_issuer_can_live_on_its_own_host() {
     }
 }
 
+/// #609: a reverse proxy may publish the provider under a path; the path
+/// is kept in the advertised base and is what the routes are served under.
 #[test]
-fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
+fn the_builtin_issuer_can_live_under_a_path() {
+    for issuer in ["https://example.org/auth/", "https://example.org/auth"] {
+        let config = parse(&format!(
+            "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\noidc_issuer = \"{issuer}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.oidc_issuer_base(), "https://example.org/auth");
+        assert_eq!(config.oidc_issuer_path(), "/auth");
+    }
+    let config = parse(
+        "[server]\nname = \"example.org\"\npublic_base_url = \"https://example.org/matrix\"\n\
+         [auth]\nbuiltin_oidc = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.oidc_issuer_path(),
+        "",
+        "no configured issuer, no path: the routes stay where they were"
+    );
+}
+
+#[test]
+fn a_builtin_issuer_must_be_a_servable_url_of_an_enabled_provider() {
     for (auth, why) in [
         (
             "oidc_issuer = \"https://auth.example.org/\"\n",
@@ -515,8 +624,16 @@ fn a_builtin_issuer_must_be_an_origin_of_an_enabled_provider() {
             "not a URL",
         ),
         (
-            "builtin_oidc = true\noidc_issuer = \"https://example.org/auth/\"\n",
-            "a path",
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/account/\"\n",
+            "a path that is one of the provider's own routes",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/_matrix/\"\n",
+            "a path inside the Matrix API",
+        ),
+        (
+            "builtin_oidc = true\noidc_issuer = \"https://example.org/a/../b\"\n",
+            "a dot segment",
         ),
         (
             "builtin_oidc = true\noidc_issuer = \"https://example.org/?x=1\"\n",
@@ -616,4 +733,68 @@ fn the_smtp_password_can_come_from_a_file() {
         config.email.unwrap().resolve_password().unwrap(),
         "from-a-file"
     );
+}
+
+fn upstream(issuer: &str, extra: &str) -> Result<Config, ConfigError> {
+    parse(&format!(
+        "[server]\nname = \"example.org\"\n[auth]\nbuiltin_oidc = true\n\
+         [[auth.upstream_oidc]]\nid = \"sso\"\nissuer = \"{issuer}\"\nclient_id = \"c\"\n\
+         client_secret = \"s\"\n{extra}"
+    ))
+}
+
+/// #610 review: an upstream's discovery, keys and token answer decide who
+/// signs in, so they travel over TLS — plain http only on loopback, or
+/// when the operator says so for a test rig.
+#[test]
+fn an_upstream_issuer_is_https_unless_loopback_or_explicitly_insecure() {
+    assert!(upstream("https://sso.example.org", "").is_ok());
+    for loopback in [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080/realm",
+        "http://[::1]:9000",
+    ] {
+        assert!(upstream(loopback, "").is_ok(), "{loopback}");
+    }
+    let error = upstream("http://sso.example.org", "").expect_err("plain http off loopback");
+    assert!(error.to_string().contains("insecure_http"), "{error}");
+    assert!(upstream("http://sso.example.org", "insecure_http = true\n").is_ok());
+}
+
+/// #610 review: `email_verified` speaks for the `email` claim only, so
+/// there is no setting that reads an address from another claim.
+#[test]
+fn an_upstream_email_claim_cannot_be_redirected() {
+    assert!(upstream("https://sso.example.org", "email_claim = \"mail\"\n").is_err());
+}
+
+#[test]
+fn storage_durability_defaults_to_group_and_takes_the_three_modes() {
+    use spindle_server::config::DurabilityMode;
+    let config = parse("[server]\nname='example.org'\n").unwrap();
+    assert_eq!(config.storage.durability, DurabilityMode::Group);
+    assert_eq!(config.storage.relaxed_sync_interval_ms, 1000);
+    for (text, mode) in [
+        ("strict", DurabilityMode::Strict),
+        ("group", DurabilityMode::Group),
+        ("relaxed", DurabilityMode::Relaxed),
+    ] {
+        let config = parse(&format!(
+            "[server]\nname='example.org'\n[storage]\ndurability='{text}'\nrelaxed_sync_interval_ms=250\n"
+        ))
+        .unwrap();
+        assert_eq!(config.storage.durability, mode);
+        assert_eq!(config.storage.relaxed_sync_interval_ms, 250);
+    }
+    parse("[server]\nname='example.org'\n[storage]\ndurability='fast'\n")
+        .expect_err("an unknown mode is refused, not defaulted");
+    let error = parse("[server]\nname='example.org'\n[storage]\nrelaxed_sync_interval_ms=0\n")
+        .expect_err("a zero interval is refused");
+    assert!(matches!(
+        error,
+        ConfigError::Invalid {
+            field: "storage.relaxed_sync_interval_ms",
+            ..
+        }
+    ));
 }

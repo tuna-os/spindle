@@ -1,18 +1,21 @@
 name: Benchmarks
 
-# Published on every push to main, so the numbers in the open are the numbers
-# from the code on main rather than whatever was hand-copied into a document
-# the last time somebody remembered. A figure typed into prose is a claim with
-# nothing holding it to the code.
+# Published weekly from main (and on demand), so the numbers in the open are the
+# numbers from the code on main rather than whatever was hand-copied into a
+# document the last time somebody remembered. A figure typed into prose is a
+# claim with nothing holding it to the code. Not on every push: a full
+# `cargo bench` over the workspace cost about 15 job-minutes per merge, and the
+# page is a trend line, not a gate.
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'
   workflow_dispatch:
 
+# Read-only by default. Only the deploy job can write Pages (#521): the
+# measuring job runs `cargo bench` over every dependency's build script,
+# and none of that needs a token that can publish the site.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One publish at a time, and never cancel one half-done: a partially deployed
 # result set reads as "everything got fast".
@@ -28,11 +31,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Run the benchmark suite
         run: cargo bench --workspace --all-features
@@ -53,9 +58,8 @@ jobs:
           python3 scripts/render-benchmarks.py site/latest.json site/index.html \
             --repository "${GITHUB_REPOSITORY}"
 
-      # The coverage dashboard rides along on the same site: one push to main
-      # republishes both, so neither can describe a different commit than the
-      # other.
+      # The coverage dashboard rides along on the same site: one run republishes
+      # both, so neither can describe a different commit than the other.
       - name: Render the dashboard
         run: python3 scripts/coverage-dashboard.py --html site/dashboard.html
 
@@ -70,7 +74,7 @@ jobs:
       - name: Keep a per-commit copy
         run: cp site/latest.json "site/${GITHUB_SHA}.json"
 
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: site
 
@@ -80,9 +84,14 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: measure
     runs-on: ubuntu-24.04
+    # deploy-pages publishes the artifact and proves who it is with an
+    # OIDC token; that is all this job does.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        uses: actions/deploy-pages@v5.0.1

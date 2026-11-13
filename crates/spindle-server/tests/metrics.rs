@@ -185,15 +185,13 @@ async fn the_exposition_carries_what_the_counters_hold() {
     assert!(text.contains("spindle_build_info{version="), "{text}");
 }
 
-/// Case 3 is the number the design is judged by, so its counter is wired
-/// even though ingest cannot yet resolve it: bounded resolution lives in
-/// `spindle-core` but is not on the ingest path (#16). This asserts the
-/// wiring — the counter and its series exist and are reachable — so that
-/// #16's test has something to assert against when it lands.
+/// Case 3 is the number the design is judged by: an append whose parents'
+/// states differ, so the room version's resolver ran (ADR 0005). It is
+/// counted with the append that took it, and the series is exposed.
 #[test]
 fn the_contested_case_is_wired_and_visible() {
     let metrics = Metrics::new();
-    metrics.record_contested_state();
+    metrics.record_append(Origin::Local, ForkCase::StateContested);
     assert_eq!(metrics.fork_case_count(ForkCase::StateContested), 1);
     assert!(
         metrics
@@ -492,7 +490,7 @@ async fn a_blocked_sync_shows_up_as_a_subscriber() {
 
     // An initial sync returns at once — there is state to hand over, so
     // nothing waits. Only a sync from a known position with nothing new
-    // reaches wait_for_event, which is the thing being counted.
+    // reaches `Rooms::wait_past`, which is the thing being counted.
     let (status, body) = server
         .request(
             reqwest::Method::GET,

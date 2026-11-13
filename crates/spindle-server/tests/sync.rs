@@ -43,6 +43,24 @@ impl Harness {
         }
     }
 
+    /// A server whose per-account send budget does not interrupt a test that
+    /// has to put a long absence's worth of events in a room.
+    fn unlimited() -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let config = spindle_server::Config::parse(
+            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
+        )
+        .unwrap();
+        let app = spindle_server::app(config, Arc::clone(&store)).unwrap();
+        Self {
+            dir,
+            store,
+            app,
+            push_enabled: true,
+        }
+    }
+
     fn build(store: &Arc<FjallStore>, push_enabled: bool) -> axum::Router {
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"example.org\"\n[push]\nenabled = {push_enabled}\n"
@@ -183,6 +201,73 @@ fn page_bodies(page: &Value) -> Vec<String> {
         .filter_map(|event| event["content"]["body"].as_str())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+/// #820: an incremental sync gives the newest `timeline_limit` events, says
+/// it was limited, and carries what the skipped span changed in the state.
+/// It used to send every event since the token with `limited` false, so a
+/// client back after a week got a week of every room in one response.
+#[tokio::test]
+async fn a_long_absence_gets_the_newest_events_and_is_told_the_window_was_limited() {
+    let harness = Harness::unlimited();
+    let token = harness.register("alice").await;
+    let room_id = harness.create_room(&token).await;
+    let initial = harness.sync(&token, None).await;
+    let since = initial["next_batch"].as_str().unwrap().to_owned();
+
+    harness.say(&room_id, &token, "m00", "t00").await;
+    // A state change inside the span the sync will skip.
+    let (status, body) = harness
+        .put(
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"),
+            &token,
+            &json!({ "topic": "set while the client was away" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for number in 1..30 {
+        harness
+            .say(
+                &room_id,
+                &token,
+                &format!("m{number:02}"),
+                &format!("t{number:02}"),
+            )
+            .await;
+    }
+
+    let (status, body) = harness
+        .get(
+            &format!("/_matrix/client/v3/sync?since={since}&timeline_limit=5"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = &body["rooms"]["join"][&room_id];
+
+    assert_eq!(
+        bodies(room),
+        vec!["m25", "m26", "m27", "m28", "m29"],
+        "the newest five, oldest first: {room}"
+    );
+    assert_eq!(room["timeline"]["limited"], true, "{room}");
+
+    // The topic changed in the skipped span, so the block that is the state
+    // at the start of the window has to carry it: the timeline does not.
+    let state = room["state"]["events"].as_array().expect("a state block");
+    let topic = state
+        .iter()
+        .find(|event| event["type"] == "m.room.topic")
+        .unwrap_or_else(|| panic!("the skipped topic change is missing: {room}"));
+    assert_eq!(topic["content"]["topic"], "set while the client was away");
+
+    // And `prev_batch` pages back through the rest, ending at the first
+    // message sent since the token.
+    let from = room["timeline"]["prev_batch"].as_str().unwrap().to_owned();
+    let page = harness.messages_before(&room_id, &token, &from).await;
+    let earlier = page_bodies(&page);
+    assert_eq!(earlier.first().map(String::as_str), Some("m24"), "{page}");
+    assert!(earlier.iter().any(|body| body == "m00"), "{page}");
 }
 
 /// `/sync` said the window begins here (#331): what `/messages?dir=b`
@@ -696,6 +781,127 @@ async fn creating_a_room_wakes_an_existing_long_poll() {
         body["rooms"]["join"][&room_id].is_object(),
         "the created room was absent: {body}"
     );
+}
+
+/// The stream is server-global, so other users' news moves it too. A
+/// long-poll that answered every move handed its user empty responses, and
+/// matrix-rust-sdk sleeps a second before a sync that follows the last
+/// within a second: the room key its user's device was sent next waited
+/// that second out, and the encrypted messages fetched meanwhile stayed
+/// undecryptable (#705). The poll stays open through someone else's room
+/// message and someone else's to-device message, and answers with the one
+/// meant for it.
+#[tokio::test]
+async fn a_long_poll_waits_through_news_for_someone_else() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let (status, devices) = harness.get("/_matrix/client/v3/devices", &bob).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let bob_device = devices["devices"][0]["device_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, devices) = harness.get("/_matrix/client/v3/devices", &alice).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let alice_device = devices["devices"][0]["device_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let alices_room = harness.create_room(&alice).await;
+    let since = harness.sync(&bob, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            harness
+                .get(
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=30000"),
+                    &bob,
+                )
+                .await
+        })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&alices_room, &alice, "not for bob", "t1").await;
+    let (status, body) = harness
+        .put(
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/to-herself",
+            &alice,
+            &json!({"messages": {"@alice:example.org": {&alice_device: {"ciphertext": "hers"}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (status, body) = harness
+        .put(
+            "/_matrix/client/v3/sendToDevice/m.room.encrypted/the-room-key",
+            &alice,
+            &json!({"messages": {"@bob:example.org": {&bob_device: {"ciphertext": "the key"}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll did not return when bob's to-device message landed")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let to_device: Vec<&str> = body["to_device"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["content"]["ciphertext"].as_str())
+        .collect();
+    assert_eq!(
+        to_device,
+        vec!["the key"],
+        "the poll answered before bob's message: {body}"
+    );
+}
+
+/// Waiting through someone else's news still ends at the timeout, with an
+/// empty answer whose token is past what the client was not shown -- so
+/// the next poll does not wake for it again.
+#[tokio::test]
+async fn a_long_poll_with_nothing_for_its_user_times_out_past_the_stream() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let alices_room = harness.create_room(&alice).await;
+    let since = harness.sync(&bob, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let bob = bob.clone();
+        let since = since.clone();
+        tokio::spawn(async move {
+            harness
+                .get(
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=300"),
+                    &bob,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.say(&alices_room, &alice, "not for bob", "t1").await;
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll outlived its timeout")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rooms"]["join"], json!({}), "{body}");
+    assert_ne!(body["next_batch"].as_str(), Some(since.as_str()), "{body}");
 }
 
 /// Once the receiver acknowledges its mailbox, pending rows no longer keep

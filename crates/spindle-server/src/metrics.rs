@@ -25,8 +25,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Which of §9.2's three cases an append took.
@@ -36,14 +36,15 @@ use std::time::Duration;
 /// argument it exists to test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkCase {
-    /// Case 1 — a non-state event. Cannot conflict; no resolution.
+    /// Case 1 — a non-state event whose parents hold one state. No
+    /// resolution.
     NonState,
-    /// Case 2 — a state event whose key nothing in the window touched.
-    /// One `apply()`; no resolution.
+    /// Case 2 — a state event whose parents hold one state. One `apply()`;
+    /// no resolution.
     StateUncontested,
-    /// Case 3 — a state event contested inside the window. The expensive
-    /// path, and the one §18.3 says must stay under 0.1% of federated
-    /// events.
+    /// Case 3 — an event whose parents' states differ, so the room
+    /// version's resolver ran (ADR 0005). The expensive path, and the one
+    /// §18.3 says must stay under 0.1% of federated events.
     StateContested,
 }
 
@@ -59,7 +60,8 @@ pub enum Origin {
 ///
 /// Five outcomes are the receipt checks' own verdicts; `refused` is
 /// everything refused before them -- a bad signature, an unknown room --
-/// so the series add up to every PDU received.
+/// and `recovery_pending` is a PDU answered before its dependency recovery
+/// ended, so the series add up to every PDU received.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PduOutcome {
     /// Appended to the timeline through the ordinary receipt checks,
@@ -77,16 +79,20 @@ pub enum PduOutcome {
     RefusedMissingDeps,
     /// Refused before any receipt check.
     Refused,
+    /// Answered while its dependency recovery was still running (#808). The
+    /// recovery continues, and places the event if it succeeds.
+    Pending,
 }
 
 impl PduOutcome {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Accepted,
         Self::GapAccepted,
         Self::SoftFailed,
         Self::Rejected,
         Self::RefusedMissingDeps,
         Self::Refused,
+        Self::Pending,
     ];
 
     fn label(self) -> &'static str {
@@ -97,6 +103,7 @@ impl PduOutcome {
             Self::Rejected => "rejected",
             Self::RefusedMissingDeps => "refused_missing_deps",
             Self::Refused => "refused",
+            Self::Pending => "recovery_pending",
         }
     }
 }
@@ -116,16 +123,20 @@ pub enum RecoveryResult {
     Timeout,
     /// What the peer sent failed verification or authorization.
     Invalid,
+    /// Not attempted: the event names a dependency that failed verification
+    /// within `dependency_failure_ttl_secs`, so it was refused at once (#725).
+    NegativeCached,
 }
 
 impl RecoveryResult {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Recovered,
         Self::BudgetExceeded,
         Self::PeerError,
         Self::RateLimited,
         Self::Timeout,
         Self::Invalid,
+        Self::NegativeCached,
     ];
 
     fn label(self) -> &'static str {
@@ -136,6 +147,33 @@ impl RecoveryResult {
             Self::RateLimited => "rate_limited",
             Self::Timeout => "timeout",
             Self::Invalid => "invalid",
+            Self::NegativeCached => "negative_cached",
+        }
+    }
+}
+
+/// What became of a PDU that needs a dependency recovery, at the gate that
+/// keeps a room's recoveries few (#808).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryAdmission {
+    /// A new recovery was started for it.
+    Started,
+    /// The recovery of the same event was in flight, and it waited for
+    /// that one: a retried PDU.
+    Joined,
+    /// Refused at once: the room had as many recoveries in flight as it
+    /// can have.
+    Busy,
+}
+
+impl RecoveryAdmission {
+    const ALL: [Self; 3] = [Self::Started, Self::Joined, Self::Busy];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Joined => "joined",
+            Self::Busy => "busy",
         }
     }
 }
@@ -313,6 +351,14 @@ pub struct Metrics {
     http_latency: Family,
     http_requests: RwLock<HashMap<String, AtomicU64>>,
     federation_queue: RwLock<Vec<(String, u64)>>,
+    /// Destinations the outbox is backing off from: `[short, long]`.
+    destinations_backing_off: [AtomicU64; 2],
+    /// Queued PDUs dropped for destinations catching up (#801).
+    catch_up_dropped: AtomicU64,
+    /// Queued PDUs dropped because a long-unreachable destination's queue
+    /// was full (#821).
+    outbox_capped: AtomicU64,
+    outbox_body_missing: AtomicU64,
     sync_subscribers: AtomicU64,
     sync_lag: Family,
     /// Inbound PDUs by what became of them ([`PduOutcome`]): the
@@ -320,6 +366,8 @@ pub struct Metrics {
     pdu_outcomes: [[AtomicU64; PduOutcome::ALL.len()]; 2],
     /// Predecessor recovery attempts by result ([`RecoveryResult`]).
     recovery_attempts: [AtomicU64; RecoveryResult::ALL.len()],
+    /// PDUs at the recovery gate by what it decided ([`RecoveryAdmission`]).
+    recovery_admissions: [AtomicU64; RecoveryAdmission::ALL.len()],
     recovery_latency: Family,
     /// Bodies fetched from peers by recovery or gap acceptance ([`FetchKind`]).
     recovery_fetched: [AtomicU64; FetchKind::ALL.len()],
@@ -332,6 +380,8 @@ pub struct Metrics {
     /// How the server counts the rooms it holds open, and the last
     /// answer it gave (served when the registry is busy at scrape time).
     resident_rooms: ResidentProbe,
+    /// Rooms dropped from memory by the resident-room budget.
+    rooms_evicted: AtomicU64,
     /// Time spent waiting to acquire `[registry exclusive, registry shared,
     /// room exclusive, room shared]`.
     lock_waits: [Histogram; 4],
@@ -354,6 +404,14 @@ pub struct Metrics {
     backfill_events: [AtomicU64; BackfillEvent::ALL.len()],
     /// Recorded federation gaps not yet filled (a gauge).
     gaps_remaining: AtomicU64,
+    /// Requests refused by `[federation] allow`/`deny`, by direction.
+    federation_listed: [AtomicU64; 2],
+    /// Pushed PDUs refused for missing dependencies and owed a retry (a gauge).
+    owed_events: AtomicU64,
+    /// Unix time of the last backup the admin endpoint finished, or `0`.
+    last_backup: AtomicU64,
+    /// Whether an admin backup is running now.
+    backup_running: std::sync::atomic::AtomicBool,
     /// Peer signing-key lookups and event signature failures.
     keys: KeyMetrics,
     auth: AuthCounters,
@@ -361,6 +419,7 @@ pub struct Metrics {
     edus: EduMetrics,
     /// State resolution's work and the forks that cause it (#626).
     state_res: StateResMetrics,
+    retention: RetentionMetrics,
     /// MSC3995 hub mode's counters (#22), in a build with the feature.
     #[cfg(feature = "hub-mode")]
     hub: crate::hub::HubMetrics,
@@ -377,9 +436,22 @@ struct StateResMetrics {
     /// `org.matrix.dummy_event`s authored to merge extremities, `[sent,
     /// failed]`.
     dummy_events: [AtomicU64; 2],
+    /// Forward extremities dropped as stuck after a resolution showed their
+    /// states had lost to the other tips'.
+    extremities_pruned: AtomicU64,
     /// Resident rooms by forward-extremity count, by
     /// [`EXTREMITY_BUCKETS`], as the last census found them.
     extremity_buckets: [AtomicU64; 4],
+}
+
+/// What history retention has done since start (#817).
+#[derive(Debug, Default)]
+struct RetentionMetrics {
+    runs: AtomicU64,
+    /// `[truncated, refused, failed]` rooms.
+    rooms: [AtomicU64; 3],
+    entries: AtomicU64,
+    bodies: AtomicU64,
 }
 
 /// The labels of `spindle_rooms_by_forward_extremities`, in index order.
@@ -409,10 +481,15 @@ impl Default for Metrics {
             http_latency: Family::default(),
             http_requests: RwLock::default(),
             federation_queue: RwLock::default(),
+            destinations_backing_off: Default::default(),
+            catch_up_dropped: AtomicU64::new(0),
+            outbox_capped: AtomicU64::new(0),
+            outbox_body_missing: AtomicU64::new(0),
             sync_subscribers: AtomicU64::new(0),
             sync_lag: Family::default(),
             pdu_outcomes: Default::default(),
             recovery_attempts: Default::default(),
+            recovery_admissions: Default::default(),
             recovery_latency: Family::default(),
             recovery_fetched: Default::default(),
             gap_acceptances: Default::default(),
@@ -420,6 +497,7 @@ impl Default for Metrics {
             cold_loads: Default::default(),
             cold_load_latency: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             resident_rooms: ResidentProbe::default(),
+            rooms_evicted: AtomicU64::new(0),
             lock_waits: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             sync_phases: std::array::from_fn(|_| Histogram::with_bounds(&SLOW_BUCKETS)),
             blocking_in_flight: Default::default(),
@@ -431,10 +509,15 @@ impl Default for Metrics {
             backfill_latency: Family::default(),
             backfill_events: Default::default(),
             gaps_remaining: AtomicU64::new(0),
+            federation_listed: [AtomicU64::new(0), AtomicU64::new(0)],
+            owed_events: AtomicU64::new(0),
+            last_backup: AtomicU64::new(0),
+            backup_running: std::sync::atomic::AtomicBool::new(false),
             keys: KeyMetrics::default(),
             auth: AuthCounters::default(),
             edus: EduMetrics::default(),
             state_res: StateResMetrics::default(),
+            retention: RetentionMetrics::default(),
             #[cfg(feature = "hub-mode")]
             hub: crate::hub::HubMetrics::default(),
         }
@@ -545,6 +628,9 @@ pub enum BlockingTask {
     RoomWarmup,
     /// An inbound federation transaction's PDUs (`spawn_blocking`).
     FederationSend,
+    /// Federation catch-up: a dependency recovery, one chunk of gap
+    /// backfill, one partial-state resync (`spawn_blocking`).
+    FederationCatchUp,
     /// A cold room load reached from async code (`block_in_place`).
     ColdLoad,
     /// A wait for a contended room lock (`block_in_place`).
@@ -552,11 +638,12 @@ pub enum BlockingTask {
 }
 
 impl BlockingTask {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SlidingSync,
         Self::Sync,
         Self::RoomWarmup,
         Self::FederationSend,
+        Self::FederationCatchUp,
         Self::ColdLoad,
         Self::LockWait,
     ];
@@ -571,6 +658,7 @@ impl BlockingTask {
             Self::Sync => "sync",
             Self::RoomWarmup => "room_warmup",
             Self::FederationSend => "federation_send",
+            Self::FederationCatchUp => "federation_catch_up",
             Self::ColdLoad => "cold_load",
             Self::LockWait => "lock_wait",
         }
@@ -655,6 +743,17 @@ impl Metrics {
             .iter()
             .map(|size| self.cold_loads(*size))
             .sum()
+    }
+
+    /// Count one room dropped from memory by the resident-room budget.
+    pub fn observe_room_evicted(&self) {
+        self.rooms_evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rooms the resident-room budget has dropped so far.
+    #[must_use]
+    pub fn rooms_evicted(&self) -> u64 {
+        self.rooms_evicted.load(Ordering::Relaxed)
     }
 
     /// Say how to count resident rooms. The probe answers `None` when it
@@ -743,6 +842,58 @@ impl Metrics {
         self.outbound_txns[result.index()].load(Ordering::Relaxed)
     }
 
+    /// Set how many destinations the outbox is backing off from: `short`
+    /// still in the first minutes of failing, `long` past them and being
+    /// tried at most as often as it has been down (#801).
+    pub fn set_destinations_backing_off(&self, short: u64, long: u64) {
+        self.destinations_backing_off[0].store(short, Ordering::Relaxed);
+        self.destinations_backing_off[1].store(long, Ordering::Relaxed);
+    }
+
+    /// Destinations backing off, `(short, long)`, for tests.
+    #[must_use]
+    pub fn destinations_backing_off(&self) -> (u64, u64) {
+        (
+            self.destinations_backing_off[0].load(Ordering::Relaxed),
+            self.destinations_backing_off[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Count `dropped` queued PDUs a catching-up destination will not get.
+    pub fn record_catch_up_dropped(&self, dropped: u64) {
+        self.catch_up_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Queued PDUs dropped by catch-up, for tests.
+    #[must_use]
+    pub fn catch_up_dropped(&self) -> u64 {
+        self.catch_up_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Count `dropped` queued PDUs shed from a full queue for a
+    /// long-unreachable destination.
+    pub fn record_outbox_capped(&self, dropped: u64) {
+        self.outbox_capped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Count `dropped` queued events whose stored body was purged.
+    pub fn record_outbox_body_missing(&self, dropped: u64) {
+        self.outbox_body_missing
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Queued events dropped for a purged body, for tests.
+    #[must_use]
+    pub fn outbox_body_missing(&self) -> u64 {
+        self.outbox_body_missing.load(Ordering::Relaxed)
+    }
+
+    /// Queued PDUs shed from full queues, for tests.
+    #[must_use]
+    pub fn outbox_capped(&self) -> u64 {
+        self.outbox_capped.load(Ordering::Relaxed)
+    }
+
     /// The warm-up has `pending` rooms left to load.
     pub fn set_warmup_pending(&self, pending: u64) {
         self.warmup_pending.store(pending, Ordering::Relaxed);
@@ -776,6 +927,26 @@ impl Metrics {
     #[must_use]
     pub fn warmup_loaded_count(&self) -> u64 {
         self.warmup_loaded.load(Ordering::Relaxed)
+    }
+}
+
+/// Holds the one backup slot; frees it when dropped.
+pub struct BackupSlot<'a>(&'a Metrics);
+
+impl Drop for BackupSlot<'_> {
+    fn drop(&mut self) {
+        self.0.backup_running.store(false, Ordering::Release);
+    }
+}
+
+/// The backup slot, owned so a blocking task can hold it past the request
+/// that took it (#813). The streaming endpoint needs this: the handler
+/// returns while the backup is still being written.
+pub struct OwnedBackupSlot(Arc<Metrics>);
+
+impl Drop for OwnedBackupSlot {
+    fn drop(&mut self) {
+        self.0.backup_running.store(false, Ordering::Release);
     }
 }
 
@@ -859,22 +1030,6 @@ impl Metrics {
         self.fork_cases[case.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a fork that needed state resolution — case 3.
-    ///
-    /// Not an append, so not [`record_append`]: nothing enters the log when
-    /// this is recorded. Bounded resolution exists in `spindle-core` but is not
-    /// yet wired into ingest (#16), so a contested fork is *deferred* rather
-    /// than resolved. A federated event naming the contesting tips is refused;
-    /// a local send sets the contesting tip aside and is authored without it
-    /// (#225), and that send is then counted by [`record_append`] as the case
-    /// it took. Counting an event here as well would count that send twice.
-    /// The counter goes where the decision is made, so it keeps counting the
-    /// same thing when the resolver lands and the deferral becomes a
-    /// resolution.
-    pub fn record_contested_state(&self) {
-        self.fork_cases[ForkCase::StateContested.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Record a received PDU kept for the DAG but out of the timeline: one
     /// that failed the auth checks against its auth events or the state
     /// before it (`rejected`), or only against the room's current state
@@ -920,6 +1075,81 @@ impl Metrics {
         )
     }
 
+    /// Record one pass of the retention job (#817).
+    pub fn record_retention(&self, report: &crate::rooms::PassReport) {
+        let counters = &self.retention;
+        counters.runs.fetch_add(1, Ordering::Relaxed);
+        for (slot, count) in
+            counters
+                .rooms
+                .iter()
+                .zip([report.truncated, report.refused, report.failed])
+        {
+            slot.fetch_add(count, Ordering::Relaxed);
+        }
+        counters
+            .entries
+            .fetch_add(report.entries, Ordering::Relaxed);
+        counters.bodies.fetch_add(report.bodies, Ordering::Relaxed);
+    }
+
+    /// Retention passes finished so far, for tests.
+    #[must_use]
+    pub fn retention_runs(&self) -> u64 {
+        self.retention.runs.load(Ordering::Relaxed)
+    }
+
+    /// History retention's counters (#817).
+    fn render_retention(&self, out: &mut String) {
+        let counters = &self.retention;
+        out.push_str(
+            "# HELP spindle_retention_runs_total Passes of the history retention job.\n\
+             # TYPE spindle_retention_runs_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_retention_runs_total {}",
+            counters.runs.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP spindle_retention_rooms_total Rooms the retention job handled, by \
+             result: truncated, refused for a reason, or failed.\n\
+             # TYPE spindle_retention_rooms_total counter\n",
+        );
+        for (index, result) in ["truncated", "refused", "failed"].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_retention_rooms_total{{result=\"{result}\"}} {}",
+                counters.rooms[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_retention_deleted_total Rows the retention job deleted, by \
+             kind: log entries or event bodies.\n\
+             # TYPE spindle_retention_deleted_total counter\n",
+        );
+        for (kind, counter) in [("entries", &counters.entries), ("bodies", &counters.bodies)] {
+            let _ = writeln!(
+                out,
+                "spindle_retention_deleted_total{{kind=\"{kind}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    /// Record `count` stuck forward extremities dropped from one room.
+    pub fn record_extremities_pruned(&self, count: u64) {
+        self.state_res
+            .extremities_pruned
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Stuck forward extremities dropped so far, for tests.
+    #[must_use]
+    pub fn extremities_pruned(&self) -> u64 {
+        self.state_res.extremities_pruned.load(Ordering::Relaxed)
+    }
+
     /// Replace the forward-extremity census, indexed as
     /// [`EXTREMITY_BUCKETS`].
     pub fn set_extremity_buckets(&self, buckets: [u64; 4]) {
@@ -941,6 +1171,7 @@ impl Metrics {
         render_build_info(&mut out);
         self.render_appends(&mut out);
         self.render_state_res(&mut out);
+        self.render_retention(&mut out);
         self.render_room_locks(&mut out);
         self.render_http(&mut out);
         self.render_federation(&mut out);
@@ -1080,6 +1311,17 @@ impl Metrics {
             );
         }
         out.push_str(
+            "# HELP spindle_forward_extremities_pruned_total Forward extremities \
+             dropped as stuck: their states lost the room's resolution and no \
+             event cites them.\n\
+             # TYPE spindle_forward_extremities_pruned_total counter\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_forward_extremities_pruned_total {}",
+            counters.extremities_pruned.load(Ordering::Relaxed)
+        );
+        out.push_str(
             "# HELP spindle_rooms_by_forward_extremities Resident rooms by how many \
              forward extremities they have, at the last census.\n\
              # TYPE spindle_rooms_by_forward_extremities gauge\n",
@@ -1173,6 +1415,42 @@ impl Metrics {
                 );
             }
         }
+        out.push_str(
+            "# HELP spindle_federation_destinations_backing_off Destinations whose last \
+             delivery failed, by how long they have been failing.\n\
+             # TYPE spindle_federation_destinations_backing_off gauge\n",
+        );
+        for (index, backoff) in ["short", "long"].iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "spindle_federation_destinations_backing_off{{backoff=\"{backoff}\"}} {}",
+                self.destinations_backing_off[index].load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_catch_up_dropped_total Queued events dropped for \
+             destinations down long enough to catch up instead.\n\
+             # TYPE spindle_federation_catch_up_dropped_total counter\n\
+             spindle_federation_catch_up_dropped_total {}",
+            self.catch_up_dropped.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_outbox_capped_total Queued events dropped because the \
+             queue of a destination that has been down a long time was full.\n\
+             # TYPE spindle_federation_outbox_capped_total counter\n\
+             spindle_federation_outbox_capped_total {}",
+            self.outbox_capped.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP spindle_federation_outbox_body_missing_total Queued events dropped because \
+             an admin purge had deleted their stored body.\n\
+             # TYPE spindle_federation_outbox_body_missing_total counter\n\
+             spindle_federation_outbox_body_missing_total {}",
+            self.outbox_body_missing.load(Ordering::Relaxed)
+        );
     }
 
     fn render_sync(&self, out: &mut String) {
@@ -1235,6 +1513,12 @@ impl Metrics {
              # TYPE spindle_rooms_resident gauge\n",
         );
         let _ = writeln!(out, "spindle_rooms_resident {}", self.resident_rooms());
+        out.push_str(
+            "# HELP spindle_rooms_evicted_total Rooms dropped from memory because more \
+             than [storage] max_resident_rooms were open.\n\
+             # TYPE spindle_rooms_evicted_total counter\n",
+        );
+        let _ = writeln!(out, "spindle_rooms_evicted_total {}", self.rooms_evicted());
 
         out.push_str(
             "# HELP spindle_lock_wait_seconds Time spent acquiring the room registry \
@@ -1602,6 +1886,12 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record what the recovery gate decided about one PDU.
+    pub fn record_recovery_admission(&self, admission: RecoveryAdmission) {
+        self.recovery_admissions[slot(&RecoveryAdmission::ALL, admission)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one predecessor recovery attempt against one peer, and how
     /// long it took.
     pub fn record_recovery(&self, result: RecoveryResult, elapsed: Duration) {
@@ -1651,6 +1941,28 @@ impl Metrics {
         self.gaps_remaining.store(gaps, Ordering::Relaxed);
     }
 
+    /// Record that a backup has just been written and synced (#813).
+    pub fn set_last_backup(&self, unix_seconds: u64) {
+        self.last_backup.store(unix_seconds, Ordering::Relaxed);
+    }
+
+    /// Claim the single backup slot, or `None` if a backup is running.
+    pub fn begin_backup(&self) -> Option<BackupSlot<'_>> {
+        (!self.backup_running.swap(true, Ordering::AcqRel)).then_some(BackupSlot(self))
+    }
+
+    /// Claim the single backup slot for a task that outlives the request.
+    pub fn begin_backup_owned(self: &Arc<Self>) -> Option<OwnedBackupSlot> {
+        (!self.backup_running.swap(true, Ordering::AcqRel))
+            .then(|| OwnedBackupSlot(Arc::clone(self)))
+    }
+
+    /// Unix time of the last successful backup, `0` if none since start.
+    #[must_use]
+    pub fn last_backup(&self) -> u64 {
+        self.last_backup.load(Ordering::Relaxed)
+    }
+
     /// Read one counter, for tests that assert a metric actually moved.
     #[must_use]
     pub fn backfill_chunk_count(&self, result: BackfillChunk) -> u64 {
@@ -1661,6 +1973,18 @@ impl Metrics {
     #[must_use]
     pub fn backfill_event_count(&self, kind: BackfillEvent) -> u64 {
         self.backfill_events[slot(&BackfillEvent::ALL, kind)].load(Ordering::Relaxed)
+    }
+
+    /// Set the number of owed events: refused for missing dependencies,
+    /// not yet applied. A gauge, set by the backfill loop each pass.
+    pub fn set_owed_events(&self, owed: u64) {
+        self.owed_events.store(owed, Ordering::Relaxed);
+    }
+
+    /// Read the owed-events gauge, for tests.
+    #[must_use]
+    pub fn owed_events(&self) -> u64 {
+        self.owed_events.load(Ordering::Relaxed)
     }
 
     /// Read the gauge, for tests that assert it moved.
@@ -1686,6 +2010,12 @@ impl Metrics {
     #[must_use]
     pub fn recovery_count(&self, result: RecoveryResult) -> u64 {
         self.recovery_attempts[slot(&RecoveryResult::ALL, result)].load(Ordering::Relaxed)
+    }
+
+    /// Read one counter, for tests that assert a metric actually moved.
+    #[must_use]
+    pub fn recovery_admission_count(&self, admission: RecoveryAdmission) -> u64 {
+        self.recovery_admissions[slot(&RecoveryAdmission::ALL, admission)].load(Ordering::Relaxed)
     }
 
     /// Read one counter, for tests that assert a metric actually moved.
@@ -1731,6 +2061,19 @@ impl Metrics {
                 "spindle_federation_recovery_attempts_total{{result=\"{}\"}} {}",
                 result.label(),
                 self.recovery_count(result)
+            );
+        }
+        out.push_str(
+            "# HELP spindle_federation_recovery_admissions_total PDUs that need a \
+         dependency recovery, by what the per-room gate decided.\n\
+         # TYPE spindle_federation_recovery_admissions_total counter\n",
+        );
+        for admission in RecoveryAdmission::ALL {
+            let _ = writeln!(
+                out,
+                "spindle_federation_recovery_admissions_total{{result=\"{}\"}} {}",
+                admission.label(),
+                self.recovery_admission_count(admission)
             );
         }
         out.push_str(
@@ -1829,6 +2172,23 @@ impl Metrics {
             self.gaps_remaining()
         );
         out.push_str(
+            "# HELP spindle_federation_owed_events Pushed events refused for missing \
+         dependencies that are still waiting for a retry.\n\
+         # TYPE spindle_federation_owed_events gauge\n",
+        );
+        let _ = writeln!(out, "spindle_federation_owed_events {}", self.owed_events());
+        out.push_str(
+            "# HELP spindle_last_successful_backup_timestamp_seconds Unix time of the \
+         last backup written through the admin endpoint since this process \
+         started, or 0 if there is none.\n\
+         # TYPE spindle_last_successful_backup_timestamp_seconds gauge\n",
+        );
+        let _ = writeln!(
+            out,
+            "spindle_last_successful_backup_timestamp_seconds {}",
+            self.last_backup()
+        );
+        out.push_str(
             "# HELP spindle_federation_backfill_duration_seconds Time one gap \
          backfill chunk took, by result.\n\
          # TYPE spindle_federation_backfill_duration_seconds histogram\n",
@@ -1857,10 +2217,20 @@ pub enum LoginMethod {
     OidcSession,
     /// The account-management sign-in page.
     Account,
+    /// An upstream identity provider's callback (#610): `success`, or
+    /// `error` for an answer that could not be verified or an account that
+    /// could not be found or made.
+    Upstream,
 }
 
 impl LoginMethod {
-    const ALL: [Self; 4] = [Self::Password, Self::Oidc, Self::OidcSession, Self::Account];
+    const ALL: [Self; 5] = [
+        Self::Password,
+        Self::Oidc,
+        Self::OidcSession,
+        Self::Account,
+        Self::Upstream,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -1868,6 +2238,7 @@ impl LoginMethod {
             Self::Oidc => "oidc",
             Self::OidcSession => "oidc_session",
             Self::Account => "account",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -2060,7 +2431,7 @@ impl PasswordRecoveryResult {
 /// label value, which is both the cardinality rule and the privacy one.
 #[derive(Debug, Default)]
 struct AuthCounters {
-    logins: [[AtomicU64; 4]; 4],
+    logins: [[AtomicU64; 4]; 5],
     grants: [[AtomicU64; 4]; 2],
     /// `[requested, completed]`.
     resets: [AtomicU64; 2],
@@ -2425,6 +2796,13 @@ impl SignatureFailure {
     }
 }
 
+/// Which way a request refused by `[federation] allow`/`deny` was going.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListedDirection {
+    Inbound = 0,
+    Outbound = 1,
+}
+
 /// Key lookups by source and result, and signature failures by reason.
 /// Fixed enum labels only: no server name, so a peer cannot mint series.
 #[derive(Debug, Default)]
@@ -2434,6 +2812,17 @@ struct KeyMetrics {
 }
 
 impl Metrics {
+    /// Record one request refused by `[federation] allow`/`deny`.
+    pub fn record_federation_listed(&self, direction: ListedDirection) {
+        self.federation_listed[direction as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the refused-by-list counter, for tests.
+    #[must_use]
+    pub fn federation_listed_count(&self, direction: ListedDirection) -> u64 {
+        self.federation_listed[direction as usize].load(Ordering::Relaxed)
+    }
+
     /// Record one lookup of a peer's signing keys.
     pub fn record_key_fetch(&self, source: KeySource, result: KeyFetchResult) {
         self.keys.fetches[slot(&KeySource::ALL, source)][slot(&KeyFetchResult::ALL, result)]
@@ -2460,6 +2849,21 @@ impl Metrics {
     }
 
     fn render_keys(&self, out: &mut String) {
+        out.push_str(
+            "# HELP spindle_federation_listed_refusals_total Federation requests refused \
+         because `[federation] allow` or `deny` does not permit the server, by direction.\n\
+         # TYPE spindle_federation_listed_refusals_total counter\n",
+        );
+        for (direction, label) in [
+            (ListedDirection::Inbound, "inbound"),
+            (ListedDirection::Outbound, "outbound"),
+        ] {
+            let _ = writeln!(
+                out,
+                "spindle_federation_listed_refusals_total{{direction=\"{label}\"}} {}",
+                self.federation_listed_count(direction)
+            );
+        }
         out.push_str(
             "# HELP spindle_federation_key_fetches_total Lookups of a peer's signing \
          keys, by where they were answered from and how.\n\
@@ -2558,7 +2962,8 @@ pub enum EduResult {
     Ignored,
     /// Not the shape the spec gives this EDU type.
     Malformed,
-    /// A type this server does not act on (presence, unknown types).
+    /// A type this server does not act on: unknown types, and `m.presence`
+    /// with `[presence] enabled = false`.
     Unsupported,
 }
 
@@ -2589,6 +2994,8 @@ pub enum ReceiptResult {
     ForeignUser,
     /// The reader is not joined to the room (or the room is unknown here).
     NotJoined,
+    /// The room's `m.room.server_acl` denies the origin.
+    Denied,
     /// None of the events the receipt names is one this server holds.
     UnknownEvent,
     /// A receipt type that does not federate (`m.read.private`, anything
@@ -2601,10 +3008,11 @@ pub enum ReceiptResult {
 }
 
 impl ReceiptResult {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Accepted,
         Self::ForeignUser,
         Self::NotJoined,
+        Self::Denied,
         Self::UnknownEvent,
         Self::UnsupportedType,
         Self::Malformed,
@@ -2616,6 +3024,7 @@ impl ReceiptResult {
             Self::Accepted => "accepted",
             Self::ForeignUser => "foreign_user",
             Self::NotJoined => "not_joined",
+            Self::Denied => "denied",
             Self::UnknownEvent => "unknown_event",
             Self::UnsupportedType => "unsupported_type",
             Self::Malformed => "malformed",
@@ -2724,15 +3133,13 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_append(Origin::Local, ForkCase::NonState);
         metrics.record_append(Origin::Federated, ForkCase::StateUncontested);
-        metrics.record_contested_state();
+        metrics.record_append(Origin::Federated, ForkCase::StateContested);
 
         assert_eq!(metrics.fork_case_count(ForkCase::NonState), 1);
         assert_eq!(metrics.fork_case_count(ForkCase::StateUncontested), 1);
         assert_eq!(metrics.fork_case_count(ForkCase::StateContested), 1);
         assert_eq!(metrics.event_count(Origin::Local), 1);
-        // One federated event: a contested fork is a decision, not an
-        // append, and the send that steps around it is counted on its own.
-        assert_eq!(metrics.event_count(Origin::Federated), 1);
+        assert_eq!(metrics.event_count(Origin::Federated), 2);
     }
 
     /// The subscriber gauge is balanced: what goes up comes back down,
@@ -2786,6 +3193,10 @@ mod tests {
         metrics.record_fetched(FetchKind::Predecessor, 2);
         metrics.record_gap(GapResult::Accepted);
         metrics.observe_state_ids("ok", Duration::from_millis(400));
+        metrics.record_pdu(PduOutcome::Pending, false);
+        metrics.record_recovery_admission(RecoveryAdmission::Joined);
+        metrics.record_recovery_admission(RecoveryAdmission::Busy);
+        metrics.record_recovery_admission(RecoveryAdmission::Busy);
 
         assert_eq!(metrics.pdu_count(PduOutcome::GapAccepted), 2);
         assert_eq!(metrics.relayed_pdu_count(PduOutcome::GapAccepted, true), 1);
@@ -2798,12 +3209,22 @@ mod tests {
         assert_eq!(metrics.fetched_count(FetchKind::Predecessor), 2);
         assert_eq!(metrics.fetched_count(FetchKind::Auth), 0);
         assert_eq!(metrics.gap_count(GapResult::Accepted), 1);
+        assert_eq!(metrics.pdu_count(PduOutcome::Pending), 1);
+        assert_eq!(
+            metrics.recovery_admission_count(RecoveryAdmission::Started),
+            0
+        );
+        assert_eq!(metrics.recovery_admission_count(RecoveryAdmission::Busy), 2);
 
         let text = metrics.render();
         for line in [
             "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"false\"} 1",
             "spindle_federation_pdus_received_total{result=\"gap_accepted\",relayed=\"true\"} 1",
             "spindle_federation_recovery_attempts_total{result=\"rate_limited\"} 1",
+            "spindle_federation_pdus_received_total{result=\"recovery_pending\",relayed=\"false\"} 1",
+            "spindle_federation_recovery_admissions_total{result=\"started\"} 0",
+            "spindle_federation_recovery_admissions_total{result=\"joined\"} 1",
+            "spindle_federation_recovery_admissions_total{result=\"busy\"} 2",
             "spindle_federation_recovery_events_fetched_total{kind=\"gap_state\"} 7",
             "spindle_federation_gap_acceptances_total{result=\"accepted\"} 1",
             // Twelve seconds lands in the ten-to-thirty bucket, which the
@@ -3043,6 +3464,7 @@ mod tests {
         metrics.record_dummy_event(true);
         metrics.record_dummy_event(false);
         metrics.record_dummy_event(true);
+        metrics.record_extremities_pruned(3);
         let text = metrics.render();
         for line in [
             "spindle_rooms_by_forward_extremities{extremities=\"1\"} 4",
@@ -3054,6 +3476,7 @@ mod tests {
             "spindle_state_res_rejections_total 7",
             "spindle_dummy_events_total{result=\"sent\"} 2",
             "spindle_dummy_events_total{result=\"failed\"} 1",
+            "spindle_forward_extremities_pruned_total 3",
         ] {
             assert!(text.contains(line), "{line} missing from {text}");
         }
@@ -3070,7 +3493,11 @@ mod tests {
             "spindle_state_res_resolutions_total",
             "spindle_state_res_rejections_total",
             "spindle_dummy_events_total",
+            "spindle_forward_extremities_pruned_total",
             "spindle_rooms_by_forward_extremities",
+            "spindle_retention_runs_total",
+            "spindle_retention_rooms_total",
+            "spindle_retention_deleted_total",
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{text}");
             assert!(text.contains(&format!("# TYPE {name} ")), "{text}");

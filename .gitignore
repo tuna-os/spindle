@@ -12,3 +12,8 @@ __pycache__/
 homeserver.db
 homeserver.log
 tmp/
+
+# The default storage path is ./data, so a test or a local run that leaves
+# `[storage] path` unset writes its store and its media here.
+/crates/*/data/
+/data/

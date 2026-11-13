@@ -125,6 +125,7 @@ pub fn routes() -> Router<AppState> {
                 get(get_event_report).delete(delete_event_report),
             )
             .route(&format!("{prefix}/audit"), get(audit_log))
+            .route(&format!("{prefix}/backup"), post(create_backup))
             .route(
                 &format!("{prefix}/registration_tokens"),
                 get(list_registration_tokens),
@@ -149,6 +150,7 @@ pub fn routes() -> Router<AppState> {
             )
     };
     group("/_spindle/admin/v1")
+        .route("/_spindle/admin/v1/backup/stream", get(stream_backup))
         .merge(group("/_synapse/admin/v1"))
         .merge(synapse_spellings())
 }
@@ -250,7 +252,7 @@ async fn shared_secret_register(
         .map_err(|error| match error {
             crate::accounts::AccountError::UserInUse => MatrixError::user_in_use(),
             crate::accounts::AccountError::InvalidUsername => MatrixError::invalid_username(),
-            other => MatrixError::internal(&other.to_string()),
+            other => crate::routes::internal(&other),
         })?;
     if request.admin {
         accounts
@@ -373,6 +375,117 @@ impl FromRequestParts<AppState> for AdminActor {
         }
         Ok(Self(identity))
     }
+}
+
+/// `POST /backup` (#813)
+///
+/// Writes a backup of the running store to a new file in
+/// `[storage] backup_dir`, and says where. The rows come from one store
+/// snapshot, so the file is of one moment however many writes land while it
+/// is written. The file name is chosen here: the request carries no path.
+/// Media is not in the file; take the store backup first, then copy media,
+/// so that `verify-media` finds every blob the store names.
+async fn create_backup(
+    State(state): State<AppState>,
+    actor: AdminActor,
+) -> Result<Json<Value>, MatrixError> {
+    let Some(dir) = state.config.storage.backup_dir.clone() else {
+        return Err(MatrixError::bad_json(
+            "online backup is off: set [storage] backup_dir",
+        ));
+    };
+    // Two at once would double the read load of a backup meant to be cheap
+    // enough to run on a live server. The slot frees itself on drop, so a
+    // panic cannot wedge it.
+    let Some(slot) = state.metrics.begin_backup() else {
+        return Err(backup_busy());
+    };
+    let started = now_ms();
+    let path = dir.join(format!("spindle-{started}.backup"));
+    let store = state.store.clone();
+    let target = path.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        // `?` on a missing directory would say nothing useful later.
+        std::fs::create_dir_all(target.parent().unwrap_or(std::path::Path::new(".")))
+            .map_err(spindle_store::backup::BackupError::Io)?;
+        let snapshot = store.snapshot().ok_or_else(|| {
+            spindle_store::backup::BackupError::Io(std::io::Error::other(
+                "the store has no snapshot, so it cannot be backed up while it runs",
+            ))
+        })?;
+        spindle_store::backup::write_backup_file(&*snapshot, &target)
+    })
+    .await
+    .map_err(|error| MatrixError::internal(&error.to_string()))?
+    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    drop(slot);
+    state.metrics.set_last_backup(started / 1000);
+    audit(
+        &state,
+        &actor.identity().user_id,
+        "backup",
+        &path.display().to_string(),
+        &json!({ "rows": rows }),
+    )?;
+    Ok(Json(
+        json!({ "path": path.display().to_string(), "rows": rows }),
+    ))
+}
+
+/// The error for a backup asked for while another runs, file or stream.
+fn backup_busy() -> MatrixError {
+    MatrixError::new(
+        StatusCode::CONFLICT,
+        "M_CONFLICT",
+        "another backup is running; only one backup, file or stream, runs at a time",
+    )
+}
+
+/// `GET /backup/stream` (#813)
+///
+/// Streams the same bytes `POST /backup` writes to a file, as the response
+/// body, from one store snapshot. Memory stays bounded: a blocking task writes
+/// through a small channel, so a slow client slows the scan. A client that
+/// disconnects stops it. The stream ends with the digest `spindle restore`
+/// checks, so a client must treat a body that ends early as no backup.
+/// `[storage] backup_dir` is not needed. The last-backup metric is not set,
+/// since the server cannot know the client kept the bytes.
+async fn stream_backup(
+    State(state): State<AppState>,
+    actor: AdminActor,
+) -> Result<axum::response::Response, MatrixError> {
+    let Some(slot) = state.metrics.begin_backup_owned() else {
+        return Err(backup_busy());
+    };
+    let actor_id = actor.identity().user_id.clone();
+    let audit_state = state.clone();
+    let stream = crate::backup_stream::BackupStream::start(
+        state.store.clone(),
+        slot,
+        crate::backup_stream::Limits::default(),
+        move |result, stats| {
+            // Audited when the write ends, as `POST /backup` is: the record
+            // says what happened. A failed or abandoned stream is not a backup.
+            let Ok(rows) = result else {
+                tracing::warn!("a streamed backup did not finish");
+                return;
+            };
+            let detail = json!({ "rows": rows, "bytes": stats.total_sent() });
+            if let Err(error) = audit(&audit_state, &actor_id, "backup_stream", "stream", &detail) {
+                tracing::error!(%error.error, "could not audit a streamed backup");
+            }
+        },
+    );
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"spindle-{}.backup\"", now_ms()),
+        )
+        .header("cache-control", "no-store")
+        .body(stream.into_body())
+        .map_err(|error| MatrixError::internal(&error.to_string()))
 }
 
 /// Append one audit record. Every mutating handler calls this after the
@@ -760,11 +873,11 @@ async fn put_user(
             .unwrap_or_else(unguessable_password);
         accounts
             .register(&localpart, &password)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
     } else if let Some(password) = &request.password {
         accounts
             .set_password(&localpart, password)
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .map_err(|error| crate::routes::internal(&error))?;
         if request.logout_devices.unwrap_or(true) {
             accounts
                 .logout_everywhere(&localpart)
@@ -777,7 +890,7 @@ async fn put_user(
             .map_err(|error| MatrixError::internal(&error.to_string()))?;
     }
     if let Some(true) = request.deactivated {
-        crate::mas::deactivate_user(&state, &localpart, false)?;
+        crate::mas::deactivate_user(&state, &localpart, false, crate::mas::EndedBy::Server)?;
     } else if let Some(false) = request.deactivated {
         accounts
             .set_deactivated(&localpart, false)
@@ -838,7 +951,7 @@ async fn deactivate(
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
     let erase = body.is_some_and(|Json(body)| body.erase);
-    crate::mas::deactivate_user(&state, &localpart, erase)?;
+    crate::mas::deactivate_user(&state, &localpart, erase, crate::mas::EndedBy::Server)?;
     audit(
         &state,
         &actor.identity().user_id,
@@ -866,7 +979,7 @@ async fn reset_password(
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts
         .set_password(&localpart, &request.new_password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(|error| crate::routes::internal(&error))?;
     let logout = request.logout_devices.unwrap_or(true);
     if logout {
         accounts
@@ -896,7 +1009,7 @@ struct SetPasswordHash {
 
 /// `POST /users/{userId}/password_hash` (#611)
 ///
-/// Store an Argon2 PHC hash computed elsewhere — a Matrix Authentication
+/// Store an Argon2 PHC or bcrypt hash computed elsewhere — a Matrix Authentication
 /// Service's `user_passwords.hashed_password`, typically — so its user
 /// signs in here with the password they already have. The hash is
 /// validated (`accounts::validate_password_hash`) and refused with
@@ -1215,7 +1328,13 @@ async fn delete_device(
 ) -> Result<Json<Value>, MatrixError> {
     let (localpart, _) = target_account(&state, &user_id)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    crate::mas::remove_device(&state, &accounts, &localpart, &device_id)?;
+    crate::mas::remove_device(
+        &state,
+        &accounts,
+        &localpart,
+        &device_id,
+        crate::mas::EndedBy::Server,
+    )?;
     crate::mas::device_list_changed(&state, &accounts.user_id(&localpart));
     audit(
         &state,
@@ -1245,7 +1364,13 @@ async fn delete_devices(
     let (localpart, _) = target_account(&state, &user_id)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     for device_id in &request.devices {
-        crate::mas::remove_device(&state, &accounts, &localpart, device_id)?;
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &localpart,
+            device_id,
+            crate::mas::EndedBy::Server,
+        )?;
         audit(
             &state,
             &actor.identity().user_id,
@@ -1739,6 +1864,10 @@ fn hex(bytes: [u8; 32]) -> String {
 struct PurgeRequest {
     before_li: Option<i64>,
     before_ts: Option<u64>,
+    /// Also remove the log entries and indexes below the cutoff (#817).
+    /// Off by default: the old purge keeps the spine.
+    #[serde(default)]
+    truncate: bool,
 }
 
 /// `POST /rooms/{roomId}/purge_history` — `{before_li}` or `{before_ts}`.
@@ -1749,6 +1878,10 @@ struct PurgeRequest {
 /// from "never existed". State event bodies survive — current state and
 /// `state_at` keep folding from the log. The one audit record names how
 /// far and how many.
+///
+/// With `"truncate": true` it also removes the log, its indexes and the
+/// old state below a safe floor (#817), and the answer says how far that
+/// went and why it stopped short.
 async fn purge_history(
     State(state): State<AppState>,
     actor: AdminActor,
@@ -1775,21 +1908,40 @@ async fn purge_history(
             ));
         }
     };
-    let purged = state
-        .rooms
-        .admin(&actor)
-        .purge_history(&room_id, before_li)
-        .map_err(crate::routes::room_error)?;
+    let admin = state.rooms.admin(&actor);
+    let (purged, truncation) = if request.truncate {
+        let (purged, report) = admin
+            .truncate_history(&room_id, before_li)
+            .map_err(crate::routes::room_error)?;
+        (purged, Some(report))
+    } else {
+        let purged = admin
+            .purge_history(&room_id, before_li)
+            .map_err(crate::routes::room_error)?;
+        (purged, None)
+    };
+    let mut answer = json!({ "purged_up_to": before_li, "events_purged": purged });
+    if let Some(report) = truncation {
+        answer["truncated"] = json!({
+            "floor": report.floor,
+            "refused": report.refused,
+            "entries_removed": report.entries,
+            "bodies_removed": report.bodies,
+            "index_rows_removed": report.index_rows,
+        });
+    }
+    let mut detail = json!({ "before_li": before_li, "events_purged": purged });
+    if let Some(truncated) = answer.get("truncated") {
+        detail["truncated"] = truncated.clone();
+    }
     audit(
         &state,
         &actor.identity().user_id,
         "purge_history",
         &room_id,
-        &json!({ "before_li": before_li, "events_purged": purged }),
+        &detail,
     )?;
-    Ok(Json(
-        json!({ "purged_up_to": before_li, "events_purged": purged }),
-    ))
+    Ok(Json(answer))
 }
 
 /// The body of Synapse's room deletion, v1 and v2 alike.

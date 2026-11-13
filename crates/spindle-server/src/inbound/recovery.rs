@@ -17,6 +17,12 @@
 //! duplicate requests`). A later PDU waits for the recovery in flight, then
 //! tries the ordinary path first, which is usually enough: the event before
 //! it was just placed.
+//!
+//! `/send` waits for a recovery only until [`SEND_BUDGET`] (#808). The
+//! recovery runs as a task of its own and goes on past that; the PDU is
+//! answered as still pending, and the recovery places the event when it
+//! finishes. A retried PDU joins the recovery in flight for it, and a room
+//! holds at most [`MAX_ROOM_RECOVERIES`] at once.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -24,10 +30,14 @@ use std::time::{Duration, Instant};
 
 use ruma::{CanonicalJsonValue, RoomVersionId};
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::AppState;
+use crate::blocking::spawn_detached;
 use crate::federation::{Federation, FederationError, PeerKeys};
-use crate::metrics::{FetchKind, GapResult, Metrics, PduOutcome, RecoveryResult};
+use crate::metrics::{
+    BlockingTask, FetchKind, GapResult, Metrics, PduOutcome, RecoveryAdmission, RecoveryResult,
+};
 use crate::rooms::{RoomError, Rooms};
 use crate::signing::ServerKey;
 
@@ -39,10 +49,32 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// append. Longer than a recovery, because its walk is wider and it is the
 /// last resort before refusing.
 const GAP_TIMEOUT: Duration = Duration::from_secs(90);
-/// How long a PDU waits for another recovery in the same room to finish
-/// before it is refused as missing its dependencies, to be retried with the
-/// transaction.
-const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+/// How long `/send` waits for the dependency recoveries of its PDUs,
+/// counted from the arrival of the transaction (#808). Synapse's federation
+/// client gives up on a request after `federation.client_timeout_ms`, 60 s
+/// by default. Its catch-up (`_catch_up_transmission_loop`) sends one
+/// transaction for each room, oldest room first, and ends the pass at the
+/// first transaction that fails. So one room whose recovery holds the
+/// answer past 60 s stops the delivery of every room after it. Twenty
+/// seconds leaves a wide margin under that timeout for the key fetches and
+/// the room work around the recoveries. A recovery that is still running
+/// at the budget is not cancelled: it continues detached.
+pub(super) const SEND_BUDGET: Duration = Duration::from_secs(20);
+/// The recoveries that one room can have in flight at once (#808): one that
+/// has the room's turn and one that waits for it. A third PDU that needs a
+/// recovery is refused at once. With no limit, a sender that retries can
+/// keep detached work queued for a room long after it stopped waiting for
+/// the answers. A refused event is not lost: the recovery of a later event
+/// that names it gets it with the rest of the history between.
+const MAX_ROOM_RECOVERIES: usize = 2;
+
+/// What became of one PDU, as `/send` answers it.
+type Verdict = (PduOutcome, Result<(), String>);
+
+/// The recoveries in flight in one room: each event, and the channel its
+/// verdict is published on.
+type InFlight = Vec<(String, watch::Receiver<Option<Verdict>>)>;
+
 /// How long a peer that answered 429 is left alone for one room and one
 /// kind of request, when it does not say. Clamped to a sane range when it
 /// does, so a peer cannot switch recovery off for a day or ask to be
@@ -50,6 +82,15 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(60);
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const MIN_COOLDOWN: Duration = Duration::from_secs(5);
 pub(super) const MAX_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Dependencies held as failed at once, across rooms (#725). Past it the
+/// entry nearest its expiry gives way: forgetting one costs one repeat of
+/// the work the entry saved, and a peer serving bad bodies for many event
+/// IDs cannot grow the cache past this.
+const MAX_FAILED_DEPENDENCIES: usize = 4096;
+/// The longest `dependency_failure_ttl_secs` holds an entry. Also what
+/// keeps `Instant + ttl` clear of overflow for any configured value.
+const MAX_FAILURE_TTL: Duration = Duration::from_secs(86_400);
 
 /// The requests a 429 cools down, separately: a peer limiting duplicate
 /// `get_missing_events` calls has said nothing about `/state_ids`.
@@ -117,27 +158,65 @@ enum GapScope {
 
 type CooldownKey = (String, String, Endpoint);
 
-/// Per-room single flight for dependency recovery, and the peers this
-/// server is leaving alone after they answered 429.
+/// An event that failed verification: its ID, and the peer that served the
+/// body which failed, or `None` for a dependency of a pushed PDU whose
+/// recovery and gap acceptance failed, whoever was asked.
+type FailedKey = (String, Option<String>);
+
+/// Per-room single flight for dependency recovery, the recoveries in flight,
+/// the peers this server is leaving alone after they answered 429, the
+/// dependencies that failed verification lately, and the turns inbound
+/// transactions take at room work.
 ///
-/// Process-local on purpose: both are about requests in flight right now.
+/// Process-local on purpose: all of it is about requests made right now.
 /// A restart forgets them, which costs at most one more request per peer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RecoveryGate {
     /// One async lock per room with a recovery in flight. Weak, so a room
     /// nobody is recovering holds nothing; dead entries are swept on entry.
     rooms: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// `room` -> each event whose recovery is in flight there, and where
+    /// its verdict is published (#808). At most [`MAX_ROOM_RECOVERIES`]
+    /// for each room; a room with none has no entry.
+    inflight: Mutex<HashMap<String, InFlight>>,
     /// `(room, peer, endpoint)` -> not before.
     cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
     /// When each room and each origin was last admitted to a gap
     /// acceptance, within the cap's window.
     gap_admissions: Mutex<HashMap<GapScope, VecDeque<Instant>>>,
+    /// `room` -> what failed verification there -> held until (#725).
+    /// Keyed by room first, so the check that every PDU with a missing
+    /// dependency makes costs one lookup in a room with no failures.
+    failed: Mutex<HashMap<String, HashMap<FailedKey, Instant>>>,
+    /// How long an entry of `failed` holds. Zero turns the cache off.
+    failure_ttl: Duration,
+    /// [`super::INGEST_SLOTS`] turns at room work (`blocking` says why).
+    ingest: tokio::sync::Semaphore,
 }
 
 impl RecoveryGate {
+    /// A gate that holds a failed dependency for `failure_ttl`, at most
+    /// [`MAX_FAILURE_TTL`].
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(failure_ttl: Duration) -> Self {
+        Self {
+            rooms: Mutex::default(),
+            inflight: Mutex::default(),
+            cooldowns: Mutex::default(),
+            gap_admissions: Mutex::default(),
+            failed: Mutex::default(),
+            failure_ttl: failure_ttl.min(MAX_FAILURE_TTL),
+            ingest: tokio::sync::Semaphore::new(super::INGEST_SLOTS),
+        }
+    }
+
+    /// Wait for a turn at inbound room work. The wait is a task waiting,
+    /// not a thread, and the semaphore is fair, so a backlog drains in
+    /// arrival order. The permit is the turn.
+    pub(super) async fn ingest_turn(
+        &self,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        self.ingest.acquire().await
     }
 
     /// Wait for this room's turn to recover. The guard is the turn.
@@ -157,6 +236,48 @@ impl RecoveryGate {
             }
         };
         lock.lock_owned().await
+    }
+
+    /// Admit the recovery of `event_id` in `room_id` (#808): join the one
+    /// in flight for the same event, start one if the room has a place
+    /// for it, or refuse when it does not.
+    pub(super) fn admit(self: &Arc<Self>, room_id: &str, event_id: &str) -> Admission {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = inflight.entry(room_id.to_owned()).or_default();
+        if let Some((_, verdict)) = running.iter().find(|(id, _)| id == event_id) {
+            return Admission::Join(verdict.clone());
+        }
+        if running.len() >= MAX_ROOM_RECOVERIES {
+            return Admission::Busy;
+        }
+        let (sender, verdict) = watch::channel(None);
+        running.push((event_id.to_owned(), verdict.clone()));
+        Admission::Start(
+            Ticket {
+                gate: Arc::clone(self),
+                room_id: room_id.to_owned(),
+                event_id: event_id.to_owned(),
+                verdict: sender,
+            },
+            verdict,
+        )
+    }
+
+    /// Free the place of a recovery that ended.
+    fn release(&self, room_id: &str, event_id: &str) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(running) = inflight.get_mut(room_id) {
+            running.retain(|(id, _)| id != event_id);
+            if running.is_empty() {
+                inflight.remove(room_id);
+            }
+        }
     }
 
     /// Whether `peer` asked to be left alone for this room and endpoint.
@@ -227,6 +348,153 @@ impl RecoveryGate {
         admissions.entry(room).or_default().push_back(now);
         admissions.entry(from).or_default().push_back(now);
         Ok(())
+    }
+
+    /// Hold `events` of `room_id` as failed for the TTL (#725): served by
+    /// `peer` in a body that failed verification, or, with no peer, named
+    /// by a pushed PDU whose recovery and gap acceptance failed.
+    pub(super) fn distrust<'e>(
+        &self,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) {
+        self.distrust_at(Instant::now(), room_id, peer, events);
+    }
+
+    fn distrust_at<'e>(
+        &self,
+        now: Instant,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) {
+        if self.failure_ttl.is_zero() {
+            return;
+        }
+        let until = now + self.failure_ttl;
+        let mut failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failed.retain(|_, held| {
+            held.retain(|_, until| *until > now);
+            !held.is_empty()
+        });
+        let mut count: usize = failed.values().map(HashMap::len).sum();
+        for event in events {
+            let key = (event.to_owned(), peer.map(str::to_owned));
+            let known = failed
+                .get(room_id)
+                .is_some_and(|held| held.contains_key(&key));
+            if !known {
+                if count >= MAX_FAILED_DEPENDENCIES {
+                    evict_nearest_expiry(&mut failed);
+                } else {
+                    count += 1;
+                }
+            }
+            failed
+                .entry(room_id.to_owned())
+                .or_default()
+                .insert(key, until);
+        }
+    }
+
+    /// The first of `events` held as failed in `room_id` for `peer` (or,
+    /// with none, as a pushed PDU's dependency), if any.
+    pub(super) fn failed<'e>(
+        &self,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) -> Option<&'e str> {
+        self.failed_at(Instant::now(), room_id, peer, events)
+    }
+
+    fn failed_at<'e>(
+        &self,
+        now: Instant,
+        room_id: &str,
+        peer: Option<&str>,
+        events: impl IntoIterator<Item = &'e str>,
+    ) -> Option<&'e str> {
+        let failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = failed.get(room_id)?;
+        let peer = peer.map(str::to_owned);
+        events.into_iter().find(|event| {
+            held.get(&((*event).to_owned(), peer.clone()))
+                .is_some_and(|until| *until > now)
+        })
+    }
+
+    /// Forget what failed in `room_id`: a recovery or gap acceptance there
+    /// just succeeded, so the room's history and the keys this server holds
+    /// have changed, and what failed before may verify now.
+    pub(super) fn forgive(&self, room_id: &str) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(room_id);
+    }
+}
+
+/// What [`RecoveryGate::admit`] decided about one PDU's recovery.
+pub(super) enum Admission {
+    /// Run the recovery and publish its verdict on the ticket. The receiver
+    /// gets that verdict.
+    Start(Ticket, watch::Receiver<Option<Verdict>>),
+    /// The recovery of this event is in flight: wait for its verdict.
+    Join(watch::Receiver<Option<Verdict>>),
+    /// The room has [`MAX_ROOM_RECOVERIES`] in flight.
+    Busy,
+}
+
+/// The place of one recovery in [`RecoveryGate`]'s registry. When it is
+/// dropped the place is free again, also after a panic, so a recovery that
+/// failed cannot hold its room's place. A PDU that waits for a ticket that
+/// was dropped without a verdict sees the channel close.
+pub(super) struct Ticket {
+    gate: Arc<RecoveryGate>,
+    room_id: String,
+    event_id: String,
+    verdict: watch::Sender<Option<Verdict>>,
+}
+
+impl Ticket {
+    /// Give the verdict to every PDU that waits for it, and free the place.
+    /// The verdict is sent first, so a PDU that joins in between gets it.
+    fn publish(self, verdict: Verdict) {
+        self.verdict.send_replace(Some(verdict));
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.gate.release(&self.room_id, &self.event_id);
+    }
+}
+
+/// Drop the entry of `failed` that expires first. Every entry holds for the
+/// same TTL, so that is also the oldest. A scan, but only when the cache is
+/// full, on a path that just failed a verification.
+fn evict_nearest_expiry(failed: &mut HashMap<String, HashMap<FailedKey, Instant>>) {
+    let Some((room, key)) = failed
+        .iter()
+        .flat_map(|(room, held)| held.iter().map(move |(key, until)| (*until, room, key)))
+        .min_by_key(|(until, ..)| *until)
+        .map(|(_, room, key)| (room.clone(), key.clone()))
+    else {
+        return;
+    };
+    if let Some(held) = failed.get_mut(&room) {
+        held.remove(&key);
+        if held.is_empty() {
+            failed.remove(&room);
+        }
     }
 }
 
@@ -324,14 +592,8 @@ pub(super) async fn verify(
     expected: Option<&str>,
     keys: &mut HashMap<String, PeerKeys>,
 ) -> Result<VerifiedPdu, String> {
-    let CanonicalJsonValue::Object(canonical) =
-        CanonicalJsonValue::try_from(body.clone()).map_err(|error| error.to_string())?
-    else {
-        return Err("event is not a canonical object".to_owned());
-    };
-    let pdu = spindle_core::Pdu::from_remote(version.clone(), canonical.clone())
-        .map_err(|error| format!("event: {error:?}"))?;
-    if expected.is_some_and(|expected| pdu.event_id().as_str() != expected) {
+    let (id, canonical) = identify(version, body)?;
+    if expected.is_some_and(|expected| id != expected) {
         return Err("recovered event ID does not match the requested event".to_owned());
     }
     if body["room_id"]
@@ -340,9 +602,45 @@ pub(super) async fn verify(
     {
         return Err("recovered event belongs to another room".to_owned());
     }
+    let public_keys = signing_keys(peers, version, &canonical, body, keys).await?;
+    let body = check_signed(room_id, version, &canonical, &id, body, &public_keys)
+        .map_err(|refusal| refusal.explain(peers, keys, body, version))?;
+    Ok(VerifiedPdu { id, body })
+}
+
+/// The canonical form of a body read off the wire and the ID it hashes to
+/// under `version`. The reference hash is the costly part of reading an
+/// event, so a caller that must know the ID before deciding to verify
+/// (`resync`) computes it here once and hands both to [`check_signed`].
+pub(super) fn identify(
+    version: &RoomVersionId,
+    body: &Value,
+) -> Result<(String, ruma::CanonicalJsonObject), String> {
+    let CanonicalJsonValue::Object(canonical) =
+        CanonicalJsonValue::try_from(body.clone()).map_err(|error| error.to_string())?
+    else {
+        return Err("event is not a canonical object".to_owned());
+    };
+    let pdu = spindle_core::Pdu::from_remote(version.clone(), canonical.clone())
+        .map_err(|error| format!("event: {error:?}"))?;
+    Ok((pdu.event_id().as_str().to_owned(), canonical))
+}
+
+/// The public keys of every server whose signature the room version
+/// requires on this event: our own, held keys, or keys looked for further
+/// -- the server itself, then the notaries -- when they are not held.
+/// `keys` accumulates what was fetched, so a batch from one server fetches
+/// once.
+pub(super) async fn signing_keys(
+    peers: &Peers<'_>,
+    version: &RoomVersionId,
+    canonical: &ruma::CanonicalJsonObject,
+    body: &Value,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<ruma::signatures::PublicKeyMap, String> {
     let rules = spindle_core::rules_of(version).ok_or_else(|| "unknown room version".to_owned())?;
     let required =
-        ruma::signatures::required_server_signatures_to_verify_event(&canonical, &rules.signatures)
+        ruma::signatures::required_server_signatures_to_verify_event(canonical, &rules.signatures)
             .map_err(|error| error.to_string())?;
     let mut public_keys = ruma::signatures::PublicKeyMap::new();
     for server in required {
@@ -359,8 +657,7 @@ pub(super) async fn verify(
             continue;
         }
         // The keys the server signed this event with, valid when it says
-        // it signed it: from what is held, or looked for further -- the
-        // server itself, then the notaries -- when it is not.
+        // it signed it.
         let at = body["origin_server_ts"].as_u64();
         let fetched = peers
             .federation
@@ -378,36 +675,71 @@ pub(super) async fn verify(
         public_keys.extend(fetched.map_for(at, rules.enforce_key_validity));
         keys.insert(server.to_owned(), fetched);
     }
-    let verdict =
-        spindle_core::version::verify(&public_keys, &canonical, version).map_err(|error| {
-            let error = error.to_string();
-            // Name the failing server for the classification: the first
-            // required one whose keys are held, which is the one ruma
-            // reports on when only one is required.
-            let server = keys.keys().find(|server| error.contains(server.as_str()));
-            let held = server.and_then(|server| keys.get(server));
-            signature_refusal(
-                peers.metrics,
-                held,
-                server.map(String::as_str),
-                body,
-                version,
-                &error,
-            )
-        })?;
+    Ok(public_keys)
+}
+
+/// Why [`check_signed`] refused an event: its signatures, which are
+/// classified and explained against the keys held, or anything else.
+pub(super) enum Refusal {
+    Signature(String),
+    Other(String),
+}
+
+impl Refusal {
+    /// The refusal as [`verify`] words it, counting a signature failure
+    /// by reason.
+    pub(super) fn explain(
+        self,
+        peers: &Peers<'_>,
+        keys: &HashMap<String, PeerKeys>,
+        body: &Value,
+        version: &RoomVersionId,
+    ) -> String {
+        match self {
+            Self::Other(why) => why,
+            Self::Signature(error) => {
+                // Name the failing server for the classification: the
+                // first required one whose keys are held, which is the one
+                // ruma reports on when only one is required.
+                let server = keys.keys().find(|server| error.contains(server.as_str()));
+                let held = server.and_then(|server| keys.get(server));
+                signature_refusal(
+                    peers.metrics,
+                    held,
+                    server.map(String::as_str),
+                    body,
+                    version,
+                    &error,
+                )
+            }
+        }
+    }
+}
+
+/// The CPU half of [`verify`]: check the signatures against keys already
+/// gathered, redact a body whose content hash does not match, and parse
+/// the result as an event of `room_id`. Synchronous and free of shared
+/// state, so a batch can run on several threads.
+pub(super) fn check_signed(
+    room_id: &str,
+    version: &RoomVersionId,
+    canonical: &ruma::CanonicalJsonObject,
+    id: &str,
+    body: &Value,
+    public_keys: &ruma::signatures::PublicKeyMap,
+) -> Result<Value, Refusal> {
+    let verdict = spindle_core::version::verify(public_keys, canonical, version)
+        .map_err(|error| Refusal::Signature(error.to_string()))?;
     let body = match verdict {
         ruma::signatures::Verified::All => body.clone(),
         ruma::signatures::Verified::Signatures => {
-            let redacted = spindle_core::version::redact(&canonical, version)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_value(redacted).map_err(|error| error.to_string())?
+            let redacted = spindle_core::version::redact(canonical, version)
+                .map_err(|error| Refusal::Other(error.to_string()))?;
+            serde_json::to_value(redacted).map_err(|error| Refusal::Other(error.to_string()))?
         }
     };
-    crate::authorize::StoredEvent::parse_in(pdu.event_id().as_str(), room_id, &body)?;
-    Ok(VerifiedPdu {
-        id: pdu.event_id().as_str().to_owned(),
-        body,
-    })
+    crate::authorize::StoredEvent::parse_in(id, room_id, &body).map_err(Refusal::Other)?;
+    Ok(body)
 }
 
 /// Count a signature refusal by reason, and say why in the refusal: the
@@ -476,19 +808,73 @@ fn signature_refusal(
 /// The signatures in the PDU, not the origin, identify the sender's
 /// server: `verify` gets the keys of each server that the room version
 /// requires.
+///
+/// A PDU whose dependencies are being recovered comes back as
+/// [`Received::Recovering`], so the caller can judge the PDUs of other
+/// rooms before it waits for the verdict (#808).
 pub(super) async fn receive(
     state: &AppState,
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
-) -> (String, Result<(), String>) {
+) -> Received {
     let relayed = pdu["sender"]
         .as_str()
         .and_then(|sender| sender.split_once(':'))
         .is_some_and(|(_, domain)| domain != origin);
-    let (id, outcome, result) = Box::pin(judge(state, origin, origin_keys, pdu)).await;
-    state.metrics.record_pdu(outcome, relayed);
-    (id, result)
+    match Box::pin(judge(state, origin, origin_keys, pdu)).await {
+        Judged::Settled(id, outcome, result) => {
+            state.metrics.record_pdu(outcome, relayed);
+            Received::Settled(id, result)
+        }
+        Judged::Recovering(id, verdict) => Received::Recovering {
+            id,
+            relayed,
+            verdict,
+        },
+    }
+}
+
+/// What [`receive`] came to for one PDU.
+pub(super) enum Received {
+    /// The PDU's ID and its answer.
+    Settled(String, Result<(), String>),
+    /// The PDU's dependencies are being recovered, and the verdict of the
+    /// recovery is its answer.
+    Recovering {
+        id: String,
+        relayed: bool,
+        verdict: watch::Receiver<Option<Verdict>>,
+    },
+}
+
+impl Received {
+    /// The PDU's ID and its answer: for a recovery in flight, its verdict,
+    /// waited for until `deadline` at most (see [`SEND_BUDGET`]).
+    pub(super) async fn answer(
+        self,
+        state: &AppState,
+        deadline: tokio::time::Instant,
+    ) -> (String, Result<(), String>) {
+        match self {
+            Self::Settled(id, result) => (id, result),
+            Self::Recovering {
+                id,
+                relayed,
+                verdict,
+            } => {
+                let (outcome, result) = wait_for_verdict(verdict, deadline).await;
+                state.metrics.record_pdu(outcome, relayed);
+                (id, result)
+            }
+        }
+    }
+}
+
+/// What [`judge`] came to: a verdict, or a recovery in flight.
+enum Judged {
+    Settled(String, PduOutcome, Result<(), String>),
+    Recovering(String, watch::Receiver<Option<Verdict>>),
 }
 
 /// The version to judge an event for a room this server does not hold
@@ -519,14 +905,18 @@ fn unheld_room_version(state: &AppState, room_id: &str, pdu: &Value) -> Option<R
     Some(stated.unwrap_or_else(|| super::room_version_of(state, pdu)))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the receipt checks for one PDU, read top to bottom"
+)]
 async fn judge(
     state: &AppState,
     origin: &str,
     origin_keys: Option<&PeerKeys>,
     pdu: &Value,
-) -> (String, PduOutcome, Result<(), String>) {
+) -> Judged {
     let Some(room_id) = pdu["room_id"].as_str() else {
-        return (
+        return Judged::Settled(
             "$malformed".to_owned(),
             PduOutcome::Refused,
             Err("no room_id".to_owned()),
@@ -543,7 +933,7 @@ async fn judge(
         Err(RoomError::UnknownRoom(_)) => match unheld_room_version(state, room_id, pdu) {
             Some(version) => version,
             None => {
-                return (
+                return Judged::Settled(
                     "$unknown-room".to_owned(),
                     PduOutcome::Refused,
                     Err(format!("unknown room: this server does not hold {room_id}")),
@@ -552,6 +942,13 @@ async fn judge(
         },
         Err(_) => super::room_version_of(state, pdu),
     };
+    if let Err(refusal) = server_acl_admits(state, room_id, origin) {
+        return Judged::Settled(
+            pdu_id_or_malformed(&version, pdu),
+            PduOutcome::Refused,
+            Err(refusal),
+        );
+    }
     // The room is known before any key is fetched. Thus a relayed PDU
     // cannot cause key fetches for a room this server does not hold.
     let mut keys = HashMap::new();
@@ -561,23 +958,16 @@ async fn judge(
     let mut event = match verify(&Peers::of(state), room_id, &version, pdu, None, &mut keys).await {
         Ok(event) => event,
         Err(error) => {
-            let id = CanonicalJsonValue::try_from(pdu.clone())
-                .ok()
-                .and_then(|value| {
-                    let CanonicalJsonValue::Object(canonical) = value else {
-                        return None;
-                    };
-                    spindle_core::Pdu::from_remote(version.clone(), canonical)
-                        .ok()
-                        .map(|event| event.event_id().as_str().to_owned())
-                })
-                .unwrap_or_else(|| "$malformed".to_owned());
-            return (id, PduOutcome::Refused, Err(error));
+            return Judged::Settled(
+                pdu_id_or_malformed(&version, pdu),
+                PduOutcome::Refused,
+                Err(error),
+            );
         }
     };
     if let Err(error) = state.rooms.authorize_policy(room_id, &mut event.body).await {
         if !matches!(error, RoomError::Forbidden(_) | RoomError::Policy(_)) {
-            return (event.id, PduOutcome::Refused, Err(error.to_string()));
+            return Judged::Settled(event.id, PduOutcome::Refused, Err(error.to_string()));
         }
         // Ordinary auth is still checked before the event is soft-failed.
         tracing::debug!(
@@ -587,66 +977,283 @@ async fn judge(
         );
     }
     let error = match state.rooms.receive_live(room_id, &event.id, &event.body) {
-        Ok(()) => return (event.id, PduOutcome::Accepted, Ok(())),
+        Ok(()) => return Judged::Settled(event.id, PduOutcome::Accepted, Ok(())),
         Err(error) => error,
     };
     // A rejection is already a verdict. Recovery fills an absent dependency;
     // it must not reconsider a stored historical or native rejection.
     if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
-        return (event.id, classify(&error), Err(error.to_string()));
+        return Judged::Settled(event.id, classify(&error), Err(error.to_string()));
     }
-    if !has_missing(state, room_id, &event.body) {
-        return (event.id, PduOutcome::Refused, Err(error.to_string()));
-    }
+    let Some(missing) = missing_dependencies(&Peers::of(state), room_id, &event.body) else {
+        return Judged::Settled(event.id, PduOutcome::Refused, Err(error.to_string()));
+    };
     // Recovery asks a participating peer about a room we hold; no unsigned
     // third-party name can trigger an arbitrary dependency fetch.
     if !state.rooms.server_in_room(room_id, origin).unwrap_or(false) {
-        return (
+        return Judged::Settled(
             event.id,
             PduOutcome::RefusedMissingDeps,
             Err(error.to_string()),
         );
     }
+    // Before the room's turn: a PDU whose dependency failed a moment ago is
+    // refused at once, not after the recovery in flight ahead of it.
+    if let Some((outcome, result)) = failed_recently(&Peers::of(state), room_id, &missing) {
+        owe(&Peers::of(state), origin, room_id, &event);
+        return Judged::Settled(event.id, outcome, result);
+    }
 
-    // The rest runs as its own task, so a sending server that gives up on
-    // the transaction does not cancel a recovery halfway: the work finishes,
-    // and the transaction's retry finds the event already placed. It holds
-    // the room's turn for as long as it runs.
+    // The recovery runs as its own task, so a sending server that gives up
+    // on the transaction does not cancel it halfway, and `/send` stops
+    // waiting for it at its budget (#808). It holds the room's turn for as
+    // long as it runs. A blocking-pool task rather than a spawned one: it
+    // ingests what it fetched and resolves state over it, which on a
+    // worker held that worker for as long (#614).
     let id = event.id.clone();
-    let task = {
-        let state = state.clone();
-        let origin = origin.to_owned();
-        let room_id = room_id.to_owned();
-        async move {
-            let Ok(turn) =
-                tokio::time::timeout(RECOVERY_WAIT, state.recovery.enter(&room_id)).await
-            else {
-                return (
-                    PduOutcome::RefusedMissingDeps,
-                    Err("another dependency recovery for this room is still running".to_owned()),
-                );
-            };
-            let outcome = resolve(&state, &origin, &room_id, &version, &event, &mut keys).await;
-            drop(turn);
-            outcome
+    let verdict = match state.recovery.admit(room_id, &id) {
+        Admission::Busy => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Busy);
+            owe(&Peers::of(state), origin, room_id, &event);
+            return Judged::Settled(
+                id,
+                PduOutcome::RefusedMissingDeps,
+                Err(format!(
+                    "{error}; this room already has {MAX_ROOM_RECOVERIES} dependency \
+                     recoveries in flight, so this event is not recovered now"
+                )),
+            );
+        }
+        Admission::Join(verdict) => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Joined);
+            verdict
+        }
+        Admission::Start(ticket, verdict) => {
+            state
+                .metrics
+                .record_recovery_admission(RecoveryAdmission::Started);
+            let state = state.clone();
+            let origin = origin.to_owned();
+            let room_id = room_id.to_owned();
+            // The handle is dropped: the task runs to its end.
+            drop(spawn_detached(
+                Arc::clone(&state.metrics),
+                BlockingTask::FederationCatchUp,
+                async move {
+                    let turn = state.recovery.enter(&room_id).await;
+                    let verdict = resolve(
+                        &Peers::of(&state),
+                        GapCaps::of(&state.config.federation),
+                        &origin,
+                        &room_id,
+                        &version,
+                        &event,
+                        &mut keys,
+                    )
+                    .await;
+                    drop(turn);
+                    ticket.publish(verdict);
+                },
+            ));
+            verdict
         }
     };
-    match tokio::spawn(task).await {
-        Ok((outcome, result)) => (id, outcome, result),
-        Err(error) => (
-            id,
-            PduOutcome::RefusedMissingDeps,
-            Err(format!("dependency recovery failed: {error}")),
+    Judged::Recovering(id, verdict)
+}
+
+/// The verdict of a recovery in flight, or [`PduOutcome::Pending`] if it is
+/// still running at `deadline`.
+///
+/// A pending PDU gets an error string, not `{}`. The recovery can still
+/// fail, and `{}` says that the event was received. Senders do not resend
+/// an event for an error in the PDU results of a transaction that was
+/// answered 200: Synapse logs it and goes on. Spindle's own sender does the
+/// same. So the error costs the sender nothing, and the recovery still
+/// places the event when it succeeds.
+async fn wait_for_verdict(
+    mut verdict: watch::Receiver<Option<Verdict>>,
+    deadline: tokio::time::Instant,
+) -> Verdict {
+    match tokio::time::timeout_at(deadline, verdict.wait_for(Option::is_some)).await {
+        Ok(Ok(held)) => held.clone().unwrap_or_else(recovery_lost),
+        // The task ended with no verdict: it panicked.
+        Ok(Err(_)) => recovery_lost(),
+        Err(_) => (
+            PduOutcome::Pending,
+            Err("dependency recovery for this event is still running; \
+                 it continues, and places the event if it succeeds"
+                .to_owned()),
         ),
     }
 }
 
-/// Whether the event names a predecessor or auth event this room lacks.
-fn has_missing(state: &AppState, room_id: &str, body: &Value) -> bool {
+fn recovery_lost() -> Verdict {
+    (
+        PduOutcome::RefusedMissingDeps,
+        Err("dependency recovery failed".to_owned()),
+    )
+}
+
+/// Owed events retried before one is given up on. With the backoff doubling
+/// from `gap_backfill_retry_ms` and capped at an hour, a day or more.
+const MAX_OWED_ATTEMPTS: u64 = 8;
+/// The longest wait between two retries of one owed event.
+const MAX_OWED_WAIT: Duration = Duration::from_secs(3600);
+
+/// Keep a PDU this server refused for missing dependencies, with no verdict
+/// stored, so the backfill loop tries it again (#822). The sender got `200`
+/// and will not send it again; if it is the newest event of a room that
+/// then goes quiet, this server would otherwise stay diverged from the
+/// room until someone speaks in it.
+fn owe(peers: &Peers<'_>, origin: &str, room_id: &str, event: &VerifiedPdu) {
+    match peers
+        .rooms
+        .owe_event(room_id, &event.id, origin, &event.body)
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            room = room_id,
+            event_id = %event.id,
+            "not retrying a refused event later: the room already owes the most it may"
+        ),
+        Err(error) => tracing::warn!(
+            room = room_id,
+            event_id = %event.id,
+            "cannot record an event owed a retry: {error}"
+        ),
+    }
+}
+
+/// Try the owed event that is due next, if one is: the retry half of
+/// [`owe`], run by the gap-backfill loop. Returns whether one was tried.
+///
+/// The event goes through [`resolve`] as it did when it arrived, under the
+/// room's turn: it is applied if its dependencies came since, recovered if
+/// a peer can serve them now, or left owed with a longer wait. After
+/// [`MAX_OWED_ATTEMPTS`] it is dropped, as is an event whose room, or whose
+/// sender's place in it, is gone. Any other verdict ends the debt too.
+pub(super) async fn retry_owed(peers: &Peers<'_>, caps: GapCaps, base: Duration, now: u64) -> bool {
+    let owed = match peers.rooms.owed_events() {
+        Ok(owed) => owed,
+        Err(error) => {
+            tracing::warn!("cannot read the owed events: {error}");
+            return false;
+        }
+    };
+    peers
+        .metrics
+        .set_owed_events(u64::try_from(owed.len()).unwrap_or(u64::MAX));
+    let Some((room_id, event_id, mut record)) = owed
+        .into_iter()
+        .find(|(_, _, record)| record["next_ms"].as_u64().unwrap_or(0) <= now)
+    else {
+        return false;
+    };
+    let origin = record["origin"].as_str().unwrap_or_default().to_owned();
+    let event = VerifiedPdu {
+        id: event_id.clone(),
+        body: record["pdu"].clone(),
+    };
+    // A room this server left, a sender that left it, or one the room's ACL
+    // now denies has nothing more to be owed.
+    let admitted = peers
+        .rooms
+        .server_in_room(&room_id, &origin)
+        .unwrap_or(false)
+        && matches!(peers.rooms.server_acl_permits(&room_id, &origin), Ok(true));
+    let (Ok(version), true) = (peers.rooms.room_version(&room_id), admitted) else {
+        let _ = peers.rooms.delete_owed_event(&room_id, &event_id);
+        return true;
+    };
+    let mut keys = HashMap::new();
+    let turn = peers.recovery.enter(&room_id).await;
+    let (outcome, result) =
+        resolve(peers, caps, &origin, &room_id, &version, &event, &mut keys).await;
+    drop(turn);
+    if outcome == PduOutcome::RefusedMissingDeps {
+        let attempts = record["attempts"].as_u64().unwrap_or(0) + 1;
+        if attempts >= MAX_OWED_ATTEMPTS {
+            tracing::warn!(
+                room = room_id,
+                event_id = %event_id,
+                "giving up on an owed event after {attempts} tries: {}",
+                result.err().unwrap_or_default()
+            );
+        } else {
+            let wait = base
+                .saturating_mul(1_u32 << attempts.min(16))
+                .min(MAX_OWED_WAIT);
+            record["attempts"] = json!(attempts);
+            record["next_ms"] =
+                json!(now.saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)));
+            if peers
+                .rooms
+                .put_owed_event(&room_id, &event_id, &record)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    } else {
+        tracing::info!(
+            room = room_id,
+            event_id = %event_id,
+            outcome = ?outcome,
+            "an owed event is settled"
+        );
+    }
+    let _ = peers.rooms.delete_owed_event(&room_id, &event_id);
+    true
+}
+
+/// The predecessors and auth events the event names that this room lacks,
+/// if there are any.
+fn missing_dependencies(
+    state: &Peers<'_>,
+    room_id: &str,
+    body: &Value,
+) -> Option<(Vec<String>, Vec<String>)> {
     state
         .rooms
         .missing_remote_dependencies(room_id, body)
-        .is_ok_and(|(predecessors, auth)| !predecessors.is_empty() || !auth.is_empty())
+        .ok()
+        .filter(|(predecessors, auth)| !predecessors.is_empty() || !auth.is_empty())
+}
+
+/// Every ID in a [`missing_dependencies`] answer.
+fn dependencies(missing: &(Vec<String>, Vec<String>)) -> impl Iterator<Item = &str> {
+    missing.0.iter().chain(&missing.1).map(String::as_str)
+}
+
+/// The refusal of an event that names a dependency which failed
+/// verification within the TTL (#725), if it does. The recovery and gap
+/// acceptance it would start ended in that failure moments ago; asking
+/// again costs every peer the same fetches for the same answer, once per
+/// PDU that names it. A sender that was answered 200 does not send the
+/// event again, so the caller keeps it owed ([`owe`]): the backfill loop
+/// judges it again once the entry expires.
+fn failed_recently(
+    state: &Peers<'_>,
+    room_id: &str,
+    missing: &(Vec<String>, Vec<String>),
+) -> Option<(PduOutcome, Result<(), String>)> {
+    let dependency = state
+        .recovery
+        .failed(room_id, None, dependencies(missing))?;
+    state
+        .metrics
+        .record_recovery(RecoveryResult::NegativeCached, Duration::ZERO);
+    Some((
+        PduOutcome::RefusedMissingDeps,
+        Err(format!(
+            "dependency {dependency} failed verification recently; \
+             it is not fetched again until that expires"
+        )),
+    ))
 }
 
 /// With the room's turn held: try the ordinary path again, then recovery
@@ -656,7 +1263,8 @@ fn has_missing(state: &AppState, room_id: &str, body: &Value) -> bool {
     reason = "the fallback ladder for one PDU, read top to bottom"
 )]
 async fn resolve(
-    state: &AppState,
+    state: &Peers<'_>,
+    caps: GapCaps,
     origin: &str,
     room_id: &str,
     version: &RoomVersionId,
@@ -672,13 +1280,15 @@ async fn resolve(
     if !matches!(error, RoomError::Append(_) | RoomError::MissingBody(_)) {
         return (classify(&error), Err(error.to_string()));
     }
-    let missing = match state
-        .rooms
-        .missing_remote_dependencies(room_id, &event.body)
-    {
-        Ok(missing) if !missing.0.is_empty() || !missing.1.is_empty() => missing,
-        _ => return (PduOutcome::Refused, Err(error.to_string())),
+    let Some(missing) = missing_dependencies(state, room_id, &event.body) else {
+        return (PduOutcome::Refused, Err(error.to_string()));
     };
+    // Again with the turn held: the recovery this PDU waited for may have
+    // failed on the same dependency.
+    if let Some(refusal) = failed_recently(state, room_id, &missing) {
+        owe(state, origin, room_id, event);
+        return refusal;
+    }
 
     let mut last = error.to_string();
     for peer in recovery_peers(state, origin, room_id) {
@@ -694,6 +1304,7 @@ async fn resolve(
                 state
                     .metrics
                     .record_recovery(RecoveryResult::Recovered, elapsed);
+                state.recovery.forgive(room_id);
                 return match state.rooms.receive_live(room_id, &event.id, &event.body) {
                     Ok(()) => (PduOutcome::Accepted, Ok(())),
                     Err(error) => (classify(&error), Err(error.to_string())),
@@ -741,6 +1352,11 @@ async fn resolve(
                 state
                     .metrics
                     .record_recovery(RecoveryResult::Invalid, elapsed);
+                if matches!(failure, Failure::Invalid(_)) {
+                    state
+                        .recovery
+                        .distrust(room_id, None, dependencies(&missing));
+                }
                 return (PduOutcome::RefusedMissingDeps, Err(failure.message()));
             }
             Err(_) => {
@@ -757,11 +1373,7 @@ async fn resolve(
     // thousands of events, so a room, and an origin across rooms, get only
     // so many per window. Past the cap the PDU is refused as before gap
     // acceptance existed, and the sender's retry is judged again later.
-    if let Err(capped) =
-        state
-            .recovery
-            .admit_gap(room_id, origin, GapCaps::of(&state.config.federation))
-    {
+    if let Err(capped) = state.recovery.admit_gap(room_id, origin, caps) {
         state.metrics.record_gap(capped);
         tracing::warn!(
             room = room_id,
@@ -770,6 +1382,7 @@ async fn resolve(
             cap = ?capped,
             "refused a gap acceptance: the cap for this window is reached"
         );
+        owe(state, origin, room_id, event);
         return (
             PduOutcome::RefusedMissingDeps,
             Err(format!(
@@ -785,6 +1398,7 @@ async fn resolve(
     let failure = match attempt {
         Ok(Ok(Some(missing))) => {
             state.metrics.record_gap(GapResult::Accepted);
+            state.recovery.forgive(room_id);
             tracing::info!(
                 room = room_id,
                 event_id = %event.id,
@@ -798,11 +1412,13 @@ async fn resolve(
         // Its parents arrived while the state was fetched: an ordinary append.
         Ok(Ok(None)) => {
             state.metrics.record_gap(GapResult::Accepted);
+            state.recovery.forgive(room_id);
             return (PduOutcome::Accepted, Ok(()));
         }
         Ok(Err(failure)) => failure,
         Err(_) => {
             state.metrics.record_gap(GapResult::Timeout);
+            owe(state, origin, room_id, event);
             return (
                 PduOutcome::RefusedMissingDeps,
                 Err(format!(
@@ -818,10 +1434,22 @@ async fn resolve(
             ..
         } => (GapResult::RateLimited, PduOutcome::RefusedMissingDeps),
         Failure::Peer { .. } => (GapResult::PeerError, PduOutcome::RefusedMissingDeps),
-        Failure::Invalid(_) => (GapResult::Invalid, PduOutcome::RefusedMissingDeps),
+        Failure::Invalid(_) => {
+            // Nothing a peer can serve for these verifies now: refuse the
+            // next PDU that names them at once (#725).
+            state
+                .recovery
+                .distrust(room_id, None, dependencies(&missing));
+            (GapResult::Invalid, PduOutcome::RefusedMissingDeps)
+        }
         Failure::Verdict(error) => (GapResult::Invalid, classify(error)),
     };
     state.metrics.record_gap(result);
+    // A peer that could not answer says nothing about the event; a forged
+    // or unauthorised answer is a verdict, and is not retried.
+    if matches!(failure, Failure::Budget(_) | Failure::Peer { .. }) {
+        owe(state, origin, room_id, event);
+    }
     (
         outcome,
         Err(format!(
@@ -835,7 +1463,7 @@ async fn resolve(
 /// with the most members joined to the room (#620: a server whose users
 /// have all left answers 403, and alphabetical order once picked exactly
 /// that one), leaving out any still cooling down from a 429 or a 403.
-fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> {
+fn recovery_peers(state: &Peers<'_>, origin: &str, room_id: &str) -> Vec<String> {
     let mut peers = Vec::with_capacity(2);
     if state.recovery.cooling(room_id, origin, Endpoint::Recovery) {
         state
@@ -851,7 +1479,7 @@ fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> 
         .into_iter()
         .find(|domain| {
             domain != origin
-                && *domain != state.config.server.name
+                && *domain != state.server_name
                 && !state.recovery.cooling(room_id, domain, Endpoint::Recovery)
         })
     {
@@ -866,7 +1494,7 @@ fn recovery_peers(state: &AppState, origin: &str, room_id: &str) -> Vec<String> 
     reason = "one verified event and its bounded predecessor recovery"
 )]
 async fn recover(
-    state: &AppState,
+    state: &Peers<'_>,
     peer: &str,
     room_id: &str,
     version: &RoomVersionId,
@@ -921,7 +1549,7 @@ async fn recover(
                 .map_err(|error| Failure::from_peer(&error))?,
         };
         charge(&body, &mut bytes, MAX_RECOVERED_BYTES)?;
-        let event = verify(&Peers::of(state), room_id, version, &body, Some(&id), keys)
+        let event = verify(state, room_id, version, &body, Some(&id), keys)
             .await
             .map_err(Failure::Invalid)?;
         if event.id != id {
@@ -984,7 +1612,7 @@ async fn recover(
     Ok(())
 }
 
-fn predecessor_missing(state: &AppState, room_id: &str, id: &str) -> Result<bool, Failure> {
+fn predecessor_missing(state: &Peers<'_>, room_id: &str, id: &str) -> Result<bool, Failure> {
     Ok(!state
         .rooms
         .missing_remote_dependencies(room_id, &json!({"prev_events":[id]}))?
@@ -997,7 +1625,7 @@ fn predecessor_missing(state: &AppState, room_id: &str, id: &str) -> Result<bool
     reason = "auth closure shares the verified event's recovery context"
 )]
 async fn recover_auth(
-    state: &AppState,
+    state: &Peers<'_>,
     peer: &str,
     room_id: &str,
     version: &RoomVersionId,
@@ -1034,7 +1662,7 @@ async fn recover_auth(
                 .map_err(|error| Failure::from_peer(&error))?,
         };
         charge(&body, bytes, MAX_RECOVERED_BYTES)?;
-        let event = verify(&Peers::of(state), room_id, version, &body, Some(&id), keys)
+        let event = verify(state, room_id, version, &body, Some(&id), keys)
             .await
             .map_err(Failure::Invalid)?;
         if event.id != id {
@@ -1078,4 +1706,142 @@ pub(super) fn charge(body: &Value, bytes: &mut usize, limit: usize) -> Result<()
 /// A collection's length as a counter increment.
 pub(super) fn count(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
+}
+
+/// The event's ID if the body parses as a PDU of `version`, else
+/// `$malformed`: the name a refusal is filed under before verification.
+fn pdu_id_or_malformed(version: &RoomVersionId, pdu: &Value) -> String {
+    CanonicalJsonValue::try_from(pdu.clone())
+        .ok()
+        .and_then(|value| {
+            let CanonicalJsonValue::Object(canonical) = value else {
+                return None;
+            };
+            spindle_core::Pdu::from_remote(version.clone(), canonical)
+                .ok()
+                .map(|event| event.event_id().as_str().to_owned())
+        })
+        .unwrap_or_else(|| "$malformed".to_owned())
+}
+
+/// The room's `m.room.server_acl` judges the origin before a key is
+/// fetched or a signature checked: a denied server gets no work done on
+/// its behalf. A room this server does not hold has no ACL to consult,
+/// and the one event such a room may deliver (`unheld_room_version`) is
+/// about our own user's invite, which no ACL is for. A store error fails
+/// closed.
+fn server_acl_admits(state: &AppState, room_id: &str, origin: &str) -> Result<(), String> {
+    match state.rooms.server_acl_permits(room_id, origin) {
+        Ok(true) | Err(RoomError::UnknownRoom(_)) => Ok(()),
+        Ok(false) => Err(format!("{origin} is denied by the room's server ACL")),
+        Err(error) => Err(format!("the room's server ACL cannot be read: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(gate: &RecoveryGate) -> usize {
+        gate.failed.lock().unwrap().values().map(HashMap::len).sum()
+    }
+
+    /// A dependency is held for the TTL, in its room, for whoever served it,
+    /// and a success in the room forgets it.
+    #[test]
+    fn a_failed_dependency_is_held_for_the_ttl_and_forgiven_on_success() {
+        let gate = RecoveryGate::new(Duration::from_secs(60));
+        let now = Instant::now();
+        gate.distrust_at(now, "!room", None, ["$named"]);
+        gate.distrust_at(now, "!room", Some("bad.example"), ["$served"]);
+
+        assert_eq!(
+            gate.failed_at(now, "!room", None, ["$other", "$named"]),
+            Some("$named")
+        );
+        assert_eq!(gate.failed_at(now, "!elsewhere", None, ["$named"]), None);
+        assert_eq!(
+            gate.failed_at(now, "!room", Some("bad.example"), ["$served"]),
+            Some("$served")
+        );
+        assert_eq!(
+            gate.failed_at(now, "!room", Some("good.example"), ["$served"]),
+            None,
+            "another peer's body may verify"
+        );
+        assert_eq!(gate.failed_at(now, "!room", None, ["$served"]), None);
+
+        let expired = now + Duration::from_secs(60);
+        assert_eq!(gate.failed_at(expired, "!room", None, ["$named"]), None);
+
+        gate.forgive("!room");
+        assert_eq!(gate.failed_at(now, "!room", None, ["$named"]), None);
+        assert_eq!(held(&gate), 0);
+    }
+
+    /// Past the cap the oldest entry gives way, so the cache never grows
+    /// past [`MAX_FAILED_DEPENDENCIES`] however many IDs a peer names.
+    #[test]
+    fn the_cache_is_bounded_and_drops_the_oldest_entry() {
+        let gate = RecoveryGate::new(Duration::from_secs(600));
+        let start = Instant::now();
+        for index in 0..=MAX_FAILED_DEPENDENCIES {
+            let at = start + Duration::from_millis(u64::try_from(index).unwrap());
+            gate.distrust_at(at, "!room", None, [format!("${index}").as_str()]);
+        }
+        assert_eq!(held(&gate), MAX_FAILED_DEPENDENCIES);
+        let last = format!("${MAX_FAILED_DEPENDENCIES}");
+        assert_eq!(gate.failed_at(start, "!room", None, ["$0"]), None);
+        assert_eq!(gate.failed_at(start, "!room", None, ["$1"]), Some("$1"));
+        assert_eq!(
+            gate.failed_at(start, "!room", None, [last.as_str()]),
+            Some(last.as_str())
+        );
+    }
+
+    /// A TTL of zero turns the cache off.
+    #[test]
+    fn a_zero_ttl_holds_nothing() {
+        let gate = RecoveryGate::new(Duration::ZERO);
+        let now = Instant::now();
+        gate.distrust_at(now, "!room", None, ["$named"]);
+        assert_eq!(gate.failed_at(now, "!room", None, ["$named"]), None);
+        assert_eq!(held(&gate), 0);
+    }
+
+    /// #808: the same event joins the recovery in flight for it, a room has
+    /// at most two in flight, another room is not counted against it, and a
+    /// ticket dropped without a verdict frees its place and closes the
+    /// channel of whoever waits.
+    #[test]
+    fn a_room_holds_two_recoveries_and_a_retry_joins_its_own() {
+        let gate = Arc::new(RecoveryGate::new(Duration::ZERO));
+        let Admission::Start(first, _) = gate.admit("!room", "$first") else {
+            panic!("the first recovery starts");
+        };
+        let Admission::Join(mut joined) = gate.admit("!room", "$first") else {
+            panic!("a retry joins the recovery in flight");
+        };
+        let Admission::Start(second, _) = gate.admit("!room", "$second") else {
+            panic!("one more recovery waits for the room's turn");
+        };
+        assert!(matches!(gate.admit("!room", "$third"), Admission::Busy));
+        assert!(matches!(
+            gate.admit("!other", "$third"),
+            Admission::Start(..)
+        ));
+
+        first.publish((PduOutcome::Accepted, Ok(())));
+        assert!(matches!(
+            *joined.borrow_and_update(),
+            Some((PduOutcome::Accepted, Ok(())))
+        ));
+        let Admission::Start(third, waiting) = gate.admit("!room", "$third") else {
+            panic!("a finished recovery frees its place");
+        };
+        drop(third);
+        assert!(waiting.has_changed().is_err(), "a lost recovery closes");
+        drop(second);
+        assert!(gate.inflight.lock().unwrap().is_empty());
+    }
 }

@@ -3,11 +3,13 @@
 //! `spindle promote-admin <config> <localpart>` mints the first admin
 //! against the store with the server stopped (#83), and `spindle migrate
 //! <config> [--dry-run]` moves a store forward to this binary's schema
-//! (#20). `accounts.rs` and `spindle-store`'s `schema_migration` tests
-//! cover the operations; these cover the command line around them, which
-//! is what an operator actually types -- the usage refusals, the exit
-//! codes, and the one coupling that matters most: a store one schema
-//! behind makes *every* ordinary command refuse and name `migrate`.
+//! (#20), listing its steps with `--list` (#661) and reporting progress as
+//! text or JSON (#656). `accounts.rs` and `spindle-store`'s
+//! `schema_migration` tests cover the operations; these cover the command
+//! line around them, which is what an operator actually types -- the usage
+//! refusals, the exit codes, the output a script parses, and the one
+//! coupling that matters most: a store one schema behind makes *every*
+//! ordinary command refuse and name `migrate`.
 
 use std::process::Command;
 
@@ -160,6 +162,190 @@ fn a_store_behind_the_schema_is_refused_by_every_command_that_opens_it() {
     let config_loaded = spindle_server::Config::load(config.to_str().unwrap()).unwrap();
     let store = spindle_store::FjallStore::open_unchecked(&config_loaded.storage.path).unwrap();
     assert_eq!(spindle_store::migrate::marker_of(&store).unwrap(), stale);
+}
+
+/// A store stamped as the last schema-2 binary left it, with no rooms: the
+/// real step runs over it end to end in milliseconds.
+fn digest_two_store(work: &TempDir) -> std::path::PathBuf {
+    let config = config_for(work, "data");
+    let loaded = spindle_server::Config::load(config.to_str().unwrap()).unwrap();
+    let store = spindle_store::FjallStore::open_unchecked(&loaded.storage.path).unwrap();
+    let old = spindle_store::SchemaMarker {
+        content_digest: 2,
+        ..spindle_store::SchemaMarker::current()
+    };
+    store
+        .put(&spindle_core::keys::store_marker(), &old.encode())
+        .unwrap();
+    config
+}
+
+/// Without a store, `--list` is the release's own list of steps (#661):
+/// what an operator reads before choosing which binary to upgrade to.
+#[test]
+fn migrate_list_names_every_step_this_binary_carries() {
+    let output = run(&[os("migrate"), os("--list")]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("[intern-state-keys] 1/1/2 -> 1/1/3 [IRREVERSIBLE]"),
+        "{stdout}"
+    );
+}
+
+/// With a store, `--list` says where each step stands on it, and the dry
+/// run names the step it would take.
+#[test]
+fn migrate_list_and_dry_run_show_the_steps_a_store_still_needs() {
+    let work = TempDir::new().unwrap();
+    let fresh = config_for(&work, "fresh");
+    drop(store_of(&fresh));
+    let listed = run(&[os("migrate"), os("--list"), fresh.as_os_str()]);
+    assert!(listed.status.success(), "{}", text(&listed.stderr));
+    assert!(
+        text(&listed.stdout).contains("[intern-state-keys] 1/1/2 -> 1/1/3 [IRREVERSIBLE] "),
+        "{}",
+        text(&listed.stdout)
+    );
+    assert!(
+        text(&listed.stdout).contains(": not needed by this store"),
+        "{}",
+        text(&listed.stdout)
+    );
+
+    let config = digest_two_store(&work);
+    let listed = run(&[os("migrate"), os("--list"), config.as_os_str()]);
+    assert!(
+        text(&listed.stdout).contains("this store is at schema 1/1/2"),
+        "{}",
+        text(&listed.stdout)
+    );
+    assert!(
+        text(&listed.stdout).contains("(#79): pending"),
+        "{}",
+        text(&listed.stdout)
+    );
+    let planned = run(&[os("migrate"), config.as_os_str(), os("--dry-run")]);
+    assert!(planned.status.success(), "{}", text(&planned.stderr));
+    assert!(
+        text(&planned.stdout).contains("would apply [intern-state-keys] [IRREVERSIBLE]"),
+        "{}",
+        text(&planned.stdout)
+    );
+}
+
+/// `--progress json` writes one object per stderr line (#656): the step,
+/// each phase from start to end with its unit, a count and a total where
+/// there is one, and the step's end. Afterwards the ledger records it.
+#[test]
+fn migrate_with_json_progress_reports_every_phase_and_records_the_step() {
+    let work = TempDir::new().unwrap();
+    let config = digest_two_store(&work);
+
+    let output = run(&[
+        os("migrate"),
+        config.as_os_str(),
+        os("--progress"),
+        os("json"),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("CANNOT be undone"));
+    let events: Vec<serde_json::Value> = text(&output.stderr)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}")))
+        .collect();
+    assert_eq!(events[0]["event"], "started");
+    assert_eq!(events[0]["step"], "intern-state-keys");
+    assert_eq!(events[0]["from"], "1/1/2");
+    assert_eq!(events[events.len() - 1]["event"], "applied");
+    let phases: Vec<(&str, &str)> = events
+        .iter()
+        .filter(|event| event["event"] == "progress")
+        .map(|event| {
+            (
+                event["phase"].as_str().unwrap(),
+                event["stage"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            ("count", "started"),
+            ("count", "finished"),
+            ("convert", "started"),
+            ("convert", "finished"),
+            ("delete-v2-nodes", "started"),
+            ("delete-v2-nodes", "finished"),
+        ]
+    );
+    let count = &events[1];
+    assert!(
+        count["total"].is_null() && count["percent"].is_null() && count["eta_seconds"].is_null()
+    );
+    assert_eq!(count["unit"], "records");
+    let converted = &events[4];
+    assert_eq!(
+        (
+            &converted["done"],
+            &converted["total"],
+            &converted["percent"]
+        ),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!(0),
+            &serde_json::json!(100.0)
+        )
+    );
+
+    let listed = run(&[os("migrate"), os("--list"), config.as_os_str()]);
+    assert!(
+        text(&listed.stdout).contains("(#79): applied at unix time"),
+        "{}",
+        text(&listed.stdout)
+    );
+    let again = run(&[os("migrate"), config.as_os_str()]);
+    assert!(text(&again.stdout).contains("already at this binary's schema"));
+}
+
+/// The default progress is text an operator reads in a terminal or a pod
+/// log, naming the step and phase on every line.
+#[test]
+fn migrate_reports_text_progress_on_stderr_by_default() {
+    let work = TempDir::new().unwrap();
+    let config = digest_two_store(&work);
+    let output = run(&[os("migrate"), config.as_os_str()]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    for line in [
+        "migrate: [intern-state-keys] started: rewrite version-2 state tries",
+        "migrate: [intern-state-keys] count started: 0 records so far, total unknown",
+        "migrate: [intern-state-keys] count done: 0 records,",
+        "migrate: [intern-state-keys] convert done: 0/0 records (100.0%)",
+        "migrate: [intern-state-keys] applied: 0 rows in",
+    ] {
+        assert!(stderr.contains(line), "missing {line:?} in:\n{stderr}");
+    }
+}
+
+#[test]
+fn migrate_refuses_an_unknown_flag_or_progress_format() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    for extra in [["--verbose", "json"], ["--progress", "yaml"]] {
+        let output = run(&[
+            os("migrate"),
+            config.as_os_str(),
+            os(extra[0]),
+            os(extra[1]),
+        ]);
+        assert!(!output.status.success());
+        assert!(
+            text(&output.stderr).contains("usage: spindle migrate"),
+            "{}",
+            text(&output.stderr)
+        );
+    }
 }
 
 const MAS_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bWFzLW1pZ3JhdGlvbi0xNg$CEd7EMaeQK2QDHVNURFc/tH0y2Ja5MduCcmz5Gs8uIo";

@@ -95,7 +95,7 @@ $ curl -H "Authorization: Bearer mct_forged" …/account/whoami
 ```
 
 **Revocation propagates, with exactly the documented lag.** A token in
-active use keeps working for at most `INTROSPECTION_TTL` (120 s) after
+active use keeps working for at most `introspection_cache_ttl_secs` (120 s) after
 MAS ends the session — the cached verdict — and is then refused:
 
 ```

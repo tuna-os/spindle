@@ -28,6 +28,7 @@ lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     ruff check scripts
     python3 scripts/actions-pinned.py
+    python3 scripts/actions-pinned-test.py
 
 test *ARGS:
     cargo test --workspace --all-features {{ARGS}}
@@ -54,7 +55,7 @@ bench-build:
 # says so. `just bench-pg-down` removes the container.
 bench-pg:
     docker run -d --name spindle-bench-pg -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
-      -p 127.0.0.1:5433:5432 postgres:16-alpine >/dev/null
+      -p 127.0.0.1:5433:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093 >/dev/null
     @for _ in $(seq 1 30); do docker exec spindle-bench-pg pg_isready -U bench -q && break; sleep 1; done
     @echo 'export BENCH_PG_URL=postgres://bench:bench@127.0.0.1:5433/postgres'
 
@@ -78,10 +79,19 @@ bench-sitting group rounds="3":
 # The whole thing from a bare checkout.
 bench group rounds="3": bench-field bench-build (bench-sitting group rounds) bench-render (bench-gate group)
 
-# #42's three parity lines, judged on one committed sitting. Fails on a
-# separated loss; reports the workloads still unmeasured either way.
-bench-gate group:
-    python3 scripts/parity-gate.py docs/benchmarks/data {{group}}
+# Parity line 3's federated and concurrent cells (#647): one Spindle holds
+# the far side of the federation while Spindle, Synapse and Tuwunel take
+# turns as the subject. Needs bench-field and bench-build; uses Postgres
+# for Synapse when BENCH_PG_URL is set (`just bench-pg`).
+bench-targeted group rounds="5":
+    BENCH_BIN="{{bench_bin}}" SYNAPSE_VENV="{{synapse_venv}}" \
+      python3 scripts/federated-benchmark.py --group {{group}} --rounds {{rounds}}
+
+# #42's three parity lines, judged on one committed sitting and any
+# targeted sitting named beside it (`just bench-gate "ci-20261010 targeted-..."`).
+# Fails on a separated loss; reports the workloads still unmeasured either way.
+bench-gate groups:
+    python3 scripts/parity-gate.py docs/benchmarks/data {{groups}}
 
 # The site, from the committed results, into site/.
 bench-render:
@@ -91,13 +101,16 @@ bench-render:
     @echo "site/comparisons.html"
 
 # --- Upkeep: what the spec, the proposals and the pinned upstreams did
-# since the last look. The weekly workflow (upkeep.yml) files the same three
+# since the last look. The weekly workflow (upkeep.yml) files the same four
 # reports into one issue; run this before bumping a pin, and read
-# docs/maintenance.md for what to do with what it says.
+# docs/maintenance.md for what to do with what it says. ruma-drift exits 1 on
+# drift; the `-` keeps the rest of the report printing after it.
 upkeep:
     python3 scripts/upstream-pins.py --upstream
     @echo
     python3 scripts/msc-ledger.py --upstream
+    @echo
+    -python3 scripts/ruma-drift.py --upstream
     @echo
     python3 scripts/spec-drift.py --preview | sed -n '/^## Client-Server/,/^## Served beyond/p' | grep -E '^(##|[0-9]+ of)'
 

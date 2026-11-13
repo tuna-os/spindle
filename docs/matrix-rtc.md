@@ -36,8 +36,8 @@ client ──POST /user/{me}/openid/request_token──▶ homeserver
 
 client ──POST S/sfu/get {room, openid_token, device_id}──▶ JWT service
                                                       │
-                          (external service only)     ├─GET /_matrix/federation/v1/openid/userinfo─▶ homeserver
-                                                      │◀────────────── {sub: @me:server} ───────────
+          (external service; built-in for other      ├─GET /_matrix/federation/v1/openid/userinfo─▶ token's homeserver
+           servers' tokens)                          │◀────────────── {sub: @me:server} ───────────
        ◀────────────────── {url: wss://sfu, jwt} ─────┘
 
 client ──websocket, jwt──▶ SFU
@@ -46,6 +46,11 @@ client ──websocket, jwt──▶ SFU
 The OpenID token is the credential in that exchange. It is short-lived
 (an hour), it opens nothing on this server, and the JWT service — built
 in or external — is what it is for.
+
+In a call across servers, each participant publishes on the SFU of
+their own server and subscribes on the SFUs of the others. So a user of
+another server also asks this server's JWT service for a token, with an
+OpenID token from their own server.
 
 ## Option A: the built-in JWT service
 
@@ -60,7 +65,9 @@ public_base_url = "https://matrix.example.org"
 url = "wss://livekit.example.org"
 key = "APIxxxxxxxx"
 secret = "..."          # the SFU's matching API secret
+# secret_file = "/run/secrets/livekit-secret"   # instead of secret
 # token_ttl_seconds = 900
+# full_access_servers = []
 ```
 
 `key` and `secret` are the pair the SFU was started with (`--keys
@@ -70,22 +77,53 @@ this server:
 - advertises itself as a `livekit` transport, first in the list, at
   `https://matrix.example.org/_spindle/rtc/livekit` — on
   `/rtc/transports` and in `.well-known/matrix/client` alike;
-- answers `POST /_spindle/rtc/livekit/sfu/get` with `{url, jwt}` in
-  `lk-jwt-service`'s shape, so a client cannot tell the two apart;
+- answers `POST /_spindle/rtc/livekit/sfu/get` and
+  `POST /_spindle/rtc/livekit/get_token` (the Matrix 2.0 request) in the
+  shape of `lk-jwt-service` 0.7, so a client cannot tell the two apart;
 - mints only for a Matrix room the user is **joined to at that moment**,
   checked against its own membership index. Never joined, only invited,
   or since left: refused with `M_FORBIDDEN`, and a room that does not
   exist is refused identically;
-- mints for its own users only. A token whose `matrix_server_name` is
-  another server is refused rather than verified over federation;
-- rate limits minting per user (docs/rate-limits.md).
+- redeems its own users' OpenID tokens itself. It sends another server's
+  token to that server (`openid/userinfo` over federation) and accepts it
+  only for a user of that server;
+- rate limits minting per user, and per server for other servers' tokens
+  (docs/rate-limits.md).
 
-The token's grants are the least a participant needs: join this one
-room, publish, subscribe. `roomCreate` is withheld because in LiveKit it
-also permits deleting the room, which ends everyone's call; the SFU's
-default `auto_create: true` makes the room on first join instead. If
-your SFU has `auto_create` off, use option B or create rooms another
-way.
+The token's grants are the ones `lk-jwt-service` gives:
+
+| Who | Join, subscribe | Publish | Room on the SFU |
+|---|---|---|---|
+| a user of this server, or of a server in `full_access_servers` | yes | yes | created through the SFU's API before the token is sent |
+| a user of any other server | yes | no | not created |
+
+So the users of another server see and hear a call on this SFU, and
+their own media goes through their own server's SFU. `full_access_servers`
+names each server whose users may also publish here. It has no
+wildcard, because publishing uses the bandwidth of this SFU.
+
+The LiveKit room name is a hash of the Matrix room ID and the call slot.
+The Matrix 2.0 identity is a hash of user, device and member ID. Both are
+the hashes of `lk-jwt-service`, so a call lands in the same LiveKit room
+with either service. The legacy `sfu/get` identity is
+`{user_id}:{device_id}`.
+
+No token gets `roomCreate`, because in LiveKit it also permits deleting
+the room, which ends the call for everyone. This server creates the room
+itself, with the SFU's `CreateRoom` API at the `http(s)` address of
+`url`. Thus the SFU can keep `auto_create: false`, which is the setting
+`lk-jwt-service` recommends: a user of another server cannot open a room
+on it. This server must reach the SFU at that address. If it cannot, the
+token request fails with `500 M_UNKNOWN`.
+
+Element Call can give the transport its delayed leave on a token request
+(`delay_id`). It does this when a delegation probe does not get a 404.
+Then it schedules a leave an hour away and stops restarting it. This
+server holds that leave for its own users, and the SFU webhook sends it
+when the participant leaves the SFU. A delay that is not the caller's
+gets `400 M_INVALID_PARAM`. A user of another server gets
+`400 M_BAD_JSON`, because this server cannot send their delayed events.
+Clients then ask again without the delay.
 
 **Revocation.** A minted token cannot be revoked: it is stateless, and
 the SFU never asks this server again. A user who leaves the room after
@@ -97,6 +135,17 @@ client that needs that gets it by setting `3600` here, on purpose.
 The secret is LiveKit's and is shared with nothing else. It is not this
 server's signing key and is not derived from it; the two rotate apart,
 and a leak of one is not a leak of the other. It is never logged.
+
+To keep the secret out of `spindle.toml`, put it in a file and set
+`secret_file` to its path instead of `secret`. For example, use a
+Compose or Kubernetes secret. This is how `lk-jwt-service` reads
+`LIVEKIT_SECRET_FROM_FILE`. Set exactly one of the two keys.
+
+The server reads the file once, at startup, and ignores the trailing
+newline. If the file is missing or empty, or if both keys or neither key
+is set, the server does not start, and the error names `rtc.livekit`.
+To use a new secret, restart the server. With a supervised SFU, the
+generated `livekit.yaml` gets the secret from the file.
 
 ## Option B: lk-jwt-service beside the server
 
@@ -174,7 +223,7 @@ identically for both:
 - **Local**: `[rtc.livekit] binary` names the operator-supplied
   `livekit-server` binary (pinned at v1.13.5, Element Server Suite
   parity), and this server supervises it as a child — generating its
-  config (keys from `[rtc.livekit]`, rooms self-creating, webhooks
+  config (keys from `[rtc.livekit]`, `auto_create: false`, webhooks
   pointing at this server), watching it, restarting it. Upgrades are
   decoupled from spindle releases: replace the binary and restart, or
   flip the switch off and on. The only file supervision writes is the
@@ -185,12 +234,15 @@ The minter gaps the "What is not here" section used to list are closed:
 MSC4195's homeserver token endpoint (`POST
 .../rtc/livekit/get_token`, stable and unstable) mints for local users
 over their access token; the federation twin mints for a remote
-participant whose server vouches for them by X-Matrix signature; the
-delegation probe (`POST .../delegate_delayed_leave`, anything but 404
-meaning "held") records the hold; and the SFU webhook (`POST
+participant whose server vouches for them by X-Matrix signature, with
+the same grants as any other remote user's token; the delegation probe
+(`POST .../delegate_delayed_leave`, anything but 404 meaning "held")
+records the hold; and the SFU webhook (`POST
 /_spindle/rtc/livekit/sfu/webhook`) releases held leaves when
 participants drop off the media — fed by the supervised sidecar's
 generated webhook config, or by the operator's hand on the remote model.
+The webhook accepts only a request that LiveKit signed: an HS256 JWT
+under the API secret in `Authorization`, with the SHA-256 of the body.
 
 ## Option C: lk-jwt-service as the homeserver's sidecar
 
@@ -266,37 +318,132 @@ to the service's prefix.
   `unsigned.msc4354_sticky_duration_ttl_ms` counting down. Durations
   above an hour are capped to it.
 - For option A: a joined user's `POST .../sfu/get` returns a `jwt` whose
-  decoded `video.room` is the Matrix room ID and whose `exp - nbf` is
-  `token_ttl_seconds`. A user who has left gets `403 M_FORBIDDEN`.
+  decoded `video.room` is the hash of the Matrix room ID and the call
+  slot (not the room ID) and whose `exp - nbf` is `token_ttl_seconds`.
+  A user who has left gets `403 M_FORBIDDEN`. A joined user of another
+  server gets `canPublish: false`.
 - For option B: `GET /_matrix/federation/v1/openid/userinfo?access_token=…`
   with a fresh token returns `{"sub": "@you:example.org"}`; with an
   expired or invented one, `401 M_UNKNOWN_TOKEN`.
 
 The tests that pin each of these: `crates/spindle-server/tests/openid.rs`,
-`livekit_jwt.rs`, `rtc_transports.rs`, `rtc_membership.rs`,
-`delayed_events.rs`, `delayed_events_merged.rs`, `appservice_proxy.rs`
-and `sticky_events.rs`.
+`livekit_jwt.rs`, `livekit_remote.rs`, `rtc_sfu.rs`, `rtc_transports.rs`,
+`rtc_membership.rs`, `delayed_events.rs`, `delayed_events_merged.rs`,
+`appservice_proxy.rs` and `sticky_events.rs`.
+
+## Moving from lk-jwt-service to the built-in minter
+
+This moves a deployment from option B (or C) to option A. The SFU stays.
+Calls in progress continue, because both services give the same LiveKit
+room names.
+
+Before you start:
+
+1. Make sure that this server can reach the SFU at the `http(s)` form of
+   its `wss` URL. The minter creates rooms there. A `curl` of
+   `https://livekit.example.org/` from the homeserver host must connect.
+2. Read `LIVEKIT_FULL_ACCESS_HOMESERVERS` from the lk-jwt-service
+   environment. Put each name except this server's own into
+   `full_access_servers`. If the value is `*`, decide which servers to
+   name: the built-in minter has no wildcard.
+3. Keep the SFU's `auto_create: false`. The minter does not need
+   `auto_create`.
+
+Roll out:
+
+1. Add `[rtc.livekit]` with the SFU's `url`, `key` and `secret` (the
+   values of `LIVEKIT_URL`, `LIVEKIT_KEY` and `LIVEKIT_SECRET`). Remove
+   the lk-jwt-service entry from `[rtc] foci`. For option C, also remove
+   its registration from `[appservices]`; otherwise this server sends
+   `get_token` and `delegate_delayed_leave` to the service.
+2. Point the SFU's `webhook.urls` at
+   `https://<public_base_url>/_spindle/rtc/livekit/sfu/webhook`, with
+   `webhook.api_key` equal to `key`. Restart the SFU.
+3. Restart this server. `GET /_matrix/client/v1/rtc/transports` now names
+   `https://<public_base_url>/_spindle/rtc/livekit` first.
+4. Publish the new transport where clients find it. If a static
+   `.well-known/matrix/client` names the lk-jwt-service URL, change it to
+   the URL from step 3 or let this server serve the document.
+5. Make a call to a user of another server, in both directions. Check
+   that each side sees and hears the other. In the server log, look for
+   `the SFU refused to create a call's room`: it means step 1 of the
+   preparation is not done.
+6. Stop lk-jwt-service when no client uses its URL. Clients that cached
+   the old transport ask it until they refresh it.
+
+Roll back:
+
+1. Put the lk-jwt-service entry back in `[rtc] foci` (and the
+   registration in `[appservices]` for option C), and start the service.
+2. Turn the built-in minter off without editing its section:
+   `spindle sfu off <config>`, or `PUT /_spindle/admin/v1/rtc/sfu` with
+   `{"enabled": false}`. The built-in transport disappears from
+   discovery at once, and `sfu/get` answers 404.
+3. Point the SFU's `webhook.urls` back at the service's `/sfu_webhook`.
+4. Restore the static `.well-known/matrix/client` if you changed it.
+
+Tokens that either service minted stay valid until they expire, and the
+room names are the same, so a call in progress continues in both
+directions.
 
 ## Running Element Call's own suite
 
-`contrib/element-call/run.sh` stands up Element Call's two-homeserver
-Playwright stack (LiveKit, lk-jwt-service, Element Web, nginx, all
-upstream's and pinned) with Spindle in both of Synapse's seats, and runs
-their specs against it. `docker-compose-spindle.yml` is the whole
-override; `spindle.toml` and `spindle-othersite.toml` stand in for
-`backend/playwright_homeserver*.yaml`. Results go through
-`scripts/element-call-check.py` against `contrib/element-call/allowlist.txt`,
-the same ratchet shape as Complement's. The `element-call-e2e` job in
-`.github/workflows/compliance.yml` runs it nightly and on demand.
+`contrib/element-call/run.sh` starts Element Call's Playwright stack with
+two homeservers. LiveKit, lk-jwt-service, Element Web and nginx are
+upstream's, at a pinned revision. Spindle takes the first homeserver
+seat: `docker-compose-spindle.yml` puts it there, with `spindle.toml` in
+place of upstream's `backend/playwright_homeserver.yaml`. The script then
+runs upstream's specs against the stack. `scripts/element-call-check.py`
+compares the results with `contrib/element-call/allowlist.txt`, as the
+Complement check does with its allowlist. The `element-call-e2e` job in
+`.github/workflows/compliance.yml` runs the suite nightly and on demand.
 
-Beside upstream's specs run this server's own, in
-`contrib/element-call/specs/` (copied into the checkout as
-`playwright/spindle/`, driven through upstream's fixtures unchanged): a
-five-party call with joins, a clean leave, a rejoin, simultaneous
-arrivals and departures and a participant killed mid-call; a homeserver
-restart mid-call in both membership modes, after which the call must
-still be up and a crash must still expire; a ring the caller abandons;
-and a call across the rig's two Spindles in both modes.
+`SPINDLE_PEER` selects the server in the second seat:
+
+- `spindle`, the default: a second Spindle, from
+  `docker-compose-spindle-othersite.yml` and `spindle-othersite.toml`.
+- `synapse`: upstream's Synapse, with no change.
+  `docker-compose-dead-peers.yml` adds three more Spindles for the last
+  ring test below. This variant has its own allowlist,
+  `allowlist-synapse-peer.txt`. The `element-call-synapse-peer` job runs
+  it nightly, on demand, and on pull requests that change federation or
+  MatrixRTC code.
+
+The rig also runs specs of this server, from `contrib/element-call/specs/`.
+The script copies them into the checkout as `playwright/spindle/`. They
+use upstream's fixtures with no change. With two Spindles they run:
+
+- a five-party call with joins, a clean leave, a rejoin, and a
+  participant that stops mid-call;
+- a homeserver restart mid-call in both membership modes. The call must
+  stay up, and a crash must still expire;
+- a ring that the caller abandons;
+- a call across the two Spindles in both membership modes.
+
+With Spindle and Synapse they run:
+
+- a call in each direction, in both membership modes.
+- a DM call in each direction. The ring must get to the callee in 15
+  seconds, and then the call must connect.
+- the same ring from Spindle, while the DM also holds users of three
+  servers that do not answer. Each request to these servers runs into
+  its timeout. Before #794, the outbox sent to one destination at a time,
+  and this ring did not arrive.
+
+`SPINDLE_RTC` selects who mints the SFU tokens for each Spindle seat:
+
+- `lk-jwt-service`, the default: upstream's service beside each
+  homeserver, as in the Element Call rig.
+- `builtin`: the built-in minter of the Spindle, against upstream's SFU.
+  `docker-compose-builtin-rtc.yml` gives the first seat
+  `spindle-builtin-rtc.toml`, and `docker-compose-builtin-rtc-othersite.yml`
+  gives a second Spindle `spindle-othersite-builtin-rtc.toml`. `run.sh`
+  writes copies of upstream's nginx and LiveKit configs that send
+  `/_spindle/rtc/livekit` and the SFU webhooks to the Spindles. A Synapse
+  in the second seat keeps its lk-jwt-service. The results go against
+  `allowlist-builtin-rtc.txt`, or `allowlist-builtin-rtc-synapse-peer.txt`
+  with Synapse. The `element-call-e2e` job runs both minters nightly; a
+  push to main runs only the first.
 
 ## Calls with no SFU
 
@@ -306,10 +453,15 @@ page, docs/p2p-calls.md, with the rig that proves it against this server.
 
 ## What is not here
 
-- **Remote users without the program on.** The federation twin mints
-  for a remote participant while the SFU program is on. While it is
-  off, a federated caller needs `lk-jwt-service`, external (option B)
-  or as the sidecar (option C), which mints on its own.
+- **Remote users without the program on.** The built-in minter and the
+  federation twin mint for a remote participant while the SFU program
+  is on. While it is off, a federated caller needs `lk-jwt-service`,
+  external (option B) or as the sidecar (option C), which mints on its
+  own.
+- **The transport's own delegation endpoint.** `lk-jwt-service` also
+  serves `{livekit_service_url}/delegate_delayed_leave`. The built-in
+  minter does not, so that probe gets a 404. Delegation still works
+  through `delay_id` on a token request and through the homeserver path.
 - **Delegated leave without SFU events.** The probe records the hold.
   The release learns the drop from the SFU webhook. The supervised
   sidecar points its webhooks here on generation. A remote deployment

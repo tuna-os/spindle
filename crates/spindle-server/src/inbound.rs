@@ -8,7 +8,7 @@
 //! through a socket -- a real peer, a key pair, a served key document -- to
 //! assert things one function call deep. The policy functions at the top
 //! take no HTTP type; the handlers below them take the unwrapped request
-//! (state, headers, path parts, the raw body) and `routes.rs` keeps only the
+//! (state, headers, path parts, the raw body) and `federation_routes.rs` keeps only the
 //! axum extractor shells, so the route table stays the one list the
 //! dashboard and `surface.rs` check against. The outbound client
 //! (`federation.rs`) is the other half of the same protocol.
@@ -21,15 +21,40 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::accounts::Accounts;
 use crate::errors::MatrixError;
+use crate::ratelimit::{Budget, limit_write_on};
 use crate::routes::{MAX_TXN_ID_LEN, record_invite, room_error};
 
 mod backfill;
 mod gap;
 mod recovery;
+mod resync;
 
 pub(crate) use backfill::run as run_backfill;
 pub use backfill::{GapBackfill, Settings as BackfillSettings, Sources as BackfillSources};
 pub use recovery::RecoveryGate;
+pub use resync::Sources as ResyncSources;
+pub(crate) use resync::run as run_resync;
+
+/// How many inbound transactions do their room work at once (#614).
+///
+/// A server back from an outage meets every peer's backlog at once: one
+/// transaction in flight from each of hundreds of servers, most of them
+/// carrying events for the same few busy rooms. Each runs on a
+/// blocking-pool thread, and each waits there for the room the one before
+/// it holds. Admitted all at once they fill the pool -- after which a
+/// worker that reaches a contended room lock cannot hand its queue on and
+/// `/health` is never polled (`blocking` has the mechanics) -- and on the
+/// two cores a pod is given they share the CPU hundreds of ways with the
+/// workers that answer probes. Admitted this many at a time, the others
+/// wait as async tasks, holding no thread and no core, and are taken in
+/// arrival order.
+///
+/// Sixteen keeps the busy threads a small fraction of the pool's 512 and a
+/// few per core, while leaving room to overlap one transaction's network
+/// waits -- keys, missing events -- with another's room work. A room
+/// takes one writer at a time whatever this says, so more slots would add
+/// waiting threads, not throughput.
+pub const INGEST_SLOTS: usize = 16;
 
 /// Say that a peer's event was refused, and name what it was refused over.
 ///
@@ -216,7 +241,12 @@ pub(crate) async fn receive_from_hub(
         let event_id = pdu["event_id"].as_str().unwrap_or("$ours").to_owned();
         return (event_id, Ok(()));
     }
-    recovery::receive(state, hub, None, pdu).await
+    // As long as `/send` waits for a recovery: this answer is awaited too.
+    let deadline = tokio::time::Instant::now() + recovery::SEND_BUDGET;
+    recovery::receive(state, hub, None, pdu)
+        .await
+        .answer(state, deadline)
+        .await
 }
 
 /// The version a received PDU is to be read under.
@@ -266,15 +296,60 @@ fn room_version_of(state: &AppState, pdu: &Value) -> ruma::RoomVersionId {
 /// A PDU whose sender is on another server is relayed: the origin sends it
 /// for that server, as the spec permits. It verifies against the keys of
 /// the sender's server, which `recovery::receive` gets when it needs them.
+///
+/// The PDUs are judged in the order they came, except that no PDU waits
+/// for the dependency recovery of another room (#808). A PDU whose
+/// recovery is in flight is put aside with the later PDUs of its room,
+/// which can need the events that recovery places. When the others are
+/// judged, each room put aside waits for its recovery until `deadline`
+/// and then judges its later PDUs in order, the rooms side by side.
 async fn receive_pdus(
     state: &AppState,
     origin: &str,
     key_map: Option<&crate::federation::PeerKeys>,
     pdus: &[Value],
+    deadline: tokio::time::Instant,
 ) -> serde_json::Map<String, Value> {
-    let mut results = serde_json::Map::new();
+    // A room put aside: its PDU whose recovery is in flight, and the later
+    // PDUs of the room. At most fifty PDUs, so a scan finds a room.
+    type Aside<'a> = (
+        Option<&'a str>,
+        (&'a Value, recovery::Received),
+        Vec<&'a Value>,
+    );
+    let mut answers = Vec::with_capacity(pdus.len());
+    let mut aside: Vec<Aside<'_>> = Vec::new();
     for pdu in pdus {
-        let (event_id, outcome) = recovery::receive(state, origin, key_map, pdu).await;
+        let room = pdu["room_id"].as_str();
+        if let Some((_, _, later)) = aside.iter_mut().find(|(id, ..)| *id == room) {
+            later.push(pdu);
+            continue;
+        }
+        match recovery::receive(state, origin, key_map, pdu).await {
+            recovery::Received::Settled(event_id, outcome) => {
+                answers.push((pdu, event_id, outcome));
+            }
+            recovering @ recovery::Received::Recovering { .. } => {
+                aside.push((room, (pdu, recovering), Vec::new()));
+            }
+        }
+    }
+    let rooms = futures_util::future::join_all(aside.into_iter().map(
+        |(_, (first, recovering), later)| async move {
+            let mut answers = Vec::with_capacity(1 + later.len());
+            let (event_id, outcome) = recovering.answer(state, deadline).await;
+            answers.push((first, event_id, outcome));
+            for pdu in later {
+                let received = recovery::receive(state, origin, key_map, pdu).await;
+                let (event_id, outcome) = received.answer(state, deadline).await;
+                answers.push((pdu, event_id, outcome));
+            }
+            answers
+        },
+    ))
+    .await;
+    let mut results = serde_json::Map::new();
+    for (pdu, event_id, outcome) in answers.into_iter().chain(rooms.into_iter().flatten()) {
         let result = match outcome {
             Ok(()) => json!({}),
             Err(reason) => {
@@ -455,17 +530,23 @@ pub(crate) fn join_candidates(
 /// is judged alone — hash and signature against the origin's published
 /// keys, then the same authorization predicate local events pass — and a
 /// refusal soft-fails into the per-PDU results without poisoning the
-/// batch. Of the EDUs, `m.typing` and `m.receipt` are applied — for the
-/// origin's own joined users only, so no server can put words in another's
-/// hands — keys, to-device messages and device lists go to
-/// `e2ee_federation`, and the rest (presence among them; see `receipts`)
-/// are accepted, counted and dropped.
+/// batch. Of the EDUs, `m.typing`, `m.receipt` and `m.presence` are
+/// applied — for the origin's own users only, so no server can put words
+/// in another's hands — keys, to-device messages and device lists go to
+/// `e2ee_federation`, and the rest are accepted, counted and dropped.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction's checks and work, read top to bottom"
+)]
 pub(crate) async fn send_transaction(
     state: AppState,
     headers: axum::http::HeaderMap,
     txn_id: String,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<Value>, MatrixError> {
+    // The budget runs from arrival, so time spent waiting for keys or for
+    // a turn below comes out of the recovery's share, not the sender's.
+    let deadline = tokio::time::Instant::now() + recovery::SEND_BUDGET;
     let uri = request
         .uri()
         .path_and_query()
@@ -493,7 +574,7 @@ pub(crate) async fn send_transaction(
     // redelivery idempotent on our side.
     let txn_key = spindle_core::keys::federation_txn(&origin, &txn_id);
     if let Ok(Some(stored)) = spindle_store::ReadView::get(state.store.as_ref(), &txn_key)
-        && let Ok(response) = serde_json::from_slice::<Value>(&stored)
+        && let Ok(response) = serde_json::from_slice::<Value>(crate::txn_replay::decode(&stored).1)
     {
         return Ok(Json(response));
     }
@@ -518,6 +599,10 @@ pub(crate) async fn send_transaction(
         })?)
     };
 
+    // A turn before any room work, held until the EDUs are applied too:
+    // receipts and presence touch rooms as PDUs do.
+    let _turn = ingest_turn(&state).await?;
+
     // Off the async workers: ingesting a backlog into a large room is
     // seconds of synchronous work per PDU -- cold loads, state resolution
     // -- and #614's liveness failures were four of these at once holding
@@ -528,7 +613,9 @@ pub(crate) async fn send_transaction(
         crate::blocking::offload_async(
             std::sync::Arc::clone(&state.metrics),
             crate::metrics::BlockingTask::FederationSend,
-            move || async move { receive_pdus(&state, &origin, key_map.as_ref(), &pdus).await },
+            move || async move {
+                receive_pdus(&state, &origin, key_map.as_ref(), &pdus, deadline).await
+            },
         )
         .await?
     };
@@ -575,26 +662,77 @@ pub(crate) async fn send_transaction(
                 crate::e2ee_federation::apply_edu(&state, &origin, edu).await;
                 crate::metrics::EduResult::Accepted
             }
-            crate::metrics::EduType::Presence | crate::metrics::EduType::Other => {
-                crate::metrics::EduResult::Unsupported
+            crate::metrics::EduType::Presence => {
+                apply_presence(&state, &origin, &edu["content"]).await
             }
+            crate::metrics::EduType::Other => crate::metrics::EduResult::Unsupported,
         };
         state.metrics.record_edu_received(edu_type, result);
     }
 
     let response = json!({ "pdus": results });
+    let received_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
     spindle_store::Store::put(
         state.store.as_ref(),
         &txn_key,
-        response.to_string().as_bytes(),
+        &crate::txn_replay::encode(received_ms, response.to_string().as_bytes()),
     )
     .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // The table is bounded by this origin's own traffic (#814). A failed
+    // sweep is a missed cleanup, not a failed transaction.
+    if crate::txn_replay::sweep_due(&origin, received_ms)
+        && let Err(error) =
+            crate::txn_replay::sweep_origin(state.store.as_ref(), &origin, received_ms)
+    {
+        tracing::warn!(%origin, %error, "sweeping the transaction replay table failed");
+    }
     state.rooms.wake_sync_waiters();
     Ok(Json(response))
 }
 
+/// A turn at inbound room work ([`INGEST_SLOTS`] at once), from the gate
+/// (`RecoveryGate::ingest_turn`).
+async fn ingest_turn(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, MatrixError> {
+    // Never closed, so this cannot fail; said rather than unwrapped.
+    state
+        .recovery
+        .ingest_turn()
+        .await
+        .map_err(|_| MatrixError::internal("inbound admission closed"))
+}
+
+/// Apply one inbound `m.presence` EDU (`presence::Presence::apply_edu`).
+///
+/// Whether the user shares a room with anyone here can load a cold room:
+/// off the async workers, like receipts.
+async fn apply_presence(
+    state: &AppState,
+    origin: &str,
+    content: &Value,
+) -> crate::metrics::EduResult {
+    let state = state.clone();
+    let origin = origin.to_owned();
+    let content = content.clone();
+    crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::FederationSend,
+        move || {
+            Ok(state
+                .presence
+                .apply_edu(crate::presence::Peers::of(&state), &origin, &content))
+        },
+    )
+    .await
+    .unwrap_or(crate::metrics::EduResult::Ignored)
+}
+
 /// Apply one inbound `m.typing` EDU: only about the origin's own joined
-/// users, so no server can put words in another's hands.
+/// users, so no server can put words in another's hands, and only from
+/// an origin the room's `m.room.server_acl` admits (MSC4163).
 fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metrics::EduResult {
     let (Some(room_id), Some(user_id), Some(typing)) = (
         content["room_id"].as_str(),
@@ -607,6 +745,13 @@ fn apply_typing(state: &AppState, origin: &str, content: &Value) -> crate::metri
         return crate::metrics::EduResult::Ignored;
     }
     if !state.rooms.is_joined(user_id, room_id).unwrap_or(false) {
+        return crate::metrics::EduResult::Ignored;
+    }
+    if !state
+        .rooms
+        .server_acl_permits(room_id, origin)
+        .unwrap_or(false)
+    {
         return crate::metrics::EduResult::Ignored;
     }
     state
@@ -628,6 +773,7 @@ pub(crate) async fn room_state(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    refuse_partial_state(&state, &room_id)?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -657,6 +803,7 @@ pub(crate) async fn room_state_ids(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    refuse_partial_state(&state, &room_id)?;
     let (pdus, auth_chain) = state
         .rooms
         .federation_state(&room_id, &query.event_id)
@@ -694,13 +841,17 @@ pub(crate) async fn event(
     };
     federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
     let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
+    let pdus = state
+        .rooms
+        .prune_erased_pdus(&room_id, vec![event])
+        .map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
         "origin_server_ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
-        "pdus": [event],
+        "pdus": pdus,
     })))
 }
 
@@ -737,6 +888,10 @@ pub(crate) async fn backfill(
     let pdus = state
         .rooms
         .backfill(&room_id, &from, limit)
+        .map_err(room_error)?;
+    let pdus = state
+        .rooms
+        .prune_erased_pdus(&room_id, pdus)
         .map_err(room_error)?;
     Ok(Json(json!({
         "origin": state.config.server.name,
@@ -801,6 +956,10 @@ pub(crate) async fn missing_events(
             state_dag,
         )
         .map_err(room_error)?;
+    let events = state
+        .rooms
+        .prune_erased_pdus(&room_id, events)
+        .map_err(room_error)?;
     Ok(Json(json!({ "events": events })))
 }
 
@@ -817,6 +976,8 @@ pub(crate) async fn make_join(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     // A server makes joins for its own users only: a template for someone
     // else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -876,6 +1037,8 @@ pub(crate) async fn make_leave(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     // A server makes leaves for its own users only, same as joins: a
     // template for someone else's user would be a forgery kit.
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
@@ -911,6 +1074,8 @@ pub(crate) async fn make_knock(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
     if user_id.split_once(':').map(|(_, domain)| domain) != Some(origin.as_str()) {
         return Err(MatrixError::forbidden(
             "the user does not live on the requesting server",
@@ -946,6 +1111,8 @@ pub(crate) async fn send_knock(
     let knock: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&knock)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // Same smuggling rule as send_join and send_leave: this door admits
     // exactly one kind of event.
@@ -1072,6 +1239,7 @@ pub(crate) async fn invite(
     let body: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&body)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
 
     // The version check comes first: an event from a room version this
     // server does not speak cannot be reasoned about, let alone signed.
@@ -1137,6 +1305,12 @@ pub(crate) async fn invite(
         return Err(MatrixError::forbidden("no such user on this server"));
     }
     let target = target.to_owned();
+    // The invitee's budget (#741) is one budget whoever invites, so a
+    // stream of invites from another server spends it like local ones do:
+    // refused before this server co-signs or records anything, as Synapse's
+    // `rc_invites.per_user` refuses them.
+    let sender = event["sender"].as_str().unwrap_or_default();
+    limit_write_on(&state, Budget::Invited, sender, &target)?;
 
     let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
         ruma::CanonicalJsonValue::try_from(event)
@@ -1206,7 +1380,19 @@ pub(crate) async fn federation_origin(
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
-    state
+    let refused = || {
+        state
+            .federation
+            .metrics()
+            .record_federation_listed(crate::metrics::ListedDirection::Inbound);
+        MatrixError::forbidden("this server does not federate with your server")
+    };
+    // Before the signature check, which would fetch the refused server's
+    // keys: that fetch is itself refused, and would answer 401.
+    if state.federation.listed_out_origin(authorization).is_some() {
+        return Err(refused());
+    }
+    let origin = state
         .federation
         .verify_request(authorization, method, uri, content)
         .await
@@ -1217,14 +1403,22 @@ pub(crate) async fn federation_origin(
                 "M_UNAUTHORIZED",
                 "the request signature is not valid".to_owned(),
             )
-        })
+        })?;
+    // Every federation route authenticates here, so this covers them all.
+    // Nothing of a refused request is read or stored.
+    if !state.federation.server_permitted(&origin) {
+        return Err(refused());
+    }
+    Ok(origin)
 }
 
-/// Authenticate a federation request AND require the origin in the room.
+/// Authenticate a federation request AND require the origin in the room
+/// AND admitted by the room's `m.room.server_acl`.
 ///
-/// The two checks always travel together on room-data reads: an
-/// authenticated stranger is still a stranger, and room state belongs to
-/// the servers in the room.
+/// The checks always travel together on room-data reads: an
+/// authenticated stranger is still a stranger, room state belongs to
+/// the servers in the room, and a server the room has denied is no
+/// longer one of them whatever its members' membership says.
 pub(crate) async fn federation_room_origin(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1243,7 +1437,26 @@ pub(crate) async fn federation_room_origin(
             "your server has no joined member in that room",
         ));
     }
+    require_server_acl(state, room_id, &origin)?;
     Ok(origin)
+}
+
+/// Refuse `origin` if the room's `m.room.server_acl` denies it. A room
+/// this server does not hold (an invite to a remote room) has no ACL to
+/// consult and passes; a store error fails closed.
+fn require_server_acl(state: &AppState, room_id: &str, origin: &str) -> Result<(), MatrixError> {
+    let admitted = match state.rooms.server_acl_permits(room_id, origin) {
+        Ok(admitted) => admitted,
+        Err(crate::rooms::RoomError::UnknownRoom(_)) => true,
+        Err(error) => return Err(MatrixError::internal(&error.to_string())),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden(
+            "your server is denied by the room's server ACL",
+        ))
+    }
 }
 
 pub(crate) async fn send_leave_common(
@@ -1263,6 +1476,8 @@ pub(crate) async fn send_leave_common(
     let leave: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&leave)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // Shape first, same reasoning as send_join: this door admits exactly
     // one kind of event, and anything else through it is smuggling.
@@ -1309,12 +1524,15 @@ pub(crate) async fn send_join_common(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let omit_members = omit_members(request.uri().query());
     let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
         .map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let join: Value =
         serde_json::from_slice(&bytes).map_err(|error| MatrixError::bad_json(error.to_string()))?;
     let origin = federation_origin(&state, &headers, "PUT", &uri, Some(&join)).await?;
+    require_server_acl(&state, &room_id, &origin)?;
+    refuse_partial_state(&state, &room_id)?;
 
     // The shape is checked before the machinery runs: send_join admits one
     // kind of event, and anything else through this door — however well
@@ -1407,22 +1625,82 @@ pub(crate) async fn send_join_common(
         }));
     }
 
-    // The state *before* the join, with its auth chain: everything the new
-    // server needs to participate from this event onward.
-    let (state_pairs, auth_pairs) = state
-        .rooms
-        .federation_state(&room_id, &event_id)
-        .map_err(room_error)?;
+    join_answer(&state, &room_id, &event_id, &join, &sticky, omit_members)
+}
+
+/// The `send_join` answer of a stock room: the state *before* the join,
+/// with its auth chain -- everything the new server needs to participate
+/// from this event onward.
+///
+/// MSC3706 (spec v1.6): a joiner that asked `omit_members` can resync
+/// later, so it is spared the roster now -- the member events it can do
+/// without, and the auth chain entries the state already carries.
+fn join_answer(
+    state: &AppState,
+    room_id: &str,
+    event_id: &str,
+    join: &Value,
+    sticky: &[Value],
+    omit_members: bool,
+) -> Result<Value, MatrixError> {
     let bodies = |events: Vec<crate::rooms::IdentifiedEvent>| -> Vec<Value> {
         events.into_iter().map(|(_, event)| event).collect()
     };
+    if omit_members {
+        let joiner = join["state_key"].as_str().unwrap_or_default().to_owned();
+        let partial = state
+            .rooms
+            .partial_join_state(room_id, event_id, &joiner)
+            .map_err(room_error)?;
+        return Ok(json!({
+            "origin": state.config.server.name,
+            "event": join,
+            "state": bodies(partial.state),
+            "auth_chain": bodies(partial.auth_chain),
+            "members_omitted": true,
+            "servers_in_room": partial.servers_in_room,
+            "msc4354_sticky": sticky,
+        }));
+    }
+    let (state_pairs, auth_pairs) = state
+        .rooms
+        .federation_state(room_id, event_id)
+        .map_err(room_error)?;
     Ok(json!({
         "origin": state.config.server.name,
         "event": join,
         "state": bodies(state_pairs),
         "auth_chain": bodies(auth_pairs),
+        "members_omitted": false,
         "msc4354_sticky": sticky,
     }))
+}
+
+/// Whether a `send_join` asked for `omit_members` (spec v1.6). Only the
+/// stable name: Synapse, the one server that ever spoke the MSC's
+/// `org.matrix.msc3706.partial_state`, asks and answers in stable terms
+/// alone today, so the unstable spelling would be read by nobody.
+fn omit_members(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(name, value)| name == "omit_members" && value == "true")
+    })
+}
+
+/// Refuse a federation request this server cannot answer completely while
+/// `room_id` is partial-state (MSC3706): it lacks member events, so the
+/// room's state, the servers in it and a join, knock or leave brokered
+/// through it would all be partial. A 404, as Synapse answers -- the same
+/// answer as not being in the room, which sends the peer to another server.
+pub(crate) fn refuse_partial_state(state: &AppState, room_id: &str) -> Result<(), MatrixError> {
+    if state.rooms.is_partial_state(room_id) {
+        return Err(MatrixError::new(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            format!("this server is still resyncing the state of {room_id}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Judge and, if it holds up, apply one received PDU.

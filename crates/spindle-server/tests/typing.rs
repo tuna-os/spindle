@@ -308,15 +308,18 @@ async fn a_notice_expires_on_its_own() {
             &room,
             &alice,
             "@alice:example.org",
-            &json!({ "typing": true, "timeout": 50 }),
+            &json!({ "typing": true, "timeout": 500 }),
         )
         .await;
+    // Ten times the time one request takes on a loaded runner. At 50 ms the
+    // notice could already be gone when this first read ran (#793); the exact
+    // expiry boundary is tested without a clock in `typing.rs`.
     assert_eq!(
         typists(&harness.sync(&alice).await, &room),
         vec!["@alice:example.org"]
     );
 
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(
         typists(&harness.sync(&alice).await, &room).is_empty(),
         "an expired notice must not be reported, with no sweeper having run"

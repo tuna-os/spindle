@@ -14,11 +14,11 @@
 //! was before this server's own last append. That is exactly the "inject
 //! stale message" case #16 asks for, and it is reproducible.
 //!
-//! Nothing is resolved when that PDU lands: it appends at the tail with its
-//! own parent's state, and the log simply has two forward extremities. The
-//! merge happens on the *next local append*, which names both — so every
-//! test here ends by sending one more event, and that event is the one under
-//! examination.
+//! That PDU needs no resolution itself: it appends at the tail with its own
+//! parent's state, and the log has two forward extremities, whose
+//! resolution becomes the room's current state. The merge *event* is the
+//! *next local append*, which names both tips -- so every test here ends by
+//! sending one more event, and that event is the one under examination.
 //!
 //! `spindle-core`'s `state_res_comparison` bench measures the same merge on
 //! a hand-built log. This is the first place a fork reaches it through the
@@ -234,7 +234,7 @@ fn injected_id(body: &Value) -> String {
 }
 
 struct Harness {
-    _dir: TempDir,
+    dir: Arc<TempDir>,
     app: axum::Router,
     metrics: Arc<Metrics>,
     store: Arc<FjallStore>,
@@ -244,6 +244,10 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        Self::over(Arc::new(dir), store)
+    }
+
+    fn over(dir: Arc<TempDir>, store: Arc<FjallStore>) -> Self {
         let config = spindle_server::Config::parse(
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
@@ -253,11 +257,17 @@ impl Harness {
         let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
             .expect("the app builds");
         Self {
-            _dir: dir,
+            dir,
             app,
             metrics,
             store,
         }
+    }
+
+    /// A new server over the same store, as a restart finds it: no room
+    /// resident, no resolution cached, counters at zero.
+    fn restarted(&self) -> Self {
+        Self::over(Arc::clone(&self.dir), Arc::clone(&self.store))
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -610,6 +620,29 @@ impl Harness {
         state_key: &str,
         content: &Value,
     ) -> Value {
+        self.stale_state_at(
+            peer,
+            room,
+            stale,
+            event_type,
+            state_key,
+            content,
+            now_millis(),
+        )
+    }
+
+    /// [`Self::stale_state`] with an explicit `origin_server_ts`.
+    #[allow(clippy::too_many_arguments, reason = "one event, in one place")]
+    fn stale_state_at(
+        &self,
+        peer: &Peer,
+        room: &str,
+        stale: &str,
+        event_type: &str,
+        state_key: &str,
+        content: &Value,
+        origin_server_ts: u64,
+    ) -> Value {
         peer.event(federation_auth::with_auth_events(
             &self.store,
             json!({
@@ -618,12 +651,22 @@ impl Harness {
                 "sender": peer.user(),
                 "room_id": room,
                 "content": content,
-                "origin_server_ts": now_millis(),
+                "origin_server_ts": origin_server_ts,
                 "depth": 11,
                 "prev_events": [stale],
                 "auth_events": [],
             }),
         ))
+    }
+
+    /// A timestamp one millisecond after `event_id`'s, as federation
+    /// serves it: for a peer event that state resolution must order after
+    /// ours. `now_millis()` read after our write can return the same
+    /// millisecond, and then the resolver orders the two by event ID,
+    /// which is random (#777).
+    async fn just_after(&self, peer: &Peer, event_id: &str) -> u64 {
+        let event = self.federation_event(peer, event_id).await;
+        event["origin_server_ts"].as_u64().unwrap() + 1
     }
 
     /// A message PDU from the peer that names `stale` as its only parent.
@@ -752,6 +795,116 @@ async fn a_fork_on_new_slots_uses_room_version_resolution() {
     assert!(state.contains_key("m.room.name/"), "{state:?}");
 }
 
+/// A room left forked: our topic and the peer's name, each on its own tip
+/// off the fork point, and nothing since that names both. Returns the
+/// room, alice's token and the room's state as alice reads it.
+async fn open_fork(
+    harness: &Harness,
+    peer: &Peer,
+) -> (String, String, std::collections::BTreeMap<String, String>) {
+    let (room, alice, fork_point) = harness.shared_room(peer).await;
+    assert_eq!(
+        harness
+            .set_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+            .await,
+        StatusCode::OK
+    );
+    let pdu = harness.stale_state(
+        peer,
+        &room,
+        &fork_point,
+        "m.room.name",
+        "",
+        &json!({ "name": "theirs" }),
+    );
+    harness.inject(peer, "open-fork", pdu).await;
+    assert!(
+        harness.metrics.state_res_counts().0 >= 1,
+        "the fork was resolved where it opened"
+    );
+    let state = harness.state_ids(&room, &alice).await;
+    assert!(state.contains_key("m.room.topic/"), "{state:?}");
+    assert!(state.contains_key("m.room.name/"), "{state:?}");
+    (room, alice, state)
+}
+
+/// A restart does not resolve a fork that was resolved before it (#724).
+///
+/// A room reopened with an open fork resolved its forward extremities on
+/// every cold load, though nothing about the fork had changed: one room of
+/// 88,670 entries spent 3.3 s of its 7 s load doing so at each restart.
+/// The resolution is recorded where it is made, and a reopened room whose
+/// fork still matches the record takes it -- counted here by the
+/// resolver's own counter, on two restarts in a row.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_restart_does_not_resolve_a_fork_again() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, before) = open_fork(&harness, &peer).await;
+
+    for restart in 1..=2 {
+        let reopened = harness.restarted();
+        assert_eq!(
+            reopened.state_ids(&room, &alice).await,
+            before,
+            "restart {restart} reads the state the fork resolved to"
+        );
+        assert_eq!(
+            reopened.metrics.cold_loads_total(),
+            1,
+            "restart {restart} reopened the room from the store"
+        );
+        assert_eq!(
+            reopened.metrics.state_res_counts().0,
+            0,
+            "restart {restart} resolved the fork again"
+        );
+    }
+}
+
+/// A fork reopened without a record of its resolution -- one a build
+/// before the record existed left, say -- is resolved once, by the load,
+/// and the answer recorded: the next restart takes it.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_fork_reopened_without_a_record_is_resolved_once() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, before) = open_fork(&harness, &peer).await;
+    spindle_store::Store::delete(
+        harness.store.as_ref(),
+        &spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::CurrentState, &room),
+    )
+    .unwrap();
+
+    for (restart, resolutions) in [(1, 1), (2, 0)] {
+        let reopened = harness.restarted();
+        assert_eq!(
+            reopened.state_ids(&room, &alice).await,
+            before,
+            "restart {restart}"
+        );
+        assert_eq!(
+            reopened.metrics.state_res_counts().0,
+            resolutions,
+            "restart {restart}"
+        );
+    }
+}
+
 /// Both branches write the same slot. The room-version resolver picks
 /// one authorized value and keeps the room writable, while the contested
 /// counter records the merge once. Every read must agree with that result.
@@ -800,8 +953,8 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
         "the expensive path was taken without being counted: {delta:?}"
     );
 
-    // The room stays writable, and the fork that is still open is not
-    // counted again on every send that steps around it.
+    // The room stays writable. Later sends build on the merge, so the fork
+    // is not counted again.
     let before = Cases::read(&harness.metrics);
     for attempt in 0..3 {
         assert_eq!(
@@ -820,11 +973,11 @@ async fn a_fork_on_the_same_slot_is_counted_once_and_leaves_the_room_writable() 
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 
-    // Set aside is not corrupted: the room still reads, and the last local
-    // write is what it now holds.
+    // The resolution corrupted nothing: the room still reads, and the last
+    // local write is what it now holds.
     let (status, topic) = harness
         .get(
             &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
@@ -945,21 +1098,19 @@ async fn a_disjoint_fork_on_preexisting_slots_merges_and_leaves_the_room_writabl
 ///
 /// The topic test above proves the same-slot fork is counted once and does
 /// not wedge the room. Power levels are the slot every later authorization
-/// reads, so this is the fork where "set aside" has to mean something more
-/// precise than "still writable": which branch the room holds afterwards
-/// decides who may write to it at all. #359's rule is that the linear head
-/// stays -- the entry this server's order puts last, whose state
-/// authorization already reads -- and the tip that contests it is set
-/// aside. The peer's PDU is appended after our write, so the peer's power
-/// levels are what the room now enforces, and both the client's view and
-/// federation's must say so, or the two servers' disagreement (#16) would
-/// be joined by a disagreement inside this one.
+/// reads, so here the resolver's choice decides who may write to the room
+/// at all. Both changes come from users at power 100 and neither cites the
+/// other, so state resolution orders them by `origin_server_ts` and applies
+/// the later one last: the peer's, stamped one millisecond after ours.
+/// Those are the power levels the room now enforces, and both the client's
+/// view and federation's must say so, or the two servers' disagreement
+/// (#16) would be joined by a disagreement inside this one.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_write() {
+async fn a_fork_on_the_power_levels_is_resolved_and_decides_who_may_write() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -985,13 +1136,14 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         .await;
     assert_eq!(status, StatusCode::OK);
     // Theirs, from the same fork point, leaves charlie at zero.
-    let pdu = harness.stale_state(
+    let pdu = harness.stale_state_at(
         &peer,
         &room,
         &fork_point,
         "m.room.power_levels",
         "",
         &levels(0),
+        harness.just_after(&peer, &ours).await,
     );
     let theirs = injected_id(&harness.inject(&peer, "fork_pl", pdu).await);
 
@@ -1009,14 +1161,14 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         "the expensive path was taken without being counted: {delta:?}"
     );
 
-    // The head's branch is the one the room holds: theirs, because it was
-    // appended last. Ours is set aside, not lost -- it stays a forward
-    // extremity for the resolver -- but it is not what the room reads.
+    // The resolver's choice is the one the room holds: theirs, the later
+    // timestamp. Ours is outweighed, not lost -- it stays in the DAG -- but
+    // it is not what the room reads.
     let state = harness.state_ids(&room, &alice).await;
     assert_eq!(
         state.get("m.room.power_levels/"),
         Some(&theirs),
-        "the room does not hold the linear head's power levels (ours: {ours})"
+        "the room does not hold the resolved power levels (ours: {ours})"
     );
     let (_, held) = harness
         .get(
@@ -1034,8 +1186,8 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
         "/state_ids disagrees with the client's view of the room"
     );
 
-    // The room stays writable under the levels it holds, and the fork that
-    // is still open is not counted again.
+    // The room stays writable under the levels it holds, and the fork,
+    // merged, is not counted again.
     let before = Cases::read(&harness.metrics);
     for attempt in 0..3 {
         assert_eq!(
@@ -1054,26 +1206,26 @@ async fn a_fork_on_the_power_levels_is_set_aside_and_the_head_decides_who_may_wr
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 }
 
 /// Both branches move one user's membership: SPEC §9.2 case 3 on the slot
 /// #16's scope names alongside power levels.
 ///
-/// We kick charlie; the peer, from the same fork point, bans them. The
-/// same rule as the power-levels test decides the outcome -- the peer's
-/// ban is the linear head -- and the assertion that matters is that the
-/// room *enforces* the membership it holds: a banned user cannot be
-/// re-invited, so the invite that a kick would have allowed is refused.
-/// A room that read one membership and enforced another would be the
-/// inconsistency the set-aside rule exists to avoid.
+/// We kick charlie; the peer, from the same fork point, bans them one
+/// millisecond later. Both are power events from equal-power senders, so
+/// resolution applies the later one, the peer's ban, last -- and the
+/// assertion that matters is that the room *enforces* the membership it
+/// holds: a banned user cannot be re-invited, so the invite that a kick
+/// would have allowed is refused. A room that read one membership and
+/// enforced another would disagree with itself.
 #[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     reason = "serializing the tests is the job"
 )]
-async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced() {
+async fn a_fork_on_one_membership_is_resolved_and_is_what_is_enforced() {
     let _guard = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1096,14 +1248,16 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let ours = harness.head_event(&room, &alice).await;
     // Theirs, from the fork point: a ban.
-    let pdu = harness.stale_state(
+    let pdu = harness.stale_state_at(
         &peer,
         &room,
         &fork_point,
         "m.room.member",
         "@charlie:example.org",
         &json!({ "membership": "ban" }),
+        harness.just_after(&peer, &ours).await,
     );
     let theirs = injected_id(&harness.inject(&peer, "fork_member", pdu).await);
 
@@ -1125,7 +1279,7 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
     assert_eq!(
         state.get("m.room.member/@charlie:example.org"),
         Some(&theirs),
-        "the room does not hold the linear head's membership"
+        "the room does not hold the resolved membership"
     );
     let (_, held) = harness
         .get(
@@ -1171,7 +1325,7 @@ async fn a_fork_on_one_membership_is_set_aside_and_the_head_is_what_is_enforced(
     let delta = Cases::read(&harness.metrics).since(before);
     assert_eq!(
         delta.contested, 0,
-        "one open fork was counted again on later sends: {delta:?}"
+        "the merged fork was counted again on later sends: {delta:?}"
     );
 }
 
@@ -1369,4 +1523,360 @@ async fn a_partition_heals_into_one_state_the_client_and_the_peer_read_alike() {
             "{expected} is missing: {bodies:?}"
         );
     }
+}
+
+/// A local `PUT /send` onto a fork that contests one slot merges both tips,
+/// and the state it sits on is the room version's resolution (#738).
+///
+/// The peer's topic is appended last but carries the older
+/// `origin_server_ts`. Matrix state resolution orders two topics under the
+/// same power levels by timestamp, so ours wins; any "the linear head's
+/// branch wins" rule -- what #359 described and the retired 503 refusal
+/// stood in for -- would pick theirs. So this tells the resolver's answer
+/// apart from the head's, on top of proving the send is not refused.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_rules() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let pdu = peer.event(federation_auth::with_auth_events(
+        &harness.store,
+        json!({
+            "type": "m.room.topic",
+            "state_key": "",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "topic": "theirs" },
+            "origin_server_ts": now_millis() - 60_000,
+            "depth": 11,
+            "prev_events": [fork_point],
+            "auth_events": [],
+        }),
+    ));
+    let theirs = injected_id(&harness.inject(&peer, "fork_ts", pdu).await);
+
+    let before = Cases::read(&harness.metrics);
+    let (status, merge) = harness.send_message(&room, &alice, "after").await;
+    let delta = Cases::read(&harness.metrics).since(before);
+    assert_eq!(status, StatusCode::OK, "a local send on a contested fork");
+    assert_eq!(
+        delta.contested, 1,
+        "the send must resolve the fork, once: {delta:?}"
+    );
+
+    // The send is the merge: it names both tips, as signed.
+    let signed = harness.federation_event(&peer, &merge).await;
+    let parents: std::collections::BTreeSet<String> = signed["prev_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parents, [ours.clone(), theirs.clone()].into());
+
+    // And the room holds the resolver's choice, not the linear head's.
+    let state = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        state.get("m.room.topic/"),
+        Some(&ours),
+        "the room holds the appended-last topic ({theirs}), not the resolved one"
+    );
+    let federation = harness.federation_state_ids(&peer, &room, &merge).await;
+    assert_eq!(
+        federation,
+        state.values().cloned().collect(),
+        "/state_ids disagrees with the client's view of the room"
+    );
+}
+
+/// A client's view of one room's state, kept the way its kind of client
+/// keeps it, so a test can ask whether what a sync said adds up to what the
+/// room holds (#819).
+struct ClientView {
+    /// MSC4222: the block after the timeline is the answer, and the
+    /// timeline's state events are not folded into it.
+    state_after: bool,
+    since: Option<String>,
+    state: std::collections::BTreeMap<String, String>,
+}
+
+impl ClientView {
+    fn new(state_after: bool) -> Self {
+        Self {
+            state_after,
+            since: None,
+            state: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Sync once and apply what the room's entry says. Returns the entry.
+    async fn sync(&mut self, harness: &Harness, token: &str, room: &str, limit: usize) -> Value {
+        let path = format!(
+            "/_matrix/client/v3/sync?timeout=0&timeline_limit={limit}&use_state_after={}{}",
+            self.state_after,
+            self.since
+                .as_ref()
+                .map_or_else(String::new, |since| format!("&since={since}"))
+        );
+        let (status, body) = harness.get(&path, token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        self.since = Some(body["next_batch"].as_str().unwrap().to_owned());
+        let entry = body["rooms"]["join"][room].clone();
+        let key = |event: &Value| {
+            format!(
+                "{}/{}",
+                event["type"].as_str().unwrap_or_default(),
+                event["state_key"].as_str().unwrap_or_default()
+            )
+        };
+        let events = |block: &Value| block["events"].as_array().cloned().unwrap_or_default();
+        if self.state_after {
+            for event in events(&entry["state_after"]) {
+                self.state
+                    .insert(key(&event), event["event_id"].as_str().unwrap().to_owned());
+            }
+        } else {
+            let state = events(&entry["state"]);
+            let timeline = events(&entry["timeline"]);
+            for event in state.iter().chain(timeline.iter()) {
+                if event.get("state_key").is_some() {
+                    self.state
+                        .insert(key(event), event["event_id"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        entry
+    }
+
+    async fn agrees_with_the_room(&self, harness: &Harness, token: &str, room: &str) {
+        let held = harness.state_ids(room, token).await;
+        assert_eq!(
+            self.state,
+            held,
+            "a {} client's state is not the room's (#819)",
+            if self.state_after {
+                "state_after"
+            } else {
+                "classic"
+            }
+        );
+    }
+}
+
+/// An event on a stale parent is appended last and loses state resolution.
+/// A `state_after` client is told the block *is* the state, so it must be
+/// told the winner and not the last topic of the timeline (#819).
+///
+/// The loser is in the timeline, where a classic client folds it; that is
+/// the protocol's own limit, so only the `state_after` client is held to
+/// the room here. Both are held in the next test, where the loser is not in
+/// the window.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_state_after_client_is_told_the_topic_that_won_not_the_one_that_arrived_last() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+    let mut client = ClientView::new(true);
+    client.sync(&harness, &alice, &room, 20).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Older than ours, so it loses; appended after ours, so the timeline
+    // ends on it.
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "theirs" }),
+        now_millis() - 60_000,
+    );
+    let theirs = injected_id(&harness.inject(&peer, "loser", pdu).await);
+    let held = harness.state_ids(&room, &alice).await;
+    assert_eq!(held.get("m.room.topic/"), Some(&ours), "the scenario loses");
+
+    let entry = client.sync(&harness, &alice, &room, 20).await;
+    let timeline: Vec<&str> = entry["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect();
+    assert_eq!(timeline.last(), Some(&theirs.as_str()), "{entry}");
+    client.agrees_with_the_room(&harness, &alice, &room).await;
+
+    // And after the merge a later sync keeps agreeing.
+    harness.say(&room, &alice, "after").await;
+    client.sync(&harness, &alice, &room, 20).await;
+    client.agrees_with_the_room(&harness, &alice, &room).await;
+}
+
+/// A span a limited sync skips holds an event that lost resolution. The
+/// classic `state` block must name what the room holds, not the loser the
+/// skipped span ended on (#819, on top of #820).
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_limited_sync_does_not_state_a_topic_that_lost_in_the_span_it_skipped() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, fork_point) = harness.shared_room(&peer).await;
+    let mut classic = ClientView::new(false);
+    let mut after = ClientView::new(true);
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &fork_point,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "theirs" }),
+        now_millis() - 60_000,
+    );
+    harness.inject(&peer, "loser", pdu).await;
+    // Newer messages push both topics out of a one-event window.
+    harness.say(&room, &alice, "newer").await;
+    let held = harness.state_ids(&room, &alice).await;
+    assert_eq!(held.get("m.room.topic/"), Some(&ours), "the scenario loses");
+
+    for client in [&mut classic, &mut after] {
+        let entry = client.sync(&harness, &alice, &room, 1).await;
+        assert_eq!(entry["timeline"]["limited"], json!(true), "{entry}");
+        client.agrees_with_the_room(&harness, &alice, &room).await;
+    }
+}
+
+/// A key put back to an older event is delivered, to a classic client, a
+/// `state_after` client and a sliding-sync client alike (#819).
+///
+/// The peer sets the topic, alice overwrites it, and then the peer lowers
+/// alice's power on a stale branch. Resolution takes alice's topic away and
+/// the room holds the peer's again: an event no window of the stream
+/// carries, because it entered the stream long ago.
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serializing the tests is the job"
+)]
+async fn a_topic_put_back_to_an_older_event_reaches_every_kind_of_client() {
+    let _guard = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let (room, alice, _) = harness.shared_room(&peer).await;
+    // Alice may write the topic, but the peer outranks her.
+    let (status, _) = harness
+        .put_state(
+            &room,
+            &alice,
+            "m.room.power_levels",
+            &json!({
+                "users": { "@alice:example.org": 50, peer.user(): 100 },
+                "users_default": 0, "state_default": 50, "events_default": 0,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let head = harness.head_event(&room, &alice).await;
+    let pdu = harness.stale_state(
+        &peer,
+        &room,
+        &head,
+        "m.room.topic",
+        "",
+        &json!({ "topic": "the peer's" }),
+    );
+    let first = injected_id(&harness.inject(&peer, "first-topic", pdu).await);
+    let (status, ours) = harness
+        .put_state(&room, &alice, "m.room.topic", &json!({ "topic": "ours" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut classic = ClientView::new(false);
+    let mut after = ClientView::new(true);
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+    classic.agrees_with_the_room(&harness, &alice, &room).await;
+    assert_eq!(classic.state.get("m.room.topic/"), Some(&ours));
+    let sliding = json!({ "lists": { "main": {
+        "ranges": [[0, 5]], "timeline_limit": 5,
+        "required_state": [["m.room.topic", ""]],
+    } } });
+    let path = "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync";
+    let (status, first_sliding) = harness.send("POST", path, &alice, &sliding).await;
+    assert_eq!(status, StatusCode::OK, "{first_sliding}");
+    let pos = first_sliding["pos"].as_str().unwrap().to_owned();
+
+    // Alice loses her power on a branch that never saw her topic.
+    let levels = json!({
+        "users": { "@alice:example.org": 0, peer.user(): 100 },
+        "users_default": 0, "state_default": 50, "events_default": 0,
+    });
+    let pdu = harness.stale_state_at(
+        &peer,
+        &room,
+        &first,
+        "m.room.power_levels",
+        "",
+        &levels,
+        harness.just_after(&peer, &ours).await,
+    );
+    harness.inject(&peer, "demote", pdu).await;
+    let current = harness.state_ids(&room, &alice).await;
+    assert_eq!(
+        current.get("m.room.topic/"),
+        Some(&first),
+        "the scenario must put the topic back"
+    );
+
+    classic.sync(&harness, &alice, &room, 20).await;
+    after.sync(&harness, &alice, &room, 20).await;
+    classic.agrees_with_the_room(&harness, &alice, &room).await;
+    after.agrees_with_the_room(&harness, &alice, &room).await;
+
+    let (status, second) = harness
+        .send("POST", &format!("{path}?pos={pos}"), &alice, &sliding)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let sent: Vec<&str> = second["rooms"][&room]["required_state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the topic put back was not sent: {second}"))
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect();
+    assert_eq!(sent, vec![first.as_str()], "{second}");
 }

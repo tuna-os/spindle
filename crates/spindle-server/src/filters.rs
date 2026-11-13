@@ -31,11 +31,11 @@ use spindle_store::{FjallStore, ReadView, Store, StoreError};
 pub struct Filter {
     #[serde(default)]
     pub room: RoomFilter,
-    /// Accepted, stored, echoed back, and not applied: this server has no
-    /// presence to filter. Keeping it rather than rejecting it is what lets a
-    /// client upload one filter and use it against any server.
+    /// Applied to `/sync`'s `presence` section as any event filter is:
+    /// `senders` picks whose presence a client hears, and `types: []` or
+    /// `limit: 0` is how a client that renders no presence turns it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presence: Option<Value>,
+    pub presence: Option<EventFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_data: Option<EventFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

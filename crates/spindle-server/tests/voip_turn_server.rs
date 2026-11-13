@@ -95,7 +95,7 @@ async fn a_server_with_no_relay_answers_with_an_empty_object() {
 /// The username is `expiry:user_id`, which is the format the relay parses.
 ///
 /// The digest itself is pinned against an externally computed vector in
-/// `routes.rs`'s own tests, where the function is in scope -- see
+/// `voip_routes.rs`'s own tests, where the function is in scope -- see
 /// `the_rest_credential_matches_an_independently_computed_hmac`.
 #[tokio::test]
 async fn the_username_carries_the_expiry_and_the_caller() {

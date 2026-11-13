@@ -123,10 +123,15 @@ impl Harness {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let config = spindle_server::Config::parse(
-            "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
+        // The storage path too, not only the store: uploads land under
+        // `<storage.path>/media`, and the default `./data` is the crate's
+        // source tree.
+        let config = spindle_server::Config::parse(&format!(
+            "[server]\nname = \"example.org\"\n[storage]\npath = \"{}\"\n\
+             [ratelimit]\nenabled = false\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n",
-        )
+            dir.path().display(),
+        ))
         .unwrap();
         let app = spindle_server::app(config, store).expect("the app builds");
         Self { dir, app }

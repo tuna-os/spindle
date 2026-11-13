@@ -27,7 +27,7 @@ use spindle_core::{
     AppendError, EventId, EventInput, LogEntry, Pdu, RoomLog, Sideline, StateKey, StateResolver,
     StateRoot, StateSnapshot, is_state_dag,
 };
-use spindle_store::{Durability, FjallStore, RoomStore, Store, StoreError};
+use spindle_store::{FjallStore, RoomStore, Store, StoreError};
 
 /// Native rooms are v11 (SPEC §11.6).
 pub const ROOM_VERSION: &str = "11";
@@ -149,14 +149,19 @@ mod federation;
 mod gaps;
 #[cfg(feature = "hub-mode")]
 mod hub;
+mod partial;
 mod policy;
 mod read;
+mod retention;
+mod state_delta;
 mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
-pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS};
+pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS, PartialJoinState};
 pub use read::{ReadScope, RoomReader};
+pub use retention::{PassReport, RoomPolicy, TruncationReport};
+pub use retention::{RETENTION_EVENT_TYPE, effective_max_lifetime_ms, retention_loop};
 pub use synapse_positions::SynapseGap;
 
 pub use unread::{Receipt, Scored, Unread, Unscored};
@@ -165,15 +170,36 @@ use unread::{ScoreTally, UnreadIndex};
 pub use gaps::{GapChunk, GapChunkOutcome, GapProgress};
 #[cfg(feature = "hub-mode")]
 pub use hub::{ChainEntry, HUB_EVENT_TYPE, Sequenced};
+pub use partial::PartialState;
+
+/// What a search tests each event with, and what the word index may use to
+/// skip events (#830).
+#[derive(Clone, Copy)]
+pub struct SearchPlan<'a> {
+    /// The lowercase text `matches` looks for in `content.body`, when that
+    /// is all it tests besides filters. `None` means the index is no help.
+    pub needle: Option<&'a str>,
+    /// The predicate that decides a hit.
+    pub matches: &'a (dyn Fn(&Value) -> bool + Sync),
+}
 
 pub struct Rooms {
     policy_federation: Mutex<Option<std::sync::Weak<crate::federation::Federation>>>,
     store: Arc<FjallStore>,
+    /// `[search] index`: maintain and use the word index (#830).
+    search_index: std::sync::atomic::AtomicBool,
+    /// Which destinations have PDUs queued, shared with the delivery loop
+    /// ([`Self::outbox`]).
+    outbox: Arc<crate::federation::outbox::OutboxIndex>,
     server_name: String,
     /// Where appends, lock acquisitions and sync waits are counted; the
     /// server's one registry, shared with everything else that records.
     metrics: Arc<crate::metrics::Metrics>,
-    open: RwLock<HashMap<String, Arc<RwLock<RoomLog>>>>,
+    open: RwLock<HashMap<String, Slot>>,
+    /// Most rooms to hold open; `0` is no limit ([`Self::enforce_resident_budget`]).
+    resident_limit: std::sync::atomic::AtomicUsize,
+    /// Orders room touches for the eviction pick; see [`Slot`].
+    touch_clock: std::sync::atomic::AtomicU64,
     /// Cold loads in flight, one per room: every other caller for a room
     /// being loaded waits for that load rather than starting its own
     /// ([`Self::room_or_load`]). Taken on its own, briefly, and never held
@@ -231,6 +257,16 @@ pub struct Rooms {
     /// stored-body read and a JSON parse per member, per ask. The root is
     /// the answer's identity, so a hit is provably current.
     member_ids: Mutex<HashMap<String, MemberIds>>,
+    /// The erased local users, keyed by the erasure generation it was read
+    /// at ([`crate::accounts::Accounts::erasure_generation`]).
+    ///
+    /// Every client read asks "is this sender erased?" of every event it
+    /// serves once any account on the server has been erased, and a
+    /// migrated Synapse server has erased accounts from the start. Asked of
+    /// the account record, that was a point read and a decode per event;
+    /// the set changes only when an erasure flag does, which bumps the
+    /// generation, so a hit is provably current for one marker read.
+    erased: Mutex<erasure::ErasedCache>,
     /// Each room's version, read once from its create event.
     ///
     /// Unlike every other cache here this one is keyed by room alone, with
@@ -260,6 +296,11 @@ pub struct Rooms {
     /// root, and a busy room recomputes only when who-is-in-it actually
     /// moves.
     destinations: Mutex<HashMap<String, Destinations>>,
+    /// The remote servers with joined members, most-joined first, keyed by
+    /// the state root they were read from, for the same reason as
+    /// `destinations`: a point read per member, asked per received PDU
+    /// that needs recovery ([`Self::participating_servers`]).
+    participants: Mutex<HashMap<String, Destinations>>,
     room_versions: Mutex<HashMap<String, RoomVersionId>>,
     /// The forward extremities of each state-DAG room's state DAG
     /// (MSC4242): the accepted state events no later accepted state event
@@ -296,11 +337,17 @@ pub struct Rooms {
     /// that event for that client forever, silently. Building and proving it
     /// first makes the lock change mechanical instead of frightening.
     stream: crate::stream::Stream,
-    issued_position: Mutex<u64>,
+    /// The stream position the durable checkpoint reaches: a restart
+    /// resumes the counter at or above it, so every token issued at or
+    /// below it is safe. See [`Rooms::checkpoint_stream_position`].
+    checkpointed_position: Mutex<u64>,
     /// Woken whenever an event lands, so a long-polling `/sync` does not have
     /// to spin. SPEC §10.3 wants per-room subscriber lists; this is the same
     /// shape at server granularity, which is enough while there is one lock.
     appended: tokio::sync::Notify,
+    /// Rooms joined with `members_omitted` and still resyncing their full
+    /// state (`partial`, MSC3706).
+    partial: partial::PartialRooms,
 }
 
 /// The events around one event, and the state there.
@@ -317,10 +364,26 @@ pub struct Context {
 pub struct SyncResult {
     pub next_batch: u64,
     pub rooms: Vec<SyncRoom>,
+    /// Every room the user is joined to, news or not: the rooms the
+    /// ephemeral sections are asked about. Read in the same scan of the
+    /// membership index as the other sections, so the caller does not scan
+    /// it again.
+    pub joined: Vec<String>,
     pub invited: Vec<String>,
     /// Rooms knocked on and not yet answered — see [`Rooms::knocked`].
     pub knocked: Vec<String>,
     pub left: Vec<SyncRoom>,
+}
+
+/// A user's rooms by their membership in each, from one scan of the
+/// membership index.
+#[derive(Default)]
+struct Memberships {
+    joined: Vec<String>,
+    invited: Vec<String>,
+    knocked: Vec<String>,
+    /// Left or banned from: the rooms of the `leave` section.
+    departed: Vec<String>,
 }
 
 impl SyncResult {
@@ -342,26 +405,22 @@ impl SyncResult {
     }
 }
 
-/// The state a window changed, as MSC4222's `state_after` wants it: the
-/// last event in the window for each `(type, state_key)` it touched. The
-/// window runs to the head, so the last event for a key *is* the state
-/// after the window for that key, and every key the window did not touch
-/// is unchanged and stays out.
-fn state_changed_in(events: &[Value]) -> Vec<Value> {
-    let mut latest: Vec<((String, String), Value)> = Vec::new();
-    for event in events {
-        let (Some(event_type), Some(state_key)) =
-            (event["type"].as_str(), event["state_key"].as_str())
-        else {
-            continue;
-        };
-        let key = (event_type.to_owned(), state_key.to_owned());
-        match latest.iter_mut().find(|(seen, _)| *seen == key) {
-            Some((_, slot)) => *slot = event.clone(),
-            None => latest.push((key, event.clone())),
-        }
-    }
-    latest.into_iter().map(|(_, event)| event).collect()
+/// One room's share of an incremental sync: its events, whether they were
+/// limited, where they begin, whether the room is told afresh, and the
+/// current event of every state key the range touched (#819).
+type RoomWindow = (Vec<Value>, bool, Option<i64>, bool, Vec<String>);
+
+/// One room's share of a stream range, for a sliding-sync connection that
+/// holds the room as of the range's start: see [`Rooms::room_delta`].
+pub struct RoomDelta {
+    /// The newest events of the range, oldest first.
+    pub events: Vec<Value>,
+    /// Whether the range held more events than were kept.
+    pub limited: bool,
+    /// The linear index of the oldest event kept.
+    pub prev_batch: Option<i64>,
+    /// Every event in the range, kept or not.
+    pub event_ids: HashSet<String>,
 }
 
 /// One room's share of a sync response.
@@ -480,6 +539,12 @@ impl Drop for SideStreamWrite<'_> {
 }
 
 impl Rooms {
+    /// Which destinations have PDUs queued; the delivery loop plans from it.
+    #[must_use]
+    pub fn outbox(&self) -> Arc<crate::federation::outbox::OutboxIndex> {
+        Arc::clone(&self.outbox)
+    }
+
     /// A `Rooms` with a registry of its own, for tests and tools that do
     /// not scrape it; the server uses [`Rooms::with_metrics`].
     #[must_use]
@@ -487,28 +552,59 @@ impl Rooms {
         Self::with_metrics(store, server_name, Arc::default())
     }
 
+    /// As [`Rooms::new`] with a registry to scrape.
+    ///
+    /// # Panics
+    ///
+    /// If the store cannot be read to find where the stream resumes. The
+    /// server uses [`Rooms::try_with_metrics`] and reports that instead.
     #[must_use]
     pub fn with_metrics(
         store: Arc<FjallStore>,
         server_name: impl Into<String>,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
+        Self::try_with_metrics(store, server_name, metrics)
+            .expect("the store can be read to resume the stream")
+    }
+
+    /// [`Rooms::with_metrics`], refusing to start when the store cannot be
+    /// read (#815).
+    ///
+    /// Where the stream resumes is read from the store. A read that failed
+    /// and counted as zero would resume the counter below ids already on
+    /// disk and overwrite the entries they point at.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error of the read that failed.
+    pub fn try_with_metrics(
+        store: Arc<FjallStore>,
+        server_name: impl Into<String>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Self, spindle_store::StoreError> {
         let store_for_stream = Arc::clone(&store);
         // Read once and used twice: the stream's own high-water mark bounds
         // the index backfill and is one of the four drawers the counter
         // resumes above.
-        let stream_high = highest_stream_row(store_for_stream.as_ref());
+        let stream_high = highest_stream_row(store_for_stream.as_ref())?;
         // Before anything reads the reverse index, make it complete. A store
         // written by a binary without it has a forward stream and no index,
         // and an incremental `/sync` answered from an empty index would
         // report that nothing had happened -- not slower, wrong.
-        backfill_room_stream_index(store_for_stream.as_ref(), stream_high);
-        Self {
+        backfill_room_stream_index(store_for_stream.as_ref(), stream_high)?;
+        let resume_at = highest_stream_id(store_for_stream.as_ref(), stream_high)?;
+        let checkpointed = read_stream_checkpoint(store_for_stream.as_ref())?;
+        Ok(Self {
             policy_federation: Mutex::new(None),
+            outbox: Arc::new(crate::federation::outbox::OutboxIndex::load(&store)),
+            search_index: std::sync::atomic::AtomicBool::new(false),
             store,
             server_name: server_name.into(),
             metrics,
             open: RwLock::new(HashMap::new()),
+            resident_limit: std::sync::atomic::AtomicUsize::new(0),
+            touch_clock: std::sync::atomic::AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
@@ -516,7 +612,9 @@ impl Rooms {
             receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
+            erased: Mutex::new(erasure::ErasedCache::default()),
             destinations: Mutex::new(HashMap::new()),
+            participants: Mutex::new(HashMap::new()),
             room_versions: Mutex::new(HashMap::new()),
             state_heads: Mutex::new(HashMap::new()),
             auth_graphs: Mutex::new(HashMap::new()),
@@ -527,13 +625,11 @@ impl Rooms {
             // they point at -- the same shape of bug as a room registry that
             // does not survive a restart, and worse, because it corrupts
             // rather than merely forgets.
-            issued_position: Mutex::new(read_stream_checkpoint(store_for_stream.as_ref())),
-            stream: crate::stream::Stream::resuming_at(highest_stream_id(
-                store_for_stream.as_ref(),
-                stream_high,
-            )),
+            checkpointed_position: Mutex::new(checkpointed),
+            stream: crate::stream::Stream::resuming_at(resume_at),
             appended: tokio::sync::Notify::new(),
-        }
+            partial: partial::PartialRooms::load(store_for_stream.as_ref()),
+        })
     }
 
     /// Persist one fully validated Synapse replay.
@@ -625,8 +721,8 @@ impl Rooms {
                 .open
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(room) = open.get(room_id) {
-                Arc::clone(room)
+            if let Some(slot) = open.get(room_id) {
+                Arc::clone(&slot.room)
             } else {
                 let log = RoomStore::new(self.store.as_ref(), room_id)
                     .load()?
@@ -635,7 +731,7 @@ impl Rooms {
                         |restored| restored.log,
                     );
                 let room = Arc::new(RwLock::new(log));
-                open.insert(room_id.to_owned(), Arc::clone(&room));
+                open.insert(room_id.to_owned(), self.slot(Arc::clone(&room)));
                 room
             }
         };
@@ -780,8 +876,11 @@ impl Rooms {
                 sender,
                 content: &body["content"],
                 json: body,
+                transaction: None,
+                before: None,
             },
         )
+        .map(|_| ())
     }
 
     /// Store the bodies of the state a seed names, and index its memberships
@@ -832,7 +931,7 @@ impl Rooms {
                         room_id.as_bytes().to_vec(),
                     ),
                 ],
-                Durability::Group,
+                self.store.durability(),
             )?;
             let key = StateKey::new(event_type.as_str(), state_key.as_str());
             if event_type == "m.room.member"
@@ -871,7 +970,7 @@ impl Rooms {
                 ));
                 retained += 1;
             }
-            spindle_store::Store::commit(rooms.store.as_ref(), &writes, Durability::Group)?;
+            spindle_store::Store::commit(rooms.store.as_ref(), &writes, rooms.store.durability())?;
             Ok(retained)
         })
     }
@@ -903,7 +1002,7 @@ impl Rooms {
                 log,
                 &markers,
                 &writes,
-                Durability::Group,
+                rooms.store.durability(),
             )?;
             Ok(markers.len())
         })
@@ -975,7 +1074,7 @@ impl Rooms {
             let body = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
             self.index_membership(room_id, Some(&user_id), &body["content"], li)?;
         }
-        spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
+        spindle_store::Store::sync(self.store.as_ref(), self.store.durability())?;
         Ok(present.len())
     }
 
@@ -1005,7 +1104,7 @@ impl Rooms {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+            .insert(room_id.to_owned(), self.slot(Arc::new(RwLock::new(log))));
     }
 
     /// Store event bodies for [`Self::install_replay_log`].
@@ -1028,7 +1127,7 @@ impl Rooms {
                 room_id.as_bytes().to_vec(),
             ));
         }
-        spindle_store::Store::commit(self.store.as_ref(), &writes, Durability::Group)?;
+        spindle_store::Store::commit(self.store.as_ref(), &writes, self.store.durability())?;
         Ok(())
     }
 
@@ -1126,6 +1225,7 @@ impl Rooms {
             &create_content,
             &create_id,
             &create_json,
+            None,
         )?;
 
         let mut creator_join = Value::Object(creator_profile.clone());
@@ -1186,7 +1286,8 @@ impl Rooms {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room_id.clone(), Arc::new(RwLock::new(log)));
+            .insert(room_id.clone(), self.slot(Arc::new(RwLock::new(log))));
+        self.enforce_resident_budget();
         Ok(room_id)
     }
 
@@ -1225,7 +1326,7 @@ impl Rooms {
     ) -> Result<String, RoomError> {
         self.with_room(room_id, |rooms, log| {
             rooms.append_with(
-                log, room_id, sender, key, event_type, None, content, sticky_ms,
+                log, room_id, sender, key, event_type, None, content, sticky_ms, None,
             )
         })
     }
@@ -1631,7 +1732,7 @@ impl Rooms {
             .iter()
             .any(|event| event.get("state_key").is_some());
         let current = state_after || !state_in_window;
-        if state_block == StateBlock::Deferred && current && !self.erasure_active()? {
+        if state_block == StateBlock::Deferred && current {
             // Nothing to do: the caller serves the cached render.
             return Ok((Vec::new(), true));
         }
@@ -1646,7 +1747,7 @@ impl Rooms {
                 || needed.contains(key.state_key())
         };
         let events = match (current, window_start) {
-            (false, Some(start)) => self.state_before(room_id, start, want)?,
+            (false, Some(start)) => self.state_before(room_id, start, timeline, want)?,
             _ => self.state_where(room_id, want)?,
         };
         Ok((events, false))
@@ -1656,6 +1757,14 @@ impl Rooms {
     /// `want` admits: the snapshot after the entry preceding `li`, or an
     /// empty room when nothing precedes it.
     ///
+    /// Plus every slot of the current state that neither that snapshot nor
+    /// a state event in `timeline` accounts for. In an ordinary room there
+    /// is none: a slot is set before the window or in it. A partial-state
+    /// join (MSC3706) makes some: the member events its resync filled in
+    /// are state the room has without any event of its timeline having set
+    /// them, and a window reaching back past the join would otherwise show
+    /// the client neither.
+    ///
     /// Decided on the key before the body is read, as [`Self::state_where`]
     /// does and for the same reason. The snapshot is rebuilt from its
     /// content address rather than taken from the resident window, because
@@ -1664,16 +1773,47 @@ impl Rooms {
         &self,
         room_id: &str,
         li: i64,
+        timeline: &[Value],
         want: impl Fn(&StateKey) -> bool,
     ) -> Result<Vec<Value>, RoomError> {
-        let root = self.with_room_read(room_id, |_, log| {
-            Ok(log
-                .entry_at_or_before(li.saturating_sub(1))
-                .filter(|entry| entry.li.get() < li)
-                .map(|entry| entry.state_root))
+        let (root, current) = self.with_room_read(room_id, |_, log| {
+            Ok((
+                log.entry_at_or_before(li.saturating_sub(1))
+                    .filter(|entry| entry.li.get() < li)
+                    .map(|entry| entry.state_root),
+                log.current_state().cloned(),
+            ))
         })?;
+        let in_window: HashSet<(&str, &str)> = timeline
+            .iter()
+            .filter_map(|event| Some((event["type"].as_str()?, event["state_key"].as_str()?)))
+            .collect();
+        let unexplained = |before: &spindle_core::StateSnapshot| -> Vec<String> {
+            let Some(current) = &current else {
+                return Vec::new();
+            };
+            before
+                .diff(current)
+                .into_iter()
+                .filter(|(key, ours, theirs)| {
+                    ours.is_none()
+                        && theirs.is_some()
+                        && want(key)
+                        && !in_window.contains(&(key.event_type().as_str(), key.state_key()))
+                })
+                .filter_map(|(_, _, theirs)| theirs.map(str::to_owned))
+                .collect()
+        };
         let Some(root) = root else {
-            return Ok(Vec::new());
+            let empty = spindle_core::StateSnapshot::new(spindle_store::ReadView::key_table(
+                self.store.as_ref(),
+            ));
+            let mut events = Vec::new();
+            for event_id in unexplained(&empty) {
+                let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
+                events.push(stamp(event, &event_id));
+            }
+            return Ok(events);
         };
         let mut load = |address: &spindle_core::StateRoot| {
             spindle_store::ReadView::get(
@@ -1698,6 +1838,7 @@ impl Rooms {
                 ids.push(event_id.to_owned());
             }
         });
+        ids.extend(unexplained(&snapshot));
         let mut events = Vec::with_capacity(ids.len());
         for event_id in ids {
             let event = self.read_event(room_id, &EventId::new(event_id.as_str()))?;
@@ -2195,14 +2336,12 @@ impl Rooms {
     ///
     /// Returns [`RoomError::UnknownRoom`] if the room does not exist.
     pub fn roster(&self, room_id: &str) -> Result<Arc<Roster>, RoomError> {
-        let (root, members) = self.with_room_read(room_id, |_, log| {
-            let root = log.current_state().map(|state| *state.root().as_bytes());
-            let members = current_state(log)
-                .into_iter()
-                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
-                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
-                .collect::<Vec<_>>();
-            Ok((root, members))
+        // The cache is asked with the root alone. Collecting the member keys
+        // first, as this did, copied out every member's user ID on every
+        // call -- a per-member cost on the warm path that the cache exists
+        // to make flat (#701).
+        let root = self.with_room_read(room_id, |_, log| {
+            Ok(log.current_state().map(|state| *state.root().as_bytes()))
         })?;
         let Some(root) = root else {
             return Ok(Arc::new(Roster::default()));
@@ -2216,6 +2355,20 @@ impl Rooms {
         {
             return Ok(Arc::clone(roster));
         }
+        // Root and members again, under one lock, so the roster is cached
+        // against the state it was built from even if the state moved since.
+        let (root, members) = self.with_room_read(room_id, |_, log| {
+            let root = log.current_state().map(|state| *state.root().as_bytes());
+            let members = current_state(log)
+                .into_iter()
+                .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
+                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
+                .collect::<Vec<_>>();
+            Ok((root, members))
+        })?;
+        let Some(root) = root else {
+            return Ok(Arc::new(Roster::default()));
+        };
         let mut joined = Vec::new();
         let mut invited = Vec::new();
         let mut invited_heroes = Vec::new();
@@ -2305,6 +2458,7 @@ impl Rooms {
                 Some(state_key),
                 content,
                 sticky_ms,
+                None,
             )
         })
     }
@@ -2384,7 +2538,7 @@ impl Rooms {
     /// Returns [`RoomError`] if the index cannot be read or the outbox
     /// written.
     pub fn push_sticky_to(&self, room_id: &str, destination: &str) -> Result<(), RoomError> {
-        for (_, event, _) in self.sticky_events(room_id, None)? {
+        for (event_id, event, _) in self.sticky_events(room_id, None)? {
             let local = event["sender"]
                 .as_str()
                 .and_then(|sender| sender.split_once(':'))
@@ -2392,17 +2546,13 @@ impl Rooms {
             if !local {
                 continue;
             }
-            // The stored body, without the client-facing `event_id`.
-            let mut pdu = event;
-            if let Some(object) = pdu.as_object_mut() {
-                object.remove("event_id");
-            }
             let stream_write = self.reserve_stream_id();
             let seq = stream_write.id();
-            spindle_store::Store::put(
+            self.outbox.enqueue(
                 self.store.as_ref(),
-                &spindle_core::keys::federation_outbox(destination, seq),
-                pdu.to_string().as_bytes(),
+                &self.metrics,
+                &[(destination, seq)],
+                &crate::federation::outbox::reference(room_id, &event_id),
             )?;
         }
         Ok(())
@@ -2512,6 +2662,8 @@ impl Rooms {
         let content = Value::Object(content);
 
         let redaction_id = self.with_room(room_id, |rooms, log| {
+            // Before anything is stored: a refused redaction leaves no event.
+            rooms.check_may_redact(log, room_id, sender, target)?;
             rooms.append(
                 log,
                 room_id,
@@ -2530,8 +2682,34 @@ impl Rooms {
         Ok(redaction_id)
     }
 
+    /// Drop the index rows of an event whose body is going away. Run while
+    /// the body is still in hand, so its words are known.
+    pub(super) fn unindex_body(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        body: &Value,
+    ) -> Result<(), RoomError> {
+        if !self.search_indexed() {
+            return Ok(());
+        }
+        let (Some(text), Some(li)) = (
+            crate::search_index::body_of(body),
+            self.event_position(room_id, event_id)?,
+        ) else {
+            return Ok(());
+        };
+        crate::search_index::remove(
+            self.store.as_ref(),
+            room_id,
+            spindle_core::LinearIndex::from_raw(li),
+            text,
+        )?;
+        Ok(())
+    }
+
     /// Rewrite a stored event to its redacted form.
-    fn apply_redaction(
+    pub(super) fn apply_redaction(
         &self,
         room_id: &str,
         target: &str,
@@ -2547,6 +2725,7 @@ impl Rooms {
         // client can see why without the ID changing.
         let version = self.room_version(room_id)?;
         let json = Self::redacted_body(&version, &stored, redaction_id)?;
+        self.unindex_body(room_id, target, &stored)?;
 
         spindle_store::Store::put(
             self.store.as_ref(),
@@ -2666,6 +2845,7 @@ impl Rooms {
         let prefix =
             spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::Relation, room_id);
         let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        let erased = self.erased_users()?;
 
         // root event id -> (latest reply's li, viewer replied in it)
         let mut roots: HashMap<String, (i64, bool)> = HashMap::new();
@@ -2688,10 +2868,9 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let reply = if self.erasure_active()? {
-                self.prune_erased_event(viewer, room_id, reply)?
-            } else {
-                reply
+            let reply = match &erased {
+                Some(erased) => self.prune_erased_with(erased, viewer, room_id, reply)?,
+                None => reply,
             };
             let Some((_, root)) = relates_to(&reply["content"]) else {
                 continue;
@@ -3451,10 +3630,13 @@ impl Rooms {
     /// below `from`, of the positions `visible` admits: at most `limit` of
     /// them, and the position a following page starts below.
     ///
-    /// This is `/search` (#7's "search basics"), and it is a walk, not an
-    /// index: every body the walk passes is read and put to `matches`, so a
-    /// search costs the room it searches, back to the oldest position the
-    /// caller may see or until `limit` hits are in hand. The candidates are
+    /// This is `/search` (#7's "search basics"), and it is a walk: every
+    /// body the walk passes is read and put to `matches`, so a search costs
+    /// the room it searches, back to the oldest position the caller may see
+    /// or until `limit` hits are in hand. With `[search] index` on and a
+    /// `needle` that `matches` tests as lowercase containment in
+    /// `content.body`, the word index drops the positions that cannot match
+    /// first, so only the candidates are read (#830). The candidates are
     /// taken from the spine under the room's read lock and the bodies read
     /// outside it, as `messages_visible` does. A purged body below the
     /// watermark is not a hit (there is nothing to match), where every
@@ -3470,8 +3652,9 @@ impl Rooms {
         from: Option<i64>,
         limit: usize,
         visible: &(dyn Fn(i64) -> bool + Sync),
-        matches: &(dyn Fn(&Value) -> bool + Sync),
+        plan: &SearchPlan<'_>,
     ) -> Result<(Vec<TimelineEvent>, Option<i64>), RoomError> {
+        let SearchPlan { needle, matches } = *plan;
         let candidates: Vec<(i64, String)> = self.with_room_read(room_id, |_, log| {
             Ok(log
                 .entries()
@@ -3480,14 +3663,33 @@ impl Rooms {
                 .filter(|(li, _)| from.is_none_or(|from| *li < from) && visible(*li))
                 .collect())
         })?;
+        // The index only marks candidates that cannot match. They stay in
+        // the walk, unread: a page that ends on one still says a further
+        // page may follow, exactly as the scan does. Read after the
+        // spine, so every position it covers has its rows already: an
+        // append writes its rows and moves the marker in one batch.
+        let mut skipped = vec![false; candidates.len()];
+        if let Some(needle) = needle.filter(|_| self.search_indexed())
+            && let Some(marked) = crate::search_index::marker(self.store.as_ref(), room_id)?
+            && let Some(narrowed) =
+                crate::search_index::candidates(self.store.as_ref(), room_id, needle)?
+        {
+            skipped = candidates
+                .iter()
+                .map(|(li, _)| *li <= marked && !narrowed.contains(li))
+                .collect();
+        }
         let watermark = self.purge_watermark(room_id)?;
-        let erasure_active = self.erasure_active()?;
+        let erased = self.erased_users()?;
         let mut hits = Vec::new();
-        for (li, event_id) in candidates {
+        for ((li, event_id), skip) in candidates.into_iter().zip(skipped) {
             if hits.len() == limit {
                 // This candidate is where the next page begins: `from` is
                 // exclusive, so one above it.
                 return Ok((hits, Some(li + 1)));
+            }
+            if skip {
+                continue;
             }
             let json = match self.read_event(room_id, &EventId::new(event_id.as_str())) {
                 Ok(json) => json,
@@ -3497,10 +3699,9 @@ impl Rooms {
                 Err(error) => return Err(error),
             };
             let json = stamp(json, &event_id);
-            let json = if erasure_active {
-                self.prune_erased_event(user_id, room_id, json)?
-            } else {
-                json
+            let json = match &erased {
+                Some(erased) => self.prune_erased_with(erased, user_id, room_id, json)?,
+                None => json,
             };
             if matches(&json) {
                 hits.push(TimelineEvent { event_id, li, json });
@@ -3683,7 +3884,7 @@ impl Rooms {
         .is_some())
     }
 
-    /// Wake everything blocked in [`Self::wait_for_event`].
+    /// Wake everything blocked in [`Self::wait_past`].
     ///
     /// For appends the append itself notifies; this is for the other thing a
     /// waiting `/sync` can be waiting on — a to-device message, which lands
@@ -3715,6 +3916,17 @@ impl Rooms {
     /// Queue rows and ephemeral marks can disappear; they cannot be the only
     /// evidence that a client already holds a position above the room log.
     ///
+    /// The checkpoint is written [`CHECKPOINT_LEASE`] positions ahead of
+    /// the one asked for, and positions under it need no write at all.
+    /// What a restart needs is a floor at or above every issued token, and
+    /// a higher floor is as good: the counter resumes above it and skips
+    /// the positions between, which nothing was ever handed. Writing the
+    /// exact position instead put a full fsync on every `/sync` that
+    /// moved the stream -- every sync that carried news. That barrier was
+    /// most of the `sync_delta` loss against Tuwunel (#701): about 1.1 ms of
+    /// a 1.9 ms one-event sync on a dev host, against 0.5 ms for an empty
+    /// poll.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError`] if the checkpoint cannot be made durable.
@@ -3724,20 +3936,21 @@ impl Rooms {
                 "uncommitted stream position".to_owned(),
             ));
         }
-        let mut issued = self
-            .issued_position
+        let mut checkpointed = self
+            .checkpointed_position
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if position > *issued {
+        if position > *checkpointed {
+            let lease = position.saturating_add(CHECKPOINT_LEASE);
             spindle_store::Store::commit(
                 self.store.as_ref(),
                 &[(
                     spindle_core::keys::stream_checkpoint(),
-                    position.to_be_bytes().to_vec(),
+                    lease.to_be_bytes().to_vec(),
                 )],
                 spindle_store::Durability::Strict,
             )?;
-            *issued = position;
+            *checkpointed = lease;
         }
         Ok(())
     }
@@ -3815,7 +4028,7 @@ impl Rooms {
             .collect()
     }
 
-    /// Wait until an event lands, or the deadline passes.
+    /// Wait until the stream moves past `seen`, or the deadline passes.
     ///
     /// SPEC §10.3 wants `/sync` to be push rather than poll, and this is the
     /// smallest thing that is: a waiter is woken by the append itself, so a
@@ -3824,11 +4037,19 @@ impl Rooms {
     /// strictly needed -- correct, and coarser than §10.3's per-room
     /// subscriber lists, which is the shape to reach for when rooms stop
     /// sharing one lock.
-    pub async fn wait_for_event(&self, timeout: std::time::Duration) {
-        // `notified()` must be created *before* the position is re-checked by
-        // the caller, or an append landing in between is missed and the client
-        // waits out the full timeout for news that already arrived.
+    ///
+    /// Returns at once if the stream has already moved past `seen`, rather
+    /// than waiting for the next wake. A long-poll reads, finds nothing for
+    /// its connection and waits again, so a move landing between that read
+    /// and this wait would otherwise be missed until the one after it.
+    pub async fn wait_past(&self, seen: u64, timeout: std::time::Duration) {
+        // `notified()` must be created *before* the position is checked, or
+        // an append landing in between is missed and the client waits out
+        // the full timeout for news that already arrived.
         let notified = self.appended.notified();
+        if self.stream_position() > seen {
+            return;
+        }
         self.metrics.sync_waiter_started();
         let _ = tokio::time::timeout(timeout, notified).await;
         self.metrics.sync_waiter_finished();
@@ -3861,16 +4082,16 @@ impl Rooms {
     ) -> Result<SyncResult, RoomError> {
         let position = self.stream_position();
         self.checkpoint_stream_position(position)?;
-        let joined = self.joined(user_id)?;
-        let invited = self.invited_since(user_id, since, position)?;
-        let knocked = self.knocked(user_id)?;
+        // One scan of the membership index for every section, not one each.
+        let memberships = self.memberships(user_id)?;
+        let invited = self.invited_since(user_id, memberships.invited, since, position)?;
 
         // The range each room is asked about. `None` on an initial sync,
         // which reads tails instead and has no range to walk.
         let range = since.map(|since| (since, position));
 
         let mut rooms = Vec::new();
-        for room_id in joined {
+        for room_id in &memberships.joined {
             // A room joined inside the window is one the client knows only
             // from its invite, if at all, so it is told the room the way an
             // initial sync would: the tail of the timeline rather than the
@@ -3878,36 +4099,14 @@ impl Rooms {
             // takes a `prev_batch` for a room it already knew only when the
             // window is `limited`, so a join sent as a one-event slice left
             // Element unable to page back to anything said before it.
-            let (events, limited, prev_batch, fresh) = match range {
+            let (events, limited, prev_batch, fresh, changed_state) = match range {
                 None => {
                     let (events, limited, prev_batch) =
-                        self.timeline_tail(&room_id, timeline_limit)?;
-                    (events, limited, prev_batch, true)
+                        self.timeline_tail(room_id, timeline_limit)?;
+                    (events, limited, prev_batch, true, Vec::new())
                 }
                 Some((since, until)) => {
-                    let slice = self.room_slice(&room_id, since, until)?;
-                    // A join lands in the window, so a quiet room needs no
-                    // lookup: `sync_cost.rs` counts reads per joined room,
-                    // and this must stay flat across rooms where nothing
-                    // happened.
-                    let joined_at = if slice.is_empty() {
-                        None
-                    } else {
-                        self.membership_event(&room_id, user_id)?.map(|(_, li)| li)
-                    };
-                    if joined_at.is_some_and(|li| slice.contains(&li)) {
-                        let (events, limited, prev_batch) =
-                            self.timeline_tail(&room_id, timeline_limit)?;
-                        (events, limited, prev_batch, true)
-                    } else {
-                        let first = slice.iter().copied().min();
-                        (
-                            self.timeline_of(&room_id, &slice, None)?,
-                            false,
-                            first,
-                            false,
-                        )
-                    }
+                    self.incremental_window(room_id, user_id, since, until, timeline_limit)?
                 }
             };
             // An incremental sync says nothing about a room where nothing
@@ -3916,31 +4115,25 @@ impl Rooms {
             if since.is_some() && events.is_empty() {
                 continue;
             }
-            // State only when the client is meeting the room: on an
-            // initial sync, or on the sync that joins it. Otherwise the
-            // state events are in the timeline already, and sending them
-            // twice would make a client apply each one twice.
-            //
-            // Except under MSC4222. `state_after` tells the client *not* to
-            // fold the timeline's state events into its state -- the block
-            // is the whole answer -- so an incremental sync must carry
-            // every key that changed in the window, or the change is lost.
-            // It was: this branch sent an empty block, and matrix-rust-sdk,
-            // which always asks for `state_after`, never saw a room name,
-            // topic, alias or power level change after its first sync.
+            // The room's state as the client is told it: whole when it is
+            // meeting the room (an initial sync, or the sync that joins it),
+            // and otherwise what the current state changed that the
+            // timeline does not carry, or under MSC4222 everything it
+            // changed. See `incremental_state`.
             let (state, cached_state) = if fresh {
                 self.initial_state(
-                    &room_id,
+                    room_id,
                     user_id,
                     state_block,
                     &events,
                     prev_batch,
                     state_after,
                 )?
-            } else if state_after {
-                (state_changed_in(&events), false)
             } else {
-                (Vec::new(), false)
+                (
+                    self.incremental_state(room_id, &events, &changed_state, state_after)?,
+                    false,
+                )
             };
             rooms.push(SyncRoom {
                 room_id: room_id.clone(),
@@ -3952,19 +4145,16 @@ impl Rooms {
             });
         }
 
-        let mut left = self.left_rooms(user_id, since, range)?;
-        if self.erasure_active()? {
+        let mut left = self.left_rooms(user_id, memberships.departed, range)?;
+        // The timeline only: Synapse's `filter_events_for_client` sees the
+        // timeline, never the state block, and pruning state would serve a
+        // later joiner an erased user's `m.room.encryption` as `{}`.
+        if let Some(erased) = self.erased_users()? {
             for room in rooms.iter_mut().chain(left.iter_mut()) {
-                room.events = self.prune_erased_events(
-                    user_id,
-                    &room.room_id,
-                    std::mem::take(&mut room.events),
-                )?;
-                room.state = self.prune_erased_events(
-                    user_id,
-                    &room.room_id,
-                    std::mem::take(&mut room.state),
-                )?;
+                room.events = std::mem::take(&mut room.events)
+                    .into_iter()
+                    .map(|event| self.prune_erased_with(&erased, user_id, &room.room_id, event))
+                    .collect::<Result<_, _>>()?;
             }
         }
 
@@ -3992,8 +4182,9 @@ impl Rooms {
         Ok(SyncResult {
             next_batch: position,
             rooms,
+            joined: memberships.joined,
             invited,
-            knocked,
+            knocked: memberships.knocked,
             left,
         })
     }
@@ -4018,10 +4209,10 @@ impl Rooms {
     fn invited_since(
         &self,
         user_id: &str,
+        invited: Vec<String>,
         since: Option<u64>,
         until: u64,
     ) -> Result<Vec<String>, RoomError> {
-        let invited = self.invited(user_id)?;
         let Some(since) = since else {
             return Ok(invited);
         };
@@ -4036,7 +4227,7 @@ impl Rooms {
                 }
                 continue;
             }
-            let Some((_, membership_li)) = self.membership_event(&room_id, user_id)? else {
+            let Some(membership_li) = self.membership_li(&room_id, user_id)? else {
                 continue;
             };
             if self
@@ -4079,51 +4270,105 @@ impl Rooms {
     /// know the room exists and that it is out of it; replaying the whole
     /// history of every room a user ever left would make the first sync
     /// proportional to their entire past.
+    ///
+    /// `departed` is the rooms the user left or was banned from.
     fn left_rooms(
         &self,
         user_id: &str,
-        since: Option<u64>,
+        departed: Vec<String>,
         range: Option<(u64, u64)>,
     ) -> Result<Vec<SyncRoom>, RoomError> {
         let mut out = Vec::new();
-        for membership in [LEAVE, BAN] {
-            for room_id in self.membership_rooms(user_id, membership)? {
-                if self.is_forgotten(user_id, &room_id)? {
-                    continue;
-                }
-                let Some((departure, departed_at)) = self.membership_event(&room_id, user_id)?
-                else {
-                    continue;
-                };
-                let (events, prev_batch) = match range {
-                    None => (vec![departure], Some(departed_at)),
-                    Some((since, until)) => {
-                        let slice = self.room_slice(&room_id, since, until)?;
-                        let first = slice.iter().copied().min();
-                        (
-                            self.timeline_of(&room_id, &slice, Some(departed_at))?,
-                            first,
-                        )
+        for room_id in departed {
+            // An incremental sync says nothing about a room the user left
+            // long ago, for the same reason it says nothing about a joined
+            // room where nothing happened -- and asks that first, as a scan
+            // that is empty for such a room, so it costs no read. It read
+            // the forgotten flag and the departure's body for every room
+            // the user had ever left, on every sync.
+            let slice = match range {
+                None => None,
+                Some((since, until)) => {
+                    let slice = self.room_slice(&room_id, since, until)?;
+                    if slice.is_empty() {
+                        continue;
                     }
-                };
-                // An incremental sync says nothing about a room the user left
-                // long ago, for the same reason it says nothing about a joined
-                // room where nothing happened.
-                if since.is_some() && events.is_empty() {
-                    continue;
+                    Some(slice)
                 }
-                out.push(SyncRoom {
-                    room_id,
-                    state: Vec::new(),
-                    events,
-                    limited: false,
-                    prev_batch,
-                    cached_state: false,
-                });
+            };
+            if self.is_forgotten(user_id, &room_id)? {
+                continue;
             }
+            // Leaving a room is not proof of having been in it: a withdrawn
+            // knock, a refused invite or a pre-emptive ban all end in
+            // `leave` or `ban`. The window `since` opens is the client's
+            // choice, so what it may carry is bounded by what the user was
+            // allowed to read, not just by when they left.
+            // Someone who never joined is still told how they left -- a
+            // refused invite or withdrawn knock must show up as a leave --
+            // but only that one membership event, and none of the history.
+            let scope = match self.leave_read_scope(user_id, &room_id)? {
+                Some(scope) => scope,
+                None => match self.membership_li(&room_id, user_id)? {
+                    Some(at) => ReadScope::Within(vec![(at, at)]),
+                    None => continue,
+                },
+            };
+            let (events, prev_batch) = match slice {
+                None => {
+                    let Some((departure, departed_at)) =
+                        self.membership_event(&room_id, user_id)?
+                    else {
+                        continue;
+                    };
+                    if !scope.admits(departed_at) {
+                        continue;
+                    }
+                    (vec![departure], Some(departed_at))
+                }
+                Some(slice) => {
+                    let Some(departed_at) = self.membership_li(&room_id, user_id)? else {
+                        continue;
+                    };
+                    let readable: Vec<i64> = slice
+                        .iter()
+                        .copied()
+                        .filter(|li| scope.admits(*li))
+                        .collect();
+                    let events = self.timeline_of(&room_id, &readable, Some(departed_at))?;
+                    // Everything in the window came after the departure.
+                    if events.is_empty() {
+                        continue;
+                    }
+                    (events, slice.iter().copied().min())
+                }
+            };
+            out.push(SyncRoom {
+                room_id,
+                state: Vec::new(),
+                events,
+                limited: false,
+                prev_batch,
+                cached_state: false,
+            });
         }
         out.sort_by(|a, b| a.room_id.cmp(&b.room_id));
         Ok(out)
+    }
+
+    /// What a user who has left `room_id` may be told of it in `/sync`:
+    /// their read scope, or `None` when they have none (never joined), in
+    /// which case the caller shows only their own departure event.
+    fn leave_read_scope(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> Result<Option<ReadScope>, RoomError> {
+        match self.read_scope(user_id, room_id) {
+            Ok(scope) => Ok(Some(scope)),
+            Err(RoomError::Forbidden(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `user_id`'s current membership event in `room_id`, and its `li`.
@@ -4137,12 +4382,35 @@ impl Rooms {
         room_id: &str,
         user_id: &str,
     ) -> Result<Option<(Value, i64)>, RoomError> {
+        let Some((event_id, li)) = self.current_membership(room_id, user_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((self.event(room_id, &event_id)?, li)))
+    }
+
+    /// The `li` of `user_id`'s current membership event in `room_id`,
+    /// without its body.
+    ///
+    /// What `/sync` asks of every room it reports -- where the reader's
+    /// unread count starts, and whether they joined inside the window --
+    /// is a position, and reading and parsing the event to learn it was a
+    /// body read per room on every sync with news (#701).
+    fn membership_li(&self, room_id: &str, user_id: &str) -> Result<Option<i64>, RoomError> {
+        Ok(self.current_membership(room_id, user_id)?.map(|(_, li)| li))
+    }
+
+    /// The ID and `li` of `user_id`'s current membership event.
+    fn current_membership(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(String, i64)>, RoomError> {
         let wanted = StateKey::new("m.room.member", user_id);
         // One lookup, under one lock. This walked every state key in the
         // room to find one, then took the room lock a second time to read
         // that entry's position -- on a path `unread` runs for every room
         // on every sync, which made each sync scale with the member list.
-        let found = self.with_room_read(room_id, |_, log| {
+        self.with_room_read(room_id, |_, log| {
             let Some(event_id) = current_state_id(log, &wanted) else {
                 return Ok(None);
             };
@@ -4150,11 +4418,7 @@ impl Rooms {
                 .get(&EventId::new(event_id.as_str()))
                 .map(|entry| entry.li.get());
             Ok(li.map(|li| (event_id, li)))
-        })?;
-        let Some((event_id, li)) = found else {
-            return Ok(None);
-        };
-        Ok(Some((self.event(room_id, &event_id)?, li)))
+        })
     }
 
     /// The stretches of `room_id` during which `user_id` could see it:
@@ -4182,7 +4446,7 @@ impl Rooms {
         from_invite: bool,
     ) -> Result<Vec<(i64, i64)>, RoomError> {
         let mut rows = self.member_history(room_id, user_id)?;
-        if rows.is_empty() && self.membership_event(room_id, user_id)?.is_some() {
+        if rows.is_empty() && self.membership_li(room_id, user_id)?.is_some() {
             self.backfill_member_history(room_id, user_id)?;
             rows = self.member_history(room_id, user_id)?;
         }
@@ -4514,6 +4778,104 @@ impl Rooms {
         Ok(out)
     }
 
+    /// One joined room's share of an incremental sync over `(since, until]`:
+    /// its events, whether they were limited, where they begin, whether the
+    /// room is told afresh, and what a skipped span changed in its state.
+    fn incremental_window(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        since: u64,
+        until: u64,
+        timeline_limit: usize,
+    ) -> Result<RoomWindow, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        // A join lands in the window, so a quiet room needs no
+        // lookup: `sync_cost.rs` counts reads per joined room,
+        // and this must stay flat across rooms where nothing
+        // happened.
+        let joined_at = if slice.is_empty() {
+            None
+        } else {
+            self.membership_li(room_id, user_id)?
+        };
+        // A partial-state room whose resync completed in the
+        // window is told afresh too (MSC3706): the members the
+        // resync filled in were never timeline events, so the
+        // state block of a fresh room is the only place a
+        // client can learn of them. An in-memory check, so the
+        // quiet room still costs no read.
+        if joined_at.is_some_and(|li| slice.contains(&li))
+            || self.resynced_between(room_id, since, until)
+        {
+            let (events, limited, prev_batch) = self.timeline_tail(room_id, timeline_limit)?;
+            Ok((events, limited, prev_batch, true, Vec::new()))
+        } else {
+            // The newest `timeline_limit` events, as an initial
+            // sync gives. A client back after a week used to get
+            // every event of every room in one response, with
+            // `limited` false so it never knew to page (#820).
+            // `slice` is in stream order and a room's stream
+            // order is its log order.
+            let skip = slice.len().saturating_sub(timeline_limit);
+            let (dropped, kept) = slice.split_at(skip);
+            let first = kept.iter().copied().min();
+            let changed = self.current_state_changes(room_id, &slice, (since, until))?;
+            Ok((
+                self.timeline_of(room_id, kept, None)?,
+                !dropped.is_empty(),
+                first,
+                false,
+                changed,
+            ))
+        }
+    }
+
+    /// The `state` block of a room an incremental sync does not meet afresh.
+    ///
+    /// `changed` is the current event of every key the range touched, from
+    /// [`Self::current_state_changes`]. Classic `state` is the state at the
+    /// start of the timeline, and the client folds the timeline onto it, so
+    /// an event the timeline carries is left out: sending it twice would
+    /// have the client apply it twice. What is sent is what the timeline
+    /// cannot say -- a key put back to an older event, a member who joined
+    /// inside a gap, anything in a span the limit skipped (#820, #819).
+    ///
+    /// Under MSC4222 (`state_after`) the client does not fold the timeline,
+    /// so the block is the whole answer: the current event of every key
+    /// the range touched, including those the timeline names. An event that
+    /// lost resolution is in the timeline and not here.
+    fn incremental_state(
+        &self,
+        room_id: &str,
+        timeline: &[Value],
+        changed: &[String],
+        state_after: bool,
+    ) -> Result<Vec<Value>, RoomError> {
+        let in_timeline = |event_id: &str| {
+            timeline
+                .iter()
+                .find(|event| event["event_id"].as_str() == Some(event_id))
+        };
+        let mut out = Vec::new();
+        for event_id in changed {
+            match in_timeline(event_id) {
+                Some(event) if state_after => out.push(event.clone()),
+                Some(_) => {}
+                // A key can hold an event this server sidelined: room v1 keeps
+                // a slot only one branch wrote, and the resolver does not
+                // re-check it. Clients never see a soft-failed or purged
+                // event, so there is nothing to send for that key.
+                None => match self.event(room_id, event_id) {
+                    Ok(event) => out.push(event),
+                    Err(RoomError::MissingBody(_)) => {}
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok(out)
+    }
+
     /// Events that entered the global stream in `(since, until]`, in
     /// stream order, each paired with the room it belongs to.
     ///
@@ -4602,6 +4964,13 @@ impl Rooms {
     ) -> Result<Option<Value>, RoomError> {
         let prefix = spindle_core::keys::relation_prefix(room_id, target);
         let rows = spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?;
+        // Bundling runs per served event and most events have no children:
+        // an empty scan must not pay the erasure marker read.
+        let erased = if rows.is_empty() {
+            None
+        } else {
+            self.erased_users()?
+        };
 
         let mut latest_edit: Option<Value> = None;
         let mut annotations: Vec<(String, String, u64)> = Vec::new();
@@ -4621,10 +4990,9 @@ impl Rooms {
                 Err(RoomError::MissingBody(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let event = if self.erasure_active()? {
-                self.prune_erased_event(viewer, room_id, event)?
-            } else {
-                event
+            let event = match &erased {
+                Some(erased) => self.prune_erased_with(erased, viewer, room_id, event)?,
+                None => event,
             };
             // Redacted: the relation is gone from the content, so it is gone
             // from the aggregate.
@@ -4901,6 +5269,27 @@ impl Rooms {
         Ok(changed)
     }
 
+    /// Whether any of `rooms` had an event in `(since, until]`:
+    /// [`Self::changed_rooms`] for a caller that needs only the answer, so
+    /// it stops at the first room that did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn any_changed<'a>(
+        &self,
+        rooms: impl IntoIterator<Item = &'a str>,
+        since: u64,
+        until: u64,
+    ) -> Result<bool, RoomError> {
+        for room_id in rooms {
+            if !self.room_slice(room_id, since, until)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The newest `limit` timeline events of a room, oldest first, stamped.
     ///
     /// # Errors
@@ -4954,6 +5343,110 @@ impl Rooms {
             .collect();
         out.reverse();
         Ok((out, more.is_some() || cut, first))
+    }
+
+    /// What `room_id` did in the stream range `(since, until]`, for a
+    /// sliding-sync connection that holds the room as of `since`: the
+    /// newest `limit` events of the range (dummy events left out, as from
+    /// [`Self::timeline_tail_for_preview`]), oldest first; whether events of
+    /// the range were left out; where the window begins; and the ID of every
+    /// event in the range.
+    ///
+    /// The IDs answer "which state changed": a current state event the
+    /// client has not been sent is one whose ID is among them. Reading them
+    /// is the room's in-memory log, not its bodies, so the whole range costs
+    /// no more than the window's own reads -- however much the room said
+    /// while the client was looking elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index, the room or an event cannot be
+    /// read.
+    pub fn room_delta(
+        &self,
+        room_id: &str,
+        since: u64,
+        until: u64,
+        limit: usize,
+    ) -> Result<RoomDelta, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        let ids: Vec<(i64, String)> = if slice.is_empty() {
+            Vec::new()
+        } else {
+            self.with_room_read(room_id, |_, log| {
+                Ok(slice
+                    .iter()
+                    .filter_map(|&li| {
+                        log.entry_at(li)
+                            .map(|entry| (li, entry.event_id.as_str().to_owned()))
+                    })
+                    .collect())
+            })?
+        };
+        // Beside the events, the events a key was put back to: a revert or a
+        // gap moves the current state to an event this range did not carry
+        // (#819). Only a room with events in the range can have either.
+        let mut event_ids: HashSet<String> =
+            ids.iter().map(|(_, event_id)| event_id.clone()).collect();
+        if !ids.is_empty() {
+            event_ids.extend(self.state_delta_event_ids(room_id, since, until)?);
+        }
+        let mut kept = Vec::new();
+        let mut limited = false;
+        let mut first = None;
+        // Newest first, stopping at the limit: a busy room's range is read
+        // only as far back as the window reaches.
+        for (li, event_id) in ids.iter().rev() {
+            let event = self.event(room_id, event_id)?;
+            if extremities::is_dummy_event(&event) {
+                continue;
+            }
+            if kept.len() == limit {
+                limited = true;
+                break;
+            }
+            first = Some(*li);
+            kept.push(event);
+        }
+        kept.reverse();
+        Ok(RoomDelta {
+            events: kept,
+            limited,
+            prev_batch: first,
+            event_ids: event_ids.into_iter().collect(),
+        })
+    }
+
+    /// Every room `user_id` has a membership in, split by that membership,
+    /// from one scan of their index: what [`Self::membership_rooms`] reads
+    /// once per kind.
+    fn memberships(&self, user_id: &str) -> Result<Memberships, RoomError> {
+        let prefix =
+            spindle_core::keys::user_prefix(spindle_core::keys::Keyspace::Membership, user_id);
+        let mut out = Memberships::default();
+        for (key, membership) in spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+        {
+            let bucket = match membership.as_slice() {
+                JOIN => &mut out.joined,
+                INVITE => &mut out.invited,
+                KNOCK => &mut out.knocked,
+                LEAVE | BAN => &mut out.departed,
+                _ => continue,
+            };
+            if let Some(room_id) = spindle_core::keys::room_from_user_room(user_id, &key) {
+                bucket.push(room_id);
+            }
+        }
+        for rooms in [
+            &mut out.joined,
+            &mut out.invited,
+            &mut out.knocked,
+            &mut out.departed,
+        ] {
+            rooms.sort();
+            rooms.dedup();
+        }
+        Ok(out)
     }
 
     fn membership_rooms(&self, user_id: &str, wanted: &[u8]) -> Result<Vec<String>, RoomError> {
@@ -5033,8 +5526,9 @@ impl Rooms {
     ///
     /// A slow one is logged with where its time went -- reading and
     /// checking the log rows, verifying the resident roots, the sidelined
-    /// events, the imported rejections, resolving an open fork -- so a
-    /// slow cold load in production says which part to look at.
+    /// records, the imported rejections, resolving an open fork -- and how
+    /// many trie nodes it read, so a slow cold load in production says
+    /// which part to look at.
     fn load_cold(&self, room_id: &str) -> Result<RoomLog, RoomError> {
         let started = std::time::Instant::now();
         let (log, profile, resolving) = self.restore_room(room_id)?;
@@ -5051,6 +5545,7 @@ impl Rooms {
                 elapsed_ms = ms(elapsed),
                 rows = profile.rows,
                 row_mib = profile.row_bytes >> 20,
+                node_reads = profile.node_reads,
                 records_ms = ms(profile.records),
                 roots_ms = ms(profile.roots),
                 sidelined_ms = ms(profile.sidelined),
@@ -5062,6 +5557,14 @@ impl Rooms {
         Ok(log)
     }
 
+    /// The room as the store holds it, with an open fork resolved.
+    ///
+    /// The store hands back the fork's recorded resolution when it still
+    /// holds (`Keyspace::CurrentState`). Only a fork without one -- new
+    /// since the last resolution was recorded, or recorded by a build
+    /// before this one -- is resolved here, and the answer is recorded so
+    /// the next load does not resolve it again. That resolution was most
+    /// of a large room's cold load, repeated at every restart (#724).
     fn restore_room(
         &self,
         room_id: &str,
@@ -5075,7 +5578,10 @@ impl Rooms {
             match self.resolve_in(&log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
-                Ok(current) => log.set_current(current),
+                Ok(current) => {
+                    log.set_current(current);
+                    self.record_current(&log, room_id);
+                }
                 Err(error) => tracing::warn!(
                     room = room_id,
                     "cannot resolve the reopened room's forward extremities: {error}"
@@ -5085,9 +5591,31 @@ impl Rooms {
         Ok((log, profile, started.elapsed()))
     }
 
+    /// Journal the room's fork resolution for the next cold load to take
+    /// instead of resolving again. A failure is logged and otherwise
+    /// ignored: the record is a cache, and without it the next load
+    /// resolves as it always did. Not tried at all on a store that has
+    /// stopped taking writes, where a cache is no reason to fail another
+    /// write. The sync is the next one anybody makes, since a record lost
+    /// to a crash costs only the resolution it saved.
+    fn record_current(&self, log: &RoomLog, room_id: &str) {
+        if !spindle_store::Store::accepts_writes(self.store.as_ref()) {
+            return;
+        }
+        if let Err(error) = RoomStore::new(self.store.as_ref(), room_id).journal_current(log) {
+            tracing::warn!(
+                room = room_id,
+                "cannot record the room's resolved current state: {error}"
+            );
+        }
+    }
+
     /// The room's lock if this process holds it open, without loading it.
     fn resident(&self, room_id: &str) -> Option<Arc<RwLock<RoomLog>>> {
-        self.registry_read().get(room_id).map(Arc::clone)
+        let open = self.registry_read();
+        let slot = open.get(room_id)?;
+        self.touch(slot);
+        Some(Arc::clone(&slot.room))
     }
 
     /// A room's lock, loading the room if need be, for tests that must hold
@@ -5133,10 +5661,19 @@ impl Rooms {
     /// loaded is skipped: the caller that needs it will meet the error
     /// itself, where it can say what it means.
     pub fn warm_all(&self, rooms: &[String], parallelism: usize) {
-        let cold: Vec<&String> = rooms
+        let mut cold: Vec<&String> = rooms
             .iter()
             .filter(|room| !self.is_resident(room))
             .collect();
+        // Past the limit a warmed room would only push out one warmed
+        // before it, so warm as many as fit.
+        let limit = self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if limit != 0 {
+            let room = usize::try_from(self.resident_count().unwrap_or(0)).unwrap_or(usize::MAX);
+            cold.truncate(limit.saturating_sub(room));
+        }
         match cold.as_slice() {
             [] => {}
             [room] => {
@@ -5160,8 +5697,20 @@ impl Rooms {
     }
 
     /// The rooms worth warming after a restart: every room a local user is
-    /// joined to that is not already resident, newest activity first, so
-    /// the rooms at the top of a client's list are the first to be ready.
+    /// joined to that is not already resident. Rooms of at least
+    /// [`WARM_FIRST_ENTRIES`] entries come first, largest first; the rest
+    /// follow newest activity first, so the rooms at the top of a client's
+    /// list are the next to be ready.
+    ///
+    /// The warm-up's workers share one queue, so its wall time is at
+    /// least the start of its largest room plus that room's load. Taken in
+    /// activity order, a room that loads for seconds could start last and
+    /// set the whole warm-up's length -- one room of 88,670 entries was
+    /// 7 s of a 9 s warm-up (#724). Started first, it runs beside the rest.
+    /// The small rooms lose little by waiting: a request for one that is
+    /// still cold loads it in milliseconds, and a request for a large one
+    /// waits for the warm-up's load of it, which is the one worth starting
+    /// early.
     ///
     /// # Errors
     ///
@@ -5184,21 +5733,39 @@ impl Rooms {
                 rooms.insert(room_id);
             }
         }
-        let mut ordered: Vec<(String, i64)> = rooms
+        let mut ordered: Vec<(String, i64, u64)> = rooms
             .into_iter()
             .map(|room_id| {
                 let activity = self.last_activity(&room_id).unwrap_or(0);
-                (room_id, activity)
+                let entries = self.stored_entries(&room_id);
+                (room_id, activity, entries)
             })
             .collect();
-        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(ordered.into_iter().map(|(room_id, _)| room_id).collect())
+        sort_for_warming(&mut ordered);
+        Ok(ordered.into_iter().map(|(room_id, _, _)| room_id).collect())
+    }
+
+    /// How many log entries the store holds for a room, from its counters
+    /// alone -- one point read, not a scan; zero for a room it cannot read.
+    fn stored_entries(&self, room_id: &str) -> u64 {
+        let key = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::RoomMeta, room_id);
+        spindle_store::ReadView::get(self.store.as_ref(), &key)
+            .ok()
+            .flatten()
+            .and_then(|raw| spindle_store::codec::RoomRecord::decode(&raw).ok())
+            .map_or(0, |meta| {
+                // The occupied positions are contiguous between the counters.
+                u64::try_from(
+                    meta.next_forward
+                        .saturating_sub(meta.next_backward)
+                        .saturating_sub(1),
+                )
+                .unwrap_or(0)
+            })
     }
 
     /// The registry, shared, with the wait timed.
-    fn registry_read(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<RoomLog>>>> {
+    fn registry_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Slot>> {
         self.metrics.record_registry_lock(false);
         let started = std::time::Instant::now();
         let open = self
@@ -5320,9 +5887,11 @@ impl Rooms {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.metrics
             .observe_lock_wait(crate::metrics::LockKind::Registry, true, started.elapsed());
-        let room = Arc::clone(open.entry(room_id.to_owned()).or_insert(room));
+        let slot = self.slot(room);
+        let room = Arc::clone(&open.entry(room_id.to_owned()).or_insert(slot).room);
         drop(open);
         leader.outcome = Some(Arc::clone(&room));
+        self.enforce_resident_budget();
         Ok(room)
     }
 
@@ -5381,12 +5950,14 @@ impl Rooms {
             work(self, &mut log)
         };
         // The guard is gone by here, so the barrier below is not holding
-        // anyone up. Ordered before `?` on `done`: a failed `work` may still
+        // anyone up. Before `done` is looked at: a failed `work` may still
         // have journalled -- a partial append is exactly what must not be
         // left unsynced and then reported as an error.
-        if self.store.journalled() != before {
-            spindle_store::Store::sync(self.store.as_ref(), Durability::Group)?;
-        }
+        let synced = if self.store.journalled() == before {
+            Ok(())
+        } else {
+            spindle_store::Store::sync(self.store.as_ref(), self.store.durability())
+        };
         // A write the store refused leaves this room's log ahead of it: the
         // entry is appended in memory before its batch is committed, and a
         // full disk refuses the batch. Kept, the entry is a head whose body
@@ -5395,6 +5966,11 @@ impl Rooms {
         // disk-full drill). The store is the record, so the room goes back
         // to it: dropped here, reloaded on the next ask.
         //
+        // Whatever the sync above did. Another writer's batch can move
+        // `journalled` while this one's is refused, and the sync then fails
+        // on the same full disk. Returning that error first kept the entry
+        // that was never stored (#780).
+        //
         // Only when the store has stopped taking writes. A refusal for any
         // other reason (a forbidden event, a contested key) is decided
         // before anything is appended, and evicting a healthy room under
@@ -5402,6 +5978,7 @@ impl Rooms {
         if done.is_err() && !self.store.accepts_writes() {
             self.evict(room_id, &room);
         }
+        synced?;
         done
     }
 
@@ -5421,23 +5998,223 @@ impl Rooms {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if open
                 .get(room_id)
-                .is_some_and(|held| Arc::ptr_eq(held, room))
+                .is_some_and(|held| Arc::ptr_eq(&held.room, room))
             {
                 open.remove(room_id);
             }
         }
-        self.unread_index
+        self.forget_room_caches(room_id);
+    }
+
+    /// Drop every cache this registry keeps for `room_id`, so the memory
+    /// is returned and a reload starts from the store alone.
+    ///
+    /// Each one is a function of the room's stored log, so a miss is
+    /// rebuilt on demand and nothing here is the only copy of anything.
+    /// `state_heads` must go with the room, not merely be allowed to:
+    /// appends keep it current only while it is present, so one that
+    /// outlived a log it was built from would name stale parents.
+    ///
+    /// Two per-room tables are kept on purpose, because the store cannot
+    /// rebuild them. `receipt_marks` is the only record that a receipt
+    /// moved at a stream position, which a syncing client may still ask
+    /// about. The extremity tracker holds a queue of rooms owed a merge
+    /// and the time of the last try, which keeps an unmergeable room from
+    /// being retried in a loop. Both are small.
+    fn forget_room_caches(&self, room_id: &str) {
+        fn clear<V>(cache: &Mutex<HashMap<String, V>>, room_id: &str) {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(room_id);
+        }
+        clear(&self.unread_index, room_id);
+        clear(&self.last_activity, room_id);
+        clear(&self.state_heads, room_id);
+        clear(&self.state_render, room_id);
+        clear(&self.member_ids, room_id);
+        clear(&self.destinations, room_id);
+        clear(&self.participants, room_id);
+        clear(&self.room_versions, room_id);
+        clear(&self.auth_graphs, room_id);
+        self.highlights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
-        self.last_activity
+            .retain(|(room, _), _| room != room_id);
+    }
+
+    /// Whether any per-room cache still holds `room_id`, for tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn holds_caches_for(&self, room_id: &str) -> bool {
+        fn has<V>(cache: &Mutex<HashMap<String, V>>, room_id: &str) -> bool {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(room_id)
+        }
+        has(&self.unread_index, room_id)
+            || has(&self.last_activity, room_id)
+            || has(&self.state_heads, room_id)
+            || has(&self.state_render, room_id)
+            || has(&self.member_ids, room_id)
+            || has(&self.destinations, room_id)
+            || has(&self.participants, room_id)
+            || has(&self.room_versions, room_id)
+            || has(&self.auth_graphs, room_id)
+            || self
+                .highlights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .any(|(room, _)| room == room_id)
+    }
+
+    /// Turn the `/search` word index on or off (`[search] index`).
+    pub fn set_search_index(&self, on: bool) {
+        self.search_index
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn search_indexed(&self) -> bool {
+        self.search_index.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The index rows an entry adds, in its own batch: its words, and the
+    /// room's marker when this entry extends the indexed range without a
+    /// gap. Nothing when the index is off.
+    fn search_rows(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        json: &Value,
+    ) -> Result<Vec<spindle_store::Record>, RoomError> {
+        if !self.search_indexed() {
+            return Ok(Vec::new());
+        }
+        let mut rows = crate::search_index::body_of(json)
+            .map(|body| crate::search_index::rows(room_id, entry.li, body))
+            .unwrap_or_default();
+        let previous = log
+            .entries()
+            .rev()
+            .find(|candidate| candidate.li < entry.li)
+            .map(|candidate| candidate.li.get());
+        let current = crate::search_index::marker(self.store.as_ref(), room_id)?;
+        if let Some(next) = crate::search_index::next_marker(current, previous, entry.li.get()) {
+            rows.push(crate::search_index::marker_row(room_id, next));
+        }
+        Ok(rows)
+    }
+
+    /// Set the most rooms to hold open at once; `0` lifts the limit.
+    /// See [`Self::enforce_resident_budget`].
+    pub fn set_max_resident_rooms(&self, limit: usize) {
+        self.resident_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.enforce_resident_budget();
+    }
+
+    /// A registry entry for a room just opened, as recently touched as
+    /// anything.
+    fn slot(&self, room: Arc<RwLock<RoomLog>>) -> Slot {
+        let slot = Slot {
+            room,
+            touched: std::sync::atomic::AtomicU64::new(0),
+        };
+        self.touch(&slot);
+        slot
+    }
+
+    /// Mark a room as just used. Skipped without a limit, so a server that
+    /// sets none pays nothing on the hot path.
+    fn touch(&self, slot: &Slot) {
+        if self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+        {
+            let tick = self
+                .touch_clock
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            slot.touched
+                .store(tick, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drop the rooms untouched for longest while more than
+    /// `max_resident_rooms` are open.
+    ///
+    /// A room is dropped only if nothing could notice. The registry is
+    /// held for writing, so no one can take a new handle on any room, and
+    /// a room whose `Arc` has a count above one is held by a reader, a
+    /// writer, a federation task or the load that just published it, and is
+    /// skipped. Also skipped are rooms with a load in flight, rooms
+    /// mid-resync (`partial`) and rooms with an unmerged fork, which the
+    /// merge pass finds only among open rooms. The count may therefore
+    /// stay above the limit while rooms are busy; the next load tries
+    /// again. The state of a room that is dropped is in the store, so the
+    /// next ask loads it as a restart would.
+    fn enforce_resident_budget(&self) {
+        let limit = self
+            .resident_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if limit == 0
+            || self
+                .resident_count()
+                .is_some_and(|open| open <= limit as u64)
+        {
+            return;
+        }
+        // Taken before the registry: `claim_load` takes `loading` and then
+        // the registry, and the order is not to be reversed here.
+        let loading: HashSet<String> = self
+            .loading
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
-        self.state_heads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(room_id);
+            .keys()
+            .cloned()
+            .collect();
+        let dropped: Vec<String> = {
+            let mut open = self
+                .open
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(excess) = open.len().checked_sub(limit).filter(|excess| *excess > 0) else {
+                return;
+            };
+            let mut idle: Vec<(u64, String)> = open
+                .iter()
+                .filter(|(room_id, slot)| {
+                    Arc::strong_count(&slot.room) == 1
+                        && !loading.contains(*room_id)
+                        && !self.is_partial_state(room_id)
+                        && !slot
+                            .room
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_forked()
+                })
+                .map(|(room_id, slot)| {
+                    (
+                        slot.touched.load(std::sync::atomic::Ordering::Relaxed),
+                        room_id.clone(),
+                    )
+                })
+                .collect();
+            idle.sort_unstable();
+            idle.truncate(excess);
+            for (_, room_id) in &idle {
+                open.remove(room_id);
+            }
+            idle.into_iter().map(|(_, room_id)| room_id).collect()
+        };
+        for room_id in &dropped {
+            self.forget_room_caches(room_id);
+            self.metrics.observe_room_evicted();
+        }
     }
 
     /// Build, sign, append and persist one event.
@@ -5658,7 +6435,7 @@ impl Rooms {
             let mut load = |root: &StateRoot| self.load_node(root);
             let state = log
                 .resolve_parents(parents, &mut spindle_core::Strict, &mut load)
-                .map_err(|error| self.append_error(&error))?;
+                .map_err(|error| Self::append_error(&error))?;
             return Ok((state, false));
         }
         let state = self.resolve_in(log, room_id, |log, resolver, load| {
@@ -5709,7 +6486,7 @@ impl Rooms {
                 "resolved a fork's state with the room version's algorithm"
             );
         }
-        result.map_err(|error| self.append_error(&error))
+        result.map_err(|error| Self::append_error(&error))
     }
 
     /// The room's auth DAG, created empty on first use.
@@ -5738,16 +6515,16 @@ impl Rooms {
 
     /// An append failure as a room error, naming a resolution failure as
     /// what it is.
-    fn append_error(&self, error: &AppendError) -> RoomError {
+    ///
+    /// `NeedsStateResolution` gets no case of its own. Only `Strict` raises
+    /// it, and the server hands `Strict` only parents whose state roots are
+    /// equal (`state_for_parents`), where it has nothing to refuse; every
+    /// other merge -- local, received or current state -- goes to the room
+    /// version's resolver, which decides or fails as `ResolutionFailed`
+    /// (ADR 0005). So reaching it here is a bug, answered as one: it once
+    /// meant "retry later" (503), and retrying a fork never folds it (#738).
+    fn append_error(error: &AppendError) -> RoomError {
         match error {
-            AppendError::NeedsStateResolution { key, .. } => {
-                self.metrics.record_contested_state();
-                RoomError::Contested {
-                    // The `type/state_key` spelling `/state_ids` uses, so an
-                    // operator can match this against what the room reports.
-                    key: format!("{}/{}", key.event_type().as_str(), key.state_key()),
-                }
-            }
             AppendError::ResolutionFailed(why) => {
                 RoomError::Append(format!("state resolution failed: {why}"))
             }
@@ -5755,23 +6532,24 @@ impl Rooms {
         }
     }
 
-    /// Bring the room's current state up to date after an append, and the
-    /// membership index with it.
+    /// Bring the room's current state up to date after an append, and say
+    /// what it moved.
     ///
-    /// With one forward extremity the current state is that event's state
-    /// and there is nothing to do. With several it is their resolution,
-    /// computed here. When the append was not the plain linear case -- one
-    /// tip, built on by one event -- the current state may have moved by
-    /// more than the event itself, so every membership it moved is
-    /// re-indexed from the resolved state rather than from the event.
-    fn settle(
+    /// With one forward extremity the current state is that event's state.
+    /// With several it is their resolution, computed here. It runs inside
+    /// [`Self::persist_entry`], after the event is stored -- the resolver
+    /// reads its body -- and before the event's stream id is released, so
+    /// the change it finds is written before any sync can read the event
+    /// (#819).
+    fn resolve_current_state(
         &self,
         log: &mut RoomLog,
         room_id: &str,
-        entry: Option<&LogEntry>,
-        previous_current: Option<StateSnapshot>,
-        previous_tips: &BTreeSet<EventId>,
-    ) -> Result<(), RoomError> {
+        entry: &LogEntry,
+        before: &Before<'_>,
+    ) -> Settling {
+        let (previous_current, previous_tips) = (before.current, before.tips);
+        let mut resolved = false;
         if log.forward_extremities().len() > 1 {
             // Every append to a forked room re-resolves its current state
             // over every extremity. A fork no peer's event merges -- tips this
@@ -5781,7 +6559,10 @@ impl Rooms {
             match self.resolve_in(log, room_id, |log, resolver, load| {
                 log.resolve_current(resolver, load)
             }) {
-                Ok(current) => log.set_current(current),
+                Ok(current) => {
+                    log.set_current(current);
+                    resolved = true;
+                }
                 Err(error) => {
                     tracing::warn!(
                         room = room_id,
@@ -5790,47 +6571,72 @@ impl Rooms {
                 }
             }
         }
-        let linear = entry.is_some_and(|entry| {
-            previous_tips.len() == 1
-                && entry.prev_events.len() == 1
-                && entry
-                    .prev_events
-                    .first()
-                    .is_some_and(|parent| previous_tips.contains(parent))
-        }) && log.forward_extremities().len() == 1;
-        if linear {
-            return Ok(());
+        let linear = previous_tips.len() == 1
+            && entry.prev_events.len() == 1
+            && entry
+                .prev_events
+                .first()
+                .is_some_and(|parent| previous_tips.contains(parent))
+            && log.forward_extremities().len() == 1;
+        let mut moved: BTreeSet<StateKey> = BTreeSet::new();
+        let mut changes = Vec::new();
+        if !linear && let Some(after) = log.current_state() {
+            if let Some(previous) = previous_current {
+                moved.extend(previous.diff(after).into_iter().map(|(key, _, _)| key));
+            }
+            if let Some(key) = entry.state_key.clone() {
+                moved.insert(key);
+            }
+            // The event's own key is listed even when the event lost: the
+            // client was told the event, and must be told what the state is
+            // instead (#819).
+            changes = moved
+                .iter()
+                .filter_map(|key| {
+                    after
+                        .get(key)
+                        .map(|event_id| (key.clone(), event_id.to_owned()))
+                })
+                .collect();
         }
-        let Some(after) = log.current_state().cloned() else {
+        Settling {
+            moved,
+            changes,
+            resolved,
+        }
+    }
+
+    /// Everything an append does to the room after it is persisted: a
+    /// resolved fork is recorded so a restart reopens it, and every
+    /// membership the current state moved is re-indexed from it rather than
+    /// from the event.
+    fn settle(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        entry: &LogEntry,
+        settling: &Settling,
+    ) -> Result<(), RoomError> {
+        if settling.resolved {
+            // So a restart reopens the fork already resolved
+            // rather than paying for this again (#724).
+            self.record_current(log, room_id);
+        }
+        let Some(after) = log.current_state() else {
             return Ok(());
         };
-        let mut keys: BTreeSet<StateKey> = previous_current
-            .map(|before| {
-                before
-                    .diff(&after)
-                    .into_iter()
-                    .map(|(key, _, _)| key.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(key) = entry.and_then(|entry| entry.state_key.clone()) {
-            keys.insert(key);
-        }
-        for key in keys {
+        for key in &settling.moved {
             if key.event_type().as_str() != "m.room.member" {
                 continue;
             }
-            let (content, li) = match after.get(&key) {
+            let (content, li) = match after.get(key) {
                 Some(id) => {
                     let id = EventId::new(id);
                     let body = self.read_event(room_id, &id)?;
-                    let li = log.get(&id).or(entry).map_or(0, |entry| entry.li.get());
+                    let li = log.get(&id).unwrap_or(entry).li.get();
                     (body["content"].clone(), li)
                 }
-                None => (
-                    serde_json::json!({ "membership": "leave" }),
-                    entry.map_or(0, |entry| entry.li.get()),
-                ),
+                None => (serde_json::json!({ "membership": "leave" }), entry.li.get()),
             };
             self.index_membership(room_id, Some(key.state_key()), &content, li)?;
         }
@@ -5849,7 +6655,7 @@ impl Rooms {
         content: &Value,
     ) -> Result<String, RoomError> {
         self.append_with(
-            log, room_id, sender, key, event_type, state_key, content, None,
+            log, room_id, sender, key, event_type, state_key, content, None, None,
         )
     }
 
@@ -5864,12 +6670,21 @@ impl Rooms {
         state_key: Option<&str>,
         content: &Value,
         sticky_ms: Option<u64>,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         let (event_id, json) = self.build_event(
             log, room_id, sender, key, event_type, state_key, content, sticky_ms,
         )?;
         self.commit_event(
-            log, room_id, sender, event_type, state_key, content, &event_id, &json,
+            log,
+            room_id,
+            sender,
+            event_type,
+            state_key,
+            content,
+            &event_id,
+            &json,
+            transaction,
         )
     }
 
@@ -5895,6 +6710,7 @@ impl Rooms {
         content: &Value,
         event_id: &str,
         json: &Value,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<String, RoomError> {
         let event_id = event_id.to_owned();
         self.check_policy_in(log, room_id, json)?;
@@ -5918,14 +6734,14 @@ impl Rooms {
         let previous_tips = log.forward_extremities().clone();
         let entry = log
             .append_resolved(input, state_before)
-            .map_err(|error| self.append_error(&error))?
+            .map_err(|error| Self::append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Local,
             case_of(state_key.is_some(), resolved),
         );
 
-        self.persist_entry(
+        let settling = self.persist_entry(
             log,
             room_id,
             &entry,
@@ -5936,10 +6752,16 @@ impl Rooms {
                 sender,
                 content,
                 json: &json,
+                transaction,
+                before: Some(Before {
+                    current: previous_current.as_ref(),
+                    tips: &previous_tips,
+                }),
             },
         )?;
-        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
-        self.enqueue_outbound(log, room_id, &json)?;
+        self.settle(log, room_id, &entry, &settling)?;
+        self.prune_stuck_extremities(log, room_id, &entry.event_id, &json);
+        self.enqueue_outbound(log, room_id, &event_id, &json)?;
         Ok(event_id)
     }
 
@@ -5955,6 +6777,7 @@ impl Rooms {
         &self,
         log: &RoomLog,
         room_id: &str,
+        event_id: &str,
         json: &Value,
     ) -> Result<(), RoomError> {
         let live = self.destinations_in(log, room_id)?;
@@ -5975,15 +6798,67 @@ impl Rooms {
             .filter(|domain| *domain != self.server_name)
             .filter(|domain| !live.iter().any(|known| known == *domain));
 
-        for destination in live.iter().map(String::as_str).chain(departing) {
-            let stream_write = self.reserve_stream_id();
-            let seq = stream_write.id();
-            spindle_store::Store::put(
-                self.store.as_ref(),
-                &spindle_core::keys::federation_outbox(destination, seq),
-                json.to_string().as_bytes(),
-            )?;
+        // The room's ACL, read after the event landed so an ACL change
+        // applies from itself onward. A denied server neither feeds the
+        // room nor hears it: the spec asks for both halves, and a kick of
+        // a denied server's user is no exception — the server was told to
+        // leave by the ACL already.
+        //
+        // The ACL event itself also goes to every server the ACL it
+        // replaces admitted. Like the kick above, it is the one event a
+        // newly denied server must hear: without it, that server's users
+        // see nothing change and keep sending into a room that refuses
+        // them.
+        let acl = self.server_acl_in(log, room_id)?;
+        let replaced = if json["type"].as_str() == Some("m.room.server_acl")
+            && json["state_key"].as_str() == Some("")
+        {
+            let parents: Vec<EventId> = edge_ids(&json["prev_events"])
+                .into_iter()
+                .map(EventId::new)
+                .collect();
+            let (before, _) = self.state_for_parents(log, room_id, &parents)?;
+            Some(self.server_acl_at(Some(&before), room_id)?)
+        } else {
+            None
+        };
+        let admitted = |domain: &str| {
+            let permits = |acl: &Option<crate::server_acl::ServerAcl>| {
+                acl.as_ref().is_none_or(|acl| acl.permits(domain))
+            };
+            permits(&acl) || replaced.as_ref().is_some_and(permits)
+        };
+
+        let destinations: Vec<&str> = live
+            .iter()
+            .map(String::as_str)
+            .chain(departing)
+            .filter(|domain| admitted(domain))
+            .collect();
+        // Nothing to queue is not a batch: a room with no remote member
+        // writes nothing, so an event stays one batch (`append_batch.rs`).
+        if destinations.is_empty() {
+            return Ok(());
         }
+        // One batch for every destination, holding only a reference to the
+        // body the event's own commit stored. The write guards live until
+        // the batch has landed, so no sync passes a sequence whose row is
+        // not there yet.
+        let writes: Vec<_> = destinations
+            .iter()
+            .map(|_| self.reserve_stream_id())
+            .collect();
+        let queued: Vec<(&str, u64)> = destinations
+            .iter()
+            .copied()
+            .zip(writes.iter().map(SideStreamWrite::id))
+            .collect();
+        self.outbox.enqueue(
+            self.store.as_ref(),
+            &self.metrics,
+            &queued,
+            &crate::federation::outbox::reference(room_id, event_id),
+        )?;
         Ok(())
     }
 
@@ -5999,6 +6874,29 @@ impl Rooms {
     /// reentrant. Same rule as [`Self::rules_in`], and the same deadlock if
     /// it is broken.
     fn destinations_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let members = self.member_destinations_in(log, room_id)?;
+        // A partial-state room (MSC3706) holds few member events, so its
+        // members name few servers; the resident's `servers_in_room` names
+        // the rest until the resync brings their members in.
+        let partial = self.partial_servers(room_id);
+        if partial.is_empty() {
+            return Ok(members);
+        }
+        let mut domains: BTreeSet<String> = members.iter().cloned().collect();
+        domains.extend(
+            partial
+                .into_iter()
+                .filter(|domain| *domain != self.server_name),
+        );
+        Ok(Arc::new(domains.into_iter().collect()))
+    }
+
+    /// [`Self::destinations_in`] from the members the room's state holds.
+    fn member_destinations_in(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+    ) -> Result<Arc<Vec<String>>, RoomError> {
         let Some(state) = log.current_state() else {
             return Ok(Arc::new(Vec::new()));
         };
@@ -6048,6 +6946,50 @@ impl Rooms {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(room_id.to_owned(), (root, Arc::clone(&domains)));
         Ok(domains)
+    }
+
+    /// The room's `m.room.server_acl`, from a log the caller holds, or
+    /// `None` when the room has set none (every server admitted).
+    ///
+    /// Takes the log for the same reason as [`Self::destinations_in`]: the
+    /// append path calls it under the room lock.
+    fn server_acl_in(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+    ) -> Result<Option<crate::server_acl::ServerAcl>, RoomError> {
+        self.server_acl_at(log.current_state(), room_id)
+    }
+
+    /// The `m.room.server_acl` in `state`, or `None` when it holds none.
+    fn server_acl_at(
+        &self,
+        state: Option<&StateSnapshot>,
+        room_id: &str,
+    ) -> Result<Option<crate::server_acl::ServerAcl>, RoomError> {
+        let wanted = StateKey::new("m.room.server_acl", "");
+        let Some(event_id) = state.and_then(|state| state.get(&wanted)) else {
+            return Ok(None);
+        };
+        let event = self.read_event(room_id, &EventId::new(event_id))?;
+        Ok(Some(crate::server_acl::ServerAcl::from_content(
+            &event["content"],
+        )))
+    }
+
+    /// Whether the room's `m.room.server_acl` admits `domain`. A room with
+    /// no ACL admits everyone; an unknown room admits nobody, which is the
+    /// answer every read gate already gives a stranger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or the ACL event cannot be read.
+    pub fn server_acl_permits(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            Ok(rooms
+                .server_acl_in(log, room_id)?
+                .is_none_or(|acl| acl.permits(domain)))
+        })
     }
 
     /// Whether `user_id` is currently joined to `room_id`, by the
@@ -6100,7 +7042,7 @@ impl Rooms {
         json: &Value,
         fan_out: bool,
     ) -> Result<(), RoomError> {
-        self.ingest_checked(log, room_id, event_id, json, fan_out, false)
+        self.ingest_checked(log, room_id, event_id, json, fan_out, false, None)
     }
 
     #[allow(
@@ -6116,6 +7058,7 @@ impl Rooms {
         json: &Value,
         fan_out: bool,
         live_policy: bool,
+        transaction: Option<&ClientTransaction<'_>>,
     ) -> Result<(), RoomError> {
         // Redelivery is not an error: transactions retry, and the event
         // is already exactly where it would go. A redelivered event that
@@ -6173,7 +7116,7 @@ impl Rooms {
         if let Some((kind, reason)) = verdict {
             let entry = log
                 .sideline(input, state_before, kind)
-                .map_err(|error| self.append_error(&error))?
+                .map_err(|error| Self::append_error(&error))?
                 .clone();
             let state = log
                 .sidelined_state(&entry.event_id)
@@ -6204,12 +7147,20 @@ impl Rooms {
         }
 
         let redaction_target = self.redaction_target(log, room_id, json)?;
+        // Judged against the state the redaction was sent in, not today's.
+        let redaction_power = redaction_target.is_some().then(|| {
+            self.redact_power_in(
+                room_id,
+                &state_before,
+                json["sender"].as_str().unwrap_or_default(),
+            )
+        });
 
         let previous_current = log.current_state().cloned();
         let previous_tips = log.forward_extremities().clone();
         let entry = log
             .append_resolved(input, state_before)
-            .map_err(|error| self.append_error(&error))?
+            .map_err(|error| Self::append_error(&error))?
             .clone();
         self.metrics.record_append(
             crate::metrics::Origin::Federated,
@@ -6217,7 +7168,7 @@ impl Rooms {
         );
 
         let content = json["content"].clone();
-        self.persist_entry(
+        let settling = self.persist_entry(
             log,
             room_id,
             &entry,
@@ -6228,9 +7179,15 @@ impl Rooms {
                 sender: &sender,
                 content: &content,
                 json,
+                transaction,
+                before: Some(Before {
+                    current: previous_current.as_ref(),
+                    tips: &previous_tips,
+                }),
             },
         )?;
-        self.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+        self.settle(log, room_id, &entry, &settling)?;
+        self.prune_stuck_extremities(log, room_id, &entry.event_id, json);
         // A federated redaction has the same effect as one authored here.
         // The target's location changed in v11, so it was resolved above
         // under this room's rules rather than by looking in both places and
@@ -6244,13 +7201,19 @@ impl Rooms {
             if log.get(&EventId::new(target.as_str())).is_some()
                 || self.gap_position(room_id, &target)?.is_some()
             {
-                self.apply_redaction(room_id, &target, event_id)?;
+                self.apply_received_redaction(
+                    room_id,
+                    &target,
+                    event_id,
+                    &sender,
+                    redaction_power.unwrap_or(false),
+                )?;
             } else {
                 self.note_unheld_redaction(log, room_id, &target, event_id, json)?;
             }
         }
         if fan_out {
-            self.enqueue_outbound(log, room_id, json)?;
+            self.enqueue_outbound(log, room_id, event_id, json)?;
         }
         Ok(())
     }
@@ -6296,7 +7259,8 @@ impl Rooms {
     /// because our own current state is exactly what a gap makes stale.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the checks' inputs, each one named by the spec"
+        clippy::too_many_lines,
+        reason = "the checks' inputs, each one named by the spec, and the checks in order"
     )]
     fn receipt_checks(
         &self,
@@ -6329,6 +7293,8 @@ impl Rooms {
         // 1. The auth events. A state-DAG room (MSC4242) carries none: its
         // events are authorized by the state DAG, which 2 checks.
         let version = self.version_in_log(log, room_id)?;
+        let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
+            HashMap::new();
         if !is_state_dag(&version) {
             let missing = std::cell::Cell::new(false);
             if let Err(why) = ruma::state_res::check_state_independent_auth_rules(
@@ -6351,8 +7317,6 @@ impl Rooms {
                 }
                 return Ok(Some((Sideline::Rejected, format!("auth events: {why}"))));
             }
-            let mut named: HashMap<(ruma::events::StateEventType, String), StoredEvent> =
-                HashMap::new();
             for id in candidate.auth_event_ids() {
                 let Some(event) = fetch(id) else {
                     return Err(RoomError::Append(format!(
@@ -6392,8 +7356,24 @@ impl Rooms {
         }
 
         // 2. The state before the event.
+        //
+        // In a partial-state room (MSC3706) the state lacks most member
+        // events, so a member slot it does not hold is read from the
+        // event's own auth events, which 1 has just verified -- Synapse's
+        // model, minus its resolution: a slot the room does hold, a ban
+        // included, is never overruled by what the event claims
+        // (`partial`).
+        let partial = self.is_partial_state(room_id);
         let by_state = |state: &StateSnapshot, kind: &ruma::events::StateEventType, key: &str| {
-            let id = state.get(&StateKey::new(kind.to_string().as_str(), key))?;
+            let Some(id) = state.get(&StateKey::new(kind.to_string().as_str(), key)) else {
+                if partial && *kind == ruma::events::StateEventType::RoomMember {
+                    return named
+                        .get(&(kind.clone(), key.to_owned()))
+                        .filter(|event| !event.rejected())
+                        .cloned();
+                }
+                return None;
+            };
             fetch(&ruma::OwnedEventId::try_from(id).ok()?).filter(|event| !event.rejected())
         };
         if let Err(why) =
@@ -6430,7 +7410,7 @@ impl Rooms {
         entry: &LogEntry,
         event_id: &str,
         input: &PersistInput<'_>,
-    ) -> Result<(), RoomError> {
+    ) -> Result<Settling, RoomError> {
         // Keep the unread index current while it is warm. Only if cached:
         // a cold room's index is built from the log on first use, so there
         // is nothing to maintain until someone asks.
@@ -6495,6 +7475,15 @@ impl Rooms {
             event_body_key(room_id, event_id),
             serde_json::to_vec(input.json)?,
         )];
+        // The search index rides the batch for the same reason: a word row
+        // without its event, or an event the index skips, would make a search
+        // disagree with the log (#830).
+        extra.extend(self.search_rows(log, room_id, entry, input.json)?);
+        // The client's transaction, for the same reason: a retry finds it if
+        // and only if the event is there to be found (#779).
+        if let Some(transaction) = input.transaction {
+            extra.extend(transaction.rows(event_id));
+        }
         // A relation is indexed in the entry's own batch too, and for the same
         // reason: an index entry written separately can outlive a commit that
         // failed, leaving `/relations` pointing at an event the room does not
@@ -6557,16 +7546,30 @@ impl Rooms {
         // the handler would fold request parsing and authorization into
         // a number the target does not describe.
         let started = std::time::Instant::now();
-        let landed = room_store.journal_entry_with(entry, log, &extra);
+        let landed = room_store.journal_entry_with(entry, log, &extra).map(|()| {
+            // What the append did to the room's current state is settled
+            // and recorded *before* the id is released, so no sync can
+            // read the event without the state it moved (#819). The
+            // resolver reads the event's body, which is why this is not
+            // before the write.
+            let settling = input
+                .before
+                .as_ref()
+                .map_or_else(Settling::default, |before| {
+                    self.resolve_current_state(log, room_id, entry, before)
+                });
+            let recorded = self.record_state_delta(room_id, stream_id, entry, &settling);
+            (settling, recorded)
+        });
         // The id is released on *both* outcomes, before the `?`. An
         // allocated id that is never resolved holds the watermark forever,
         // which does not lose this event -- it makes every later event
         // invisible to every client.
         match &landed {
-            Ok(()) => self.stream.commit(stream_id),
+            Ok(_) => self.stream.commit(stream_id),
             Err(_) => self.stream.abandon(stream_id),
         }
-        landed?;
+        let (settling, recorded) = landed?;
         self.metrics.observe_append("group", started.elapsed());
 
         // The index is derived from the event that just landed, and only from
@@ -6576,6 +7579,27 @@ impl Rooms {
             self.index_membership(room_id, input.state_key, input.content, entry.li.get())?;
         }
         self.appended.notify_waiters();
+        recorded?;
+        Ok(settling)
+    }
+
+    /// Write the change an append made to the room's current state, under
+    /// the event's own stream id. A linear append made none and writes none.
+    fn record_state_delta(
+        &self,
+        room_id: &str,
+        stream_id: u64,
+        entry: &LogEntry,
+        settling: &Settling,
+    ) -> Result<(), RoomError> {
+        if settling.changes.is_empty() {
+            return Ok(());
+        }
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::room_state_delta(room_id, stream_id),
+            &state_delta::encode(entry.li.get(), &settling.changes),
+        )?;
         Ok(())
     }
 
@@ -6850,6 +7874,14 @@ struct TailEntry {
     state: bool,
 }
 
+/// One open room in the registry, with when it was last used.
+struct Slot {
+    room: Arc<RwLock<RoomLog>>,
+    /// A tick of `touch_clock` at the last use; the smallest is the room
+    /// idle the longest. Only kept while a limit is set.
+    touched: std::sync::atomic::AtomicU64,
+}
+
 /// One cold load in flight ([`Rooms::room_or_load`]): its outcome once it
 /// has one, and the waiters waiting for it.
 #[derive(Default)]
@@ -6933,6 +7965,23 @@ impl Drop for Lead<'_> {
     }
 }
 
+/// What an append did to the room's current state: the keys it moved, the
+/// `(key, event)` each now holds, and whether a fork was resolved on the way.
+/// Empty for a linear append, where the event is the whole change.
+#[derive(Default)]
+struct Settling {
+    moved: BTreeSet<StateKey>,
+    changes: Vec<(StateKey, String)>,
+    resolved: bool,
+}
+
+/// The room's current state and forward extremities as they stood before
+/// an append: what its effect is measured against.
+struct Before<'a> {
+    current: Option<&'a StateSnapshot>,
+    tips: &'a BTreeSet<EventId>,
+}
+
 /// The event-shaped arguments `persist_entry` needs, in one carrier so the
 /// two call sites cannot drift on argument order.
 struct PersistInput<'a> {
@@ -6941,6 +7990,49 @@ struct PersistInput<'a> {
     sender: &'a str,
     content: &'a Value,
     json: &'a Value,
+    /// The client transaction a local send runs under, if any.
+    transaction: Option<&'a ClientTransaction<'a>>,
+    /// The room as it stood before the append, so `persist_entry` can
+    /// settle the current state and record what the append moved. `None`
+    /// for an entry seeded rather than appended.
+    before: Option<Before<'a>>,
+}
+
+/// The client transaction (`txnId`) a `PUT /send` or `PUT /redact` runs
+/// under.
+///
+/// Its rows are written in the event's own batch, so they land if and only
+/// if the event does (#779). Written after the event, they were lost
+/// whenever the event landed and a later write failed: the send answered
+/// 5xx for an event the room holds, and the client's retry with the same
+/// transaction ID sent it a second time.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientTransaction<'a> {
+    pub user_id: &'a str,
+    pub device_id: &'a str,
+    pub txn_id: &'a str,
+}
+
+impl ClientTransaction<'_> {
+    /// The transaction's key: what a retry looks up.
+    #[must_use]
+    pub fn key(&self) -> Vec<u8> {
+        spindle_core::keys::transaction(self.user_id, self.device_id, self.txn_id)
+    }
+
+    /// The rows that record `event_id` as this transaction's event. The
+    /// second is the inverse, so the event comes back to this device with
+    /// the transaction ID it chose: that is how a client matches the remote
+    /// echo to the local one it is still showing.
+    fn rows(&self, event_id: &str) -> [(Vec<u8>, Vec<u8>); 2] {
+        [
+            (self.key(), event_id.as_bytes().to_vec()),
+            (
+                spindle_core::keys::transaction_echo(self.user_id, event_id),
+                spindle_core::keys::transaction_echo_value(self.device_id, self.txn_id),
+            ),
+        ]
+    }
 }
 
 /// An event ID with its stored body — federation answers want both, and
@@ -7123,6 +8215,34 @@ fn purged_marker() -> Value {
     })
 }
 
+/// Rooms of at least this many log entries are warmed before the rest,
+/// largest first ([`Rooms::warm_candidates`]). Below it a room loads in
+/// well under a second -- 98 rooms under a thousand entries took 0.42 s
+/// between them on the deployment #724 measured, and none under ten
+/// thousand took more than half a second -- so only the rooms above it can
+/// set the length of the warm-up.
+pub const WARM_FIRST_ENTRIES: u64 = 10_000;
+
+/// Order `(room_id, last activity, entries)` for the warm-up: rooms of at
+/// least [`WARM_FIRST_ENTRIES`] entries first, largest first, then the
+/// rest by newest activity; the room id breaks ties so the order is
+/// deterministic.
+fn sort_for_warming(rooms: &mut [(String, i64, u64)]) {
+    rooms.sort_by(|a, b| {
+        let (a_large, b_large) = (a.2 >= WARM_FIRST_ENTRIES, b.2 >= WARM_FIRST_ENTRIES);
+        b_large
+            .cmp(&a_large)
+            .then_with(|| {
+                if a_large {
+                    b.2.cmp(&a.2)
+                } else {
+                    b.1.cmp(&a.1)
+                }
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 /// The `(user_id, room_id)` a membership-index key names: a schema byte,
 /// a keyspace byte, the user's big-endian length and bytes, then the room.
 fn split_user_room(key: &[u8]) -> Option<(String, String)> {
@@ -7134,10 +8254,7 @@ fn split_user_room(key: &[u8]) -> Option<(String, String)> {
 
 /// Event bodies live beside the log, keyed by room and event ID.
 fn event_body_key(room_id: &str, event_id: &str) -> Vec<u8> {
-    let mut key =
-        spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::EventIndex, room_id);
-    key.extend_from_slice(event_id.as_bytes());
-    key
+    spindle_core::keys::event_body(room_id, event_id)
 }
 
 /// The state events a new event must cite to be authorizable (room v11's
@@ -7413,18 +8530,6 @@ pub enum RoomError {
     MissingBody(String),
     Build(String),
     Append(String),
-    /// SPEC §9.2 case 3: two branches of a fork moved the same state key
-    /// away from the value they both inherited, so the merge needs the
-    /// room-version resolver that is not yet wired into ingest (#16).
-    ///
-    /// Distinct from [`RoomError::Append`] because it is the one append
-    /// failure that is neither the caller's fault nor a bug: the room is in
-    /// a state this server cannot currently fold, and #225 recorded that
-    /// answering it with a bare 500 tells a client nothing it can act on
-    /// and an operator nothing they can diagnose.
-    Contested {
-        key: String,
-    },
     StateUnavailable(String),
     UnknownState(String),
     Forbidden(String),
@@ -7455,10 +8560,6 @@ impl std::fmt::Display for RoomError {
                     "this server does not support room version {version}"
                 )
             }
-            Self::Contested { key } => write!(
-                formatter,
-                "the state key {key} is contested between two branches of a                  fork and needs state resolution"
-            ),
             Self::InvalidPowerLevels(why) => {
                 write!(formatter, "invalid power_level_content_override: {why}")
             }
@@ -7506,25 +8607,65 @@ impl StreamRecord {
     }
 }
 
+/// The largest number `of` reads from any row under `prefix`, or 0 when there
+/// is none.
+///
+/// Streamed, so one row is in memory at a time whatever the keyspace holds.
+/// The recovery below used to copy whole keyspaces into a `Vec` to take a
+/// maximum, and to read a failed scan as an empty one (#815): a counter
+/// resumed below ids already on disk re-issues them, so a read error here
+/// has to stop the start, not count as zero.
+fn max_over(
+    store: &dyn spindle_store::ReadView,
+    prefix: &[u8],
+    of: impl Fn(&[u8], &[u8]) -> Option<u64>,
+) -> Result<u64, spindle_store::StoreError> {
+    let mut best = 0_u64;
+    spindle_store::ReadView::visit_prefix(store, prefix, &mut |key, value| {
+        if let Some(number) = of(key, value) {
+            best = best.max(number);
+        }
+        Ok(())
+    })?;
+    Ok(best)
+}
+
+/// The number in the last eight bytes of a key, which is where the
+/// side-stream keyspaces keep their big-endian sequence.
+fn trailing_u64(key: &[u8]) -> Option<u64> {
+    key.get(key.len().checked_sub(8)?..)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+}
+
+/// A value that is exactly a big-endian `u64`.
+fn value_u64(value: &[u8]) -> Option<u64> {
+    value.try_into().map(u64::from_be_bytes).ok()
+}
+
 /// The highest id in the forward stream index, or 0 for a fresh store.
 ///
-/// A prefix scan rather than a stored high-water mark: one number that has to
-/// be kept in step with the rows it describes is one number that can disagree
-/// with them, and the rows are the truth.
-fn highest_stream_row(store: &FjallStore) -> u64 {
-    spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|(key, _)| spindle_core::keys::stream_from_key(key))
-        .max()
-        .unwrap_or(0)
+/// The rows rather than a stored high-water mark: one number that has to be
+/// kept in step with the rows it describes is one number that can disagree
+/// with them, and the rows are the truth. Stream keys are the id in
+/// big-endian, so the highest is the last key: one seek, not a scan of a
+/// keyspace that holds a row for every event the server has ever stored.
+fn highest_stream_row(
+    store: &dyn spindle_store::ReadView,
+) -> Result<u64, spindle_store::StoreError> {
+    let prefix = spindle_core::keys::stream_prefix();
+    // The next keyspace byte is above every key under this one.
+    let end = [prefix[0], prefix[1] + 1];
+    Ok(spindle_store::ReadView::last_before(store, &prefix, &end)?
+        .and_then(|(key, _)| spindle_core::keys::stream_from_key(&key))
+        .unwrap_or(0))
 }
 
 /// Fill in any reverse-index rows the forward stream has and the index does
 /// not, and report how many were written.
 ///
 /// Every append writes both rows in one batch, so in the steady state there
-/// is nothing to do and this costs one scan of a keyspace holding eight bytes
+/// is nothing to do and this costs one pass over a keyspace holding eight bytes
 /// per event. It is not dead code, though: a store written before the reverse
 /// index existed has a forward stream and no index at all, and reading it
 /// with this binary must not silently answer `/sync` from an index that stops
@@ -7535,26 +8676,26 @@ fn highest_stream_row(store: &FjallStore) -> u64 {
 /// The comparison is `max` against `max` rather than a count, because the two
 /// keyspaces are written together: any id the index is missing is above the
 /// highest id it holds.
-fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
-    let indexed = spindle_store::ReadView::scan_prefix(
+fn backfill_room_stream_index(
+    store: &FjallStore,
+    through: u64,
+) -> Result<usize, spindle_store::StoreError> {
+    let indexed = max_over(
         store,
         &[
             spindle_core::keys::KEY_SCHEMA_VERSION,
             spindle_core::keys::Keyspace::RoomStream as u8,
         ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(key, _)| spindle_core::keys::room_stream_from_key(key))
-    .max()
-    .unwrap_or(0);
+        |key, _| spindle_core::keys::room_stream_from_key(key),
+    )?;
     if indexed >= through {
-        return 0;
+        return Ok(0);
     }
+    // Only the migration case reaches here, and it writes while it reads, so
+    // it takes its rows first.
     let mut written = 0;
     for (key, raw) in
-        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())
-            .unwrap_or_default()
+        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::stream_prefix())?
     {
         let Some(stream_id) = spindle_core::keys::stream_from_key(&key) else {
             continue;
@@ -7565,151 +8706,124 @@ fn backfill_room_stream_index(store: &FjallStore, through: u64) -> usize {
         let Some(record) = StreamRecord::decode(&raw) else {
             continue;
         };
-        if spindle_store::Store::put(
+        spindle_store::Store::put(
             store,
             &spindle_core::keys::room_stream(&record.room_id, stream_id),
             &record.li.to_be_bytes(),
-        )
-        .is_ok()
-        {
-            written += 1;
-        }
+        )?;
+        written += 1;
     }
-    written
+    Ok(written)
 }
 
-fn read_stream_checkpoint(store: &FjallStore) -> u64 {
-    spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-        .unwrap_or(0)
+/// How many positions past an issued token the stream checkpoint reaches.
+///
+/// One checkpoint write covers this many stream advances, and a restart
+/// skips at most this many positions. Postgres pre-logs its sequences the
+/// same way, for the same reason: the counter must never go back, and
+/// paying a disk barrier for every value it hands out is the expensive way
+/// to promise that.
+const CHECKPOINT_LEASE: u64 = 1_024;
+
+fn read_stream_checkpoint(
+    store: &dyn spindle_store::ReadView,
+) -> Result<u64, spindle_store::StoreError> {
+    Ok(
+        spindle_store::ReadView::get(store, &spindle_core::keys::stream_checkpoint())?
+            .and_then(|value| value_u64(&value))
+            .unwrap_or(0),
+    )
 }
 
 /// The highest stream id already on disk, or 0 for a fresh store.
 ///
 /// `from_stream` is [`highest_stream_row`], passed in because the caller has
-/// already paid for that scan.
-fn highest_stream_id(store: &FjallStore, from_stream: u64) -> u64 {
+/// already paid for that read.
+///
+/// # Errors
+///
+/// A read that fails is an error and never a zero: a counter resumed below
+/// an id on disk re-issues it (#815).
+fn highest_stream_id(
+    store: &dyn spindle_store::ReadView,
+    from_stream: u64,
+) -> Result<u64, spindle_store::StoreError> {
+    use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace};
     // Pending to-device messages drew from this counter without writing a
     // stream row, so their sequence numbers are invisible to `from_stream`.
     // A counter resumed below them would eventually re-allocate a pending
     // message's sequence for the same device and overwrite it — silent loss
     // of session-establishment ciphertext. Their keys end in the big-endian
     // sequence, so the maximum is read off the last eight bytes.
-    let from_to_device = spindle_store::ReadView::scan_prefix(
+    let from_to_device = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::ToDevice as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(key, _)| {
-        key.get(key.len().checked_sub(8)?..)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u64::from_be_bytes)
-    })
-    .max()
-    .unwrap_or(0);
+        &[KEY_SCHEMA_VERSION, Keyspace::ToDevice as u8],
+        |key, _| trailing_u64(key),
+    )?;
     // Device-list watermarks are the third drawer the counter allocates into
     // without a stream row. The failure a low resume causes here is subtler
     // than an overwrite: `/sync` hands out `next_batch` tokens read off this
     // counter, so a change recorded at a re-used low sequence would sit at or
     // below a token a client already holds — and that client would never hear
     // that a device changed, and keep encrypting to a stale device set.
-    let from_device_lists = spindle_store::ReadView::scan_prefix(
+    let from_device_lists = max_over(
         store,
         &spindle_core::keys::device_list_change_prefix(),
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
+        |_, value| value_u64(value),
+    )?;
     // An out-of-band federated invite has no room event and therefore no
     // `Stream` row, but its pending record carries the side-stream position
     // that makes it a one-shot incremental-sync change. Resume above those
     // positions too, or a restart can reuse one and make a later invite sit
     // at or below a token the client already holds.
-    let from_pending_invites = spindle_store::ReadView::scan_prefix(
+    let from_pending_invites = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::PendingInvite as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| {
-        serde_json::from_slice::<Value>(value)
-            .ok()?
-            .get("stream_id")?
-            .as_u64()
-    })
-    .max()
-    .unwrap_or(0);
-    let from_account_data = spindle_store::ReadView::scan_prefix(
+        &[KEY_SCHEMA_VERSION, Keyspace::PendingInvite as u8],
+        |_, value| {
+            serde_json::from_slice::<Value>(value)
+                .ok()?
+                .get("stream_id")?
+                .as_u64()
+        },
+    )?;
+    let from_account_data = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::AccountDataStream as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
+        &[KEY_SCHEMA_VERSION, Keyspace::AccountDataStream as u8],
+        |_, value| value_u64(value),
+    )?;
     // The federation outbox is the fourth drawer: its rows carry the
     // sequence in the key's last eight bytes and have no stream row, and a
     // counter resumed below one would eventually overwrite a pending
     // delivery for the same destination.
-    let from_outbox =
-        spindle_store::ReadView::scan_prefix(store, &spindle_core::keys::federation_outbox_all())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|(key, _)| {
-                key.get(key.len().checked_sub(8)?..)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u64::from_be_bytes)
-            })
-            .max()
-            .unwrap_or(0);
+    let from_outbox = max_over(
+        store,
+        &spindle_core::keys::federation_outbox_all(),
+        |key, _| trailing_u64(key),
+    )?;
     // A completed fresh import fences historical notifications at this durable
     // global position. Pending side-stream rows can later be consumed/deleted;
     // restarting below the push cursor would assign new events old IDs and
     // silently suppress their notifications. Malformed rows retain the same
     // ignore policy as the other counter drawers above.
-    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_slice().try_into().map(u64::from_be_bytes).ok())
+    let from_push_cursor = spindle_store::ReadView::get(store, &spindle_core::keys::push_cursor())?
+        .and_then(|value| value_u64(&value))
         .unwrap_or(0);
     // An appservice can drain the last to-device row without any Matrix
     // client syncing. Its durable acknowledgement is also a counter floor.
-    let from_appservices = spindle_store::ReadView::scan_prefix(
+    let from_appservices = max_over(
         store,
-        &[
-            spindle_core::keys::KEY_SCHEMA_VERSION,
-            spindle_core::keys::Keyspace::AppserviceCursor as u8,
-        ],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|(_, value)| value.as_slice().try_into().map(u64::from_be_bytes).ok())
-    .max()
-    .unwrap_or(0);
-    from_stream
-        .max(read_stream_checkpoint(store))
+        &[KEY_SCHEMA_VERSION, Keyspace::AppserviceCursor as u8],
+        |_, value| value_u64(value),
+    )?;
+    Ok(from_stream
+        .max(read_stream_checkpoint(store)?)
         .max(from_appservices)
         .max(from_push_cursor)
         .max(from_to_device)
         .max(from_device_lists)
         .max(from_pending_invites)
         .max(from_account_data)
-        .max(from_outbox)
+        .max(from_outbox))
 }
 
 #[cfg(test)]
@@ -7717,7 +8831,7 @@ mod stream_index_tests {
     use spindle_store::{FjallStore, Store};
     use tempfile::TempDir;
 
-    use super::{StreamRecord, backfill_room_stream_index, highest_stream_row};
+    use super::{StreamRecord, backfill_room_stream_index, highest_stream_id, highest_stream_row};
 
     /// Write forward stream rows from `first` and no index rows, which is
     /// what a store written before the reverse index looks like.
@@ -7748,7 +8862,7 @@ mod stream_index_tests {
         );
 
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             3
         );
         assert_eq!(
@@ -7779,11 +8893,11 @@ mod stream_index_tests {
         let store = FjallStore::open(dir.path()).unwrap();
         unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
 
-        let through = highest_stream_row(&store);
-        assert_eq!(backfill_room_stream_index(&store, through), 2);
+        let through = highest_stream_row(&store).unwrap();
+        assert_eq!(backfill_room_stream_index(&store, through).unwrap(), 2);
 
         let before = store.scanned();
-        assert_eq!(backfill_room_stream_index(&store, through), 0);
+        assert_eq!(backfill_room_stream_index(&store, through).unwrap(), 0);
         assert_eq!(
             store.scanned() - before,
             2,
@@ -7840,16 +8954,109 @@ mod stream_index_tests {
         let store = FjallStore::open(dir.path()).unwrap();
         unindexed(&store, 1, &["!a:example.org", "!b:example.org"]);
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             2
         );
 
         unindexed(&store, 3, &["!c:example.org"]);
         assert_eq!(
-            backfill_room_stream_index(&store, highest_stream_row(&store)),
+            backfill_room_stream_index(&store, highest_stream_row(&store).unwrap()).unwrap(),
             1,
             "only the row the older binary missed"
         );
+    }
+
+    /// #815: the stream's high-water mark is one seek, not a scan of a
+    /// keyspace that holds a row for every event the server has stored.
+    #[test]
+    fn finding_the_highest_stream_row_does_not_read_every_row() {
+        let rows_read = |events: u64| {
+            let dir = TempDir::new().unwrap();
+            let store = FjallStore::open(dir.path()).unwrap();
+            unindexed(
+                &store,
+                1,
+                &vec!["!a:example.org"; usize::try_from(events).unwrap()],
+            );
+            let before = store.scanned();
+            assert_eq!(highest_stream_row(&store).unwrap(), events);
+            store.scanned() - before
+        };
+        let small = rows_read(10);
+        let large = rows_read(3_000);
+        assert_eq!(
+            small, large,
+            "the rows read grew with the stream: {small} for 10 events, {large} for 3000"
+        );
+        assert!(large <= 1, "one seek, not {large} rows");
+    }
+
+    /// A store whose every read fails, the way a bad block does.
+    struct Unreadable;
+
+    impl spindle_store::ReadView for Unreadable {
+        fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_prefix(
+            &self,
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_from(
+            &self,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn scan_until(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<spindle_store::Record>, spindle_store::StoreError> {
+            Err(spindle_store::StoreError::Backend("EIO".to_owned()))
+        }
+        fn key_table(&self) -> std::sync::Arc<dyn spindle_core::StateKeyTable> {
+            spindle_core::MemStateKeyTable::shared()
+        }
+    }
+
+    /// #815: a read that fails is not a position of zero. A counter resumed
+    /// below ids already on disk re-issues them and overwrites the entries
+    /// they point at, so recovery has to stop the start.
+    #[test]
+    fn a_failed_read_stops_recovery_instead_of_resuming_at_zero() {
+        assert!(highest_stream_row(&Unreadable).is_err());
+        assert!(highest_stream_id(&Unreadable, 0).is_err());
+        assert!(super::read_stream_checkpoint(&Unreadable).is_err());
+    }
+
+    /// Every counter drawer still floors the resumed position, now that they
+    /// are read by streaming.
+    #[test]
+    fn every_drawer_still_sets_the_floor() {
+        use spindle_core::keys::{KEY_SCHEMA_VERSION, Keyspace};
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 0);
+
+        // A pending to-device sequence, key ends in it.
+        let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::ToDevice as u8, 1, 2, 3];
+        key.extend_from_slice(&700_u64.to_be_bytes());
+        store.put(&key, b"x").unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 700);
+
+        // A device-list watermark, in the value.
+        let mut key = spindle_core::keys::device_list_change_prefix();
+        key.extend_from_slice(b"@u:example.org");
+        store.put(&key, &900_u64.to_be_bytes()).unwrap();
+        assert_eq!(highest_stream_id(&store, 0).unwrap(), 900);
+
+        // The stream's own high-water mark outranks them when it is higher.
+        assert_eq!(highest_stream_id(&store, 1_000).unwrap(), 1_000);
     }
 }
 
@@ -8343,6 +9550,21 @@ mod room_version_tests {
             )
             .expect("an append with a cold cache must not hang or fail");
     }
+
+    /// #738: a `Strict` refusal reaching the live path is a server bug, not
+    /// a fork to wait out. It was answered 503 "retry", which a client
+    /// obeys forever because no retry folds the fork.
+    #[test]
+    fn a_strict_refusal_is_a_bug_not_a_retryable_outage() {
+        let error = Rooms::append_error(&spindle_core::AppendError::NeedsStateResolution {
+            key: spindle_core::StateKey::new("m.room.topic", ""),
+            candidates: Vec::new(),
+        });
+        assert_eq!(
+            crate::routes::room_error(error).status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }
 
 /// The `m.room.create` content: what the server decides, plus what the client
@@ -8663,7 +9885,7 @@ mod cold_registry_tests {
             .open
             .write()
             .unwrap()
-            .insert("!same:test".to_owned(), Arc::clone(&published));
+            .insert("!same:test".to_owned(), rooms.slot(Arc::clone(&published)));
         published
             .write()
             .unwrap()
@@ -8682,6 +9904,38 @@ mod cold_registry_tests {
                 .event_id
                 .as_str(),
             "$new"
+        );
+    }
+}
+
+#[cfg(test)]
+mod warm_order_tests {
+    use super::{WARM_FIRST_ENTRIES, sort_for_warming};
+
+    /// The rooms that can set the warm-up's length start it, largest
+    /// first, whatever their activity; every other room keeps the
+    /// newest-activity order a client's room list has.
+    #[test]
+    fn large_rooms_are_warmed_first_and_the_rest_by_activity() {
+        let large = WARM_FIRST_ENTRIES;
+        let mut rooms = vec![
+            ("!busy-small".to_owned(), 900, 40),
+            ("!quiet-huge".to_owned(), 1, large * 9),
+            ("!idle-small".to_owned(), 10, 5),
+            ("!busy-large".to_owned(), 800, large),
+            ("!mid".to_owned(), 500, large - 1),
+        ];
+        sort_for_warming(&mut rooms);
+        let order: Vec<&str> = rooms.iter().map(|room| room.0.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "!quiet-huge",
+                "!busy-large",
+                "!busy-small",
+                "!mid",
+                "!idle-small"
+            ]
         );
     }
 }

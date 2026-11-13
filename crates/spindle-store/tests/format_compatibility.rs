@@ -141,11 +141,9 @@ fn order_preserving_encoding_survives_the_sign_boundary() {
     );
 }
 
-/// Keyspaces are discriminants written into every key. Reusing or reordering one
-/// makes two record types collide in the same byte range.
-#[test]
-fn keyspace_discriminants_are_unchanged() {
-    for (keyspace, expected) in [
+/// Every keyspace and the byte it owns. Its own function keeps the test short.
+fn keyspace_table() -> Vec<(Keyspace, u8)> {
+    vec![
         (Keyspace::Log, 0x01_u8),
         (Keyspace::EventIndex, 0x02),
         (Keyspace::StateNode, 0x03),
@@ -196,6 +194,8 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::FederationGapPosition, 0x46),
         (Keyspace::FederationGapSpan, 0x47),
         (Keyspace::PendingRedaction, 0x48),
+        (Keyspace::UpstreamLink, 0x49),
+        (Keyspace::OwedEvent, 0x4b),
         (Keyspace::PendingKnock, 0x32),
         (Keyspace::OpenIdToken, 0x33),
         (Keyspace::Sticky, 0x34),
@@ -217,14 +217,39 @@ fn keyspace_discriminants_are_unchanged() {
         (Keyspace::AdminTask, 0x58),
         (Keyspace::FinalisedDelayById, 0x55),
         (Keyspace::DelayEcho, 0x56),
+        (Keyspace::DeviceListOutbound, 0x5d),
+        (Keyspace::DeviceListInbound, 0x5e),
+        (Keyspace::PresenceStream, 0x5f),
+        (Keyspace::PartialStateRoom, 0x61),
+        (Keyspace::PartialStateResynced, 0x62),
+        (Keyspace::RevokedDevice, 0x63),
+        (Keyspace::CurrentState, 0x64),
+        (Keyspace::DestinationRetry, 0x65),
+        (Keyspace::ChainCheckpoint, 0x67),
         (Keyspace::HubAttestation, 0x70),
         (Keyspace::HubEquivocation, 0x71),
         (Keyspace::HubCheckpoint, 0x72),
-    ] {
+        (Keyspace::RoomStateDelta, 0x66),
+        (Keyspace::SearchPosting, 0x80),
+        (Keyspace::SearchVocab, 0x81),
+        (Keyspace::SearchMarker, 0x82),
+    ]
+}
+
+/// Keyspaces are discriminants written into every key. Reusing or reordering one
+/// makes two record types collide in the same byte range.
+#[test]
+fn keyspace_discriminants_are_unchanged() {
+    let table = keyspace_table();
+    let mut owner = std::collections::BTreeMap::new();
+    for (keyspace, expected) in table {
         let key = room_prefix(keyspace, ROOM);
         assert_eq!(
             key[1], expected,
             "keyspace {keyspace:?} moved; existing rows are now read as another type"
         );
+        if let Some(other) = owner.insert(expected, keyspace) {
+            panic!("{other:?} and {keyspace:?} share byte {expected:#04x}");
+        }
     }
 }

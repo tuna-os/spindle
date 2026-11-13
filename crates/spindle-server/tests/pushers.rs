@@ -136,17 +136,11 @@ async fn a_registration_reads_back_whole_and_replaces_rather_than_duplicates() {
 }
 
 #[tokio::test]
-async fn kind_null_removes_and_an_email_pusher_needs_no_url() {
+async fn kind_null_removes_a_registered_pusher() {
     let harness = Harness::new();
     let alice = harness.register("alice").await;
     harness.set(&alice, &http_pusher("KEY1")).await;
-    let (status, body) = harness
-        .set(
-            &alice,
-            &json!({ "pushkey": "alice@example.org", "kind": "email", "app_id": "m.email", "data": {} }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    harness.set(&alice, &http_pusher("KEY2")).await;
     assert_eq!(harness.list(&alice).await.len(), 2);
 
     let (status, body) = harness
@@ -158,7 +152,24 @@ async fn kind_null_removes_and_an_email_pusher_needs_no_url() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let left = harness.list(&alice).await;
     assert_eq!(left.len(), 1, "{left:?}");
-    assert_eq!(left[0]["kind"], "email");
+    assert_eq!(left[0]["pushkey"], "KEY2");
+}
+
+/// #824: nothing delivers to an email pusher, so storing one told the client
+/// its notifications would be mailed and then mailed nothing.
+#[tokio::test]
+async fn an_email_pusher_is_refused_because_nothing_would_deliver_to_it() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (status, body) = harness
+        .set(
+            &alice,
+            &json!({ "pushkey": "alice@example.org", "kind": "email", "app_id": "m.email", "data": {} }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM", "{body}");
+    assert!(harness.list(&alice).await.is_empty(), "nothing was stored");
 }
 
 #[tokio::test]

@@ -24,18 +24,20 @@ jobs:
     # test, so it reports nothing useful. Raise it rather than cut coverage.
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       # `rust-toolchain.toml` pins the version and rustup honours it over
       # whatever this step installs, so naming a different one here does
       # nothing -- this job read `toolchain: 1.85.0` for months while
       # building on 1.89. It could not have built on 1.85: `rust-version`
       # in Cargo.toml is 1.89, and cargo refuses outright below it. Left
       # unset so there is one place the version is declared.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Check code
@@ -93,6 +95,15 @@ jobs:
       # file that uses it; a renamed variable would drop one silently.
       - name: Check every upstream pin can still be read
         run: python3 scripts/upstream-pins.py --check
+
+      # vendor/ruma-state-res is a patched copy with no upstream path for
+      # the patch (ADR 0006). Hold it to the crates.io base plus exactly the
+      # hunks SPINDLE-PATCH.md lists, so the patch cannot grow silently; the
+      # test runs the same judgement on synthetic trees and an injected hunk.
+      - name: Check the vendored ruma-state-res is its base plus the listed hunks
+        run: |
+          python3 scripts/ruma-drift.py --check
+          python3 scripts/ruma-drift-test.py
 
       # The Complement ratchet decides whether a conformance regression can
       # merge, and its output is what somebody reads when one does. Both are
@@ -153,6 +164,12 @@ jobs:
       - name: Check the parity gate
         run: python3 scripts/parity-gate-test.py
 
+      # The targeted sitting's partition is a TLS front that must break
+      # established flows, not only refuse new ones; a leak there turns the
+      # catch-up cell into a page read (#647).
+      - name: Check the federated benchmark's partition front
+        run: python3 scripts/federated-benchmark-test.py
+
       # The ESS driver owns the one-writer cutover boundary. Its fake API
       # exercises conflicts and failed convergence without cluster credentials.
       - name: Check the ESS/Kubernetes operation driver
@@ -185,12 +202,52 @@ jobs:
       # this repository is unusually prose-heavy: the SPEC, the ADRs and the
       # benchmark write-ups are the artefact as much as the code is.
       - name: Check spelling
-        uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1
+        uses: crate-ci/typos@v1.52.1
 
       # A tag is a pointer somebody else can move, and every action here runs
       # before our code does, in a job holding a token. This ran
       # `dtolnay/rust-toolchain@master` -- a mutable *branch* installing a
       # toolchain -- for its whole history. Pins drift back the moment nothing
-      # is watching, so the check ships with them.
-      - name: Check actions are pinned to commit SHAs
-        run: python3 scripts/actions-pinned.py
+      # is watching, so the check ships with them. The same script refuses
+      # an expression pasted into a `run:` script (#516), a write grant every
+      # job inherits (#521) and a container image named by tag alone (#652);
+      # its test holds each check to the case that made it.
+      - name: Check actions and images are pinned and workflows least-privileged
+        run: |
+          python3 scripts/actions-pinned.py
+          python3 scripts/actions-pinned-test.py
+
+  # The files under deploy/ run nowhere in the Rust gate, so they would rot
+  # unseen. Compose, Caddy, Helm and systemd each check their own file with
+  # their own tool, on the runner's preinstalled copies (#825).
+  deploy:
+    name: Deployment files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the deployment files
+        run: |
+          pip install --quiet pyyaml==6.0.3
+          python3 scripts/check-deploy.py --require-all
+
+  # Starts the Compose file's Spindle service from the repository's own
+  # Dockerfile and walks the first operator steps: register, log in, create
+  # a room, send a message (#825). The render checks above cannot tell that
+  # the stack runs.
+  deploy-smoke:
+    name: Deployment smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start the Compose service and register a user
+        run: scripts/deploy-smoke.sh

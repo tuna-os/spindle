@@ -1,0 +1,28 @@
+# The second seat with the built-in LiveKit minter (#796), for
+# SPINDLE_RTC=builtin in run.sh: spindle-othersite.toml's server, with
+# `[rtc.livekit]` against the other site's SFU (backend/dev_livekit-othersite.yaml).
+# spindle-builtin-rtc.toml says why the rest is as it is.
+[server]
+name = "synapse.othersite.m.localhost"
+bind = "0.0.0.0:18008"
+public_base_url = "https://synapse.othersite.m.localhost"
+
+[storage]
+path = "/data/store"
+
+[logging]
+filter = "info"
+
+[ratelimit]
+enabled = false
+
+[registration]
+shared_secret = "test_shared_secret_for_local_dev_only"
+
+[federation]
+allow_internal = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[rtc.livekit]
+url = "wss://matrix-rtc.othersite.m.localhost/livekit/sfu"
+key = "devkey"
+secret = "secret"

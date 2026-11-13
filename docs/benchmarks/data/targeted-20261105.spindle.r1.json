@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 123267965.0,
+      "joined_members": 1002,
+      "lower_ns": 129642513.0,
+      "mean_ns": 129642513.0,
+      "samples": 1,
+      "upper_ns": 129642513.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 1192408970.0,
+      "joined_members": 10002,
+      "lower_ns": 1263270578.0,
+      "mean_ns": 1263270578.0,
+      "samples": 1,
+      "upper_ns": 1263270578.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 375.58235445484917,
+      "heal_to_served_ns": 1605579476.0,
+      "lower_ns": 535168912.0,
+      "mean_ns": 535168912.0,
+      "resident_retry_ns": 1070410564.0,
+      "samples": 1,
+      "upper_ns": 535168912.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 561208.0,
+      "latency_median_ns": 834443.5,
+      "latency_p99_ns": 1361780.0,
+      "latency_samples": 96,
+      "lower_ns": 446634.59374999994,
+      "mean_ns": 446634.59374999994,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 2238.9667392395086,
+      "upper_ns": 446634.59374999994
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 768400.0,
+      "latency_median_ns": 1430998.5,
+      "latency_p99_ns": 3051804.0,
+      "latency_samples": 96,
+      "lower_ns": 380445.5520833334,
+      "mean_ns": 380445.5520833334,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 2628.4970202016148,
+      "upper_ns": 380445.5520833334
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 598343.0,
+      "latency_median_ns": 2946168.0,
+      "latency_p99_ns": 30486589.0,
+      "latency_samples": 96,
+      "lower_ns": 686745.8958333334,
+      "mean_ns": 686745.8958333334,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 1456.142666548517,
+      "upper_ns": 686745.8958333334
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 1,
+  "server": "spindle"
+}

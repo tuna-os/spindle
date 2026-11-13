@@ -275,3 +275,87 @@ fn a_restore_says_which_media_the_rows_it_wrote_still_need() {
         "the restore claimed success without naming the media it is missing: {text}"
     );
 }
+
+/// A room with state, and the nodes of a state no record names: what an
+/// interrupted write leaves behind. Returns how many stray nodes there are.
+fn seed_state_garbage(config_path: &std::path::Path) -> usize {
+    let config = spindle_server::Config::load(config_path.to_str().unwrap()).unwrap();
+    let store = spindle_store::FjallStore::open(&config.storage.path).unwrap();
+    let table = spindle_store::ReadView::key_table(&store);
+    let room_store = spindle_store::RoomStore::new(&store, "!gc:example.org");
+    let mut log = spindle_core::RoomLog::new(std::sync::Arc::clone(&table));
+    for number in 0..8 {
+        let key = spindle_core::StateKey::new("m.room.member", format!("@u{number}:example.org"));
+        let entry = log
+            .append_local(format!("$gc-{number}"), Some(key))
+            .unwrap()
+            .clone();
+        room_store
+            .commit_entry(&entry, &log, spindle_store::Durability::Strict)
+            .unwrap();
+    }
+    let mut stray = spindle_core::StateSnapshot::new(std::sync::Arc::clone(&table));
+    for number in 0..40 {
+        stray = stray.apply(
+            &spindle_core::StateKey::new("m.room.member", format!("@stray{number}:example.org")),
+            format!("$stray-{number}"),
+        );
+    }
+    let writes: Vec<_> = stray
+        .delta_nodes(None)
+        .into_iter()
+        .map(|(address, bytes)| {
+            (
+                spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+                bytes,
+            )
+        })
+        .collect();
+    spindle_store::Store::commit_state_deferred(&store, &writes, &table).unwrap();
+    spindle_store::Store::sync(&store, spindle_store::Durability::Strict).unwrap();
+    writes.len()
+}
+
+/// `spindle gc` (#742) says what is unreachable on a dry run, sweeps
+/// exactly that, finds nothing the second time, and refuses a store a
+/// running server holds -- the offline guarantee is the directory lock.
+#[test]
+fn gc_sweeps_unreachable_state_nodes_and_only_offline() {
+    let work = TempDir::new().unwrap();
+    let config = config_for(&work, "data");
+    let stray = seed_state_garbage(&config);
+    let said = |output: &std::process::Output| {
+        assert!(
+            output.status.success(),
+            "gc failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let dry = said(&run(&[os("gc"), config.as_os_str(), os("--dry-run")]));
+    assert!(
+        dry.contains(&format!("would sweep {stray} unreachable")),
+        "{dry}"
+    );
+    assert!(dry.contains("8 root-holding rows"), "{dry}");
+    let swept = said(&run(&[os("gc"), config.as_os_str()]));
+    assert!(
+        swept.contains(&format!("swept {stray} unreachable")),
+        "{swept}"
+    );
+    let again = said(&run(&[os("gc"), config.as_os_str()]));
+    assert!(again.contains("swept 0 unreachable"), "{again}");
+
+    let parsed = spindle_server::Config::load(config.to_str().unwrap()).unwrap();
+    let held = spindle_store::FjallStore::open(&parsed.storage.path).unwrap();
+    let refused = run(&[os("gc"), config.as_os_str()]);
+    assert!(
+        !refused.status.success(),
+        "gc ran against a store another process holds"
+    );
+    drop(held);
+}

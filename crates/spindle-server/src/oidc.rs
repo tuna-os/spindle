@@ -118,9 +118,12 @@ struct PendingCode {
 
 /// The provider's in-flight state. Codes are memory-only on purpose: a
 /// code that does not survive a restart costs the user one more login
-/// page, while a durable code would be a credential at rest.
+/// page, while a durable code would be a credential at rest. The client
+/// API's email validation sessions (`threepid.rs`) are held the same way
+/// for the same reason.
 pub struct BuiltinOidc {
     codes: Mutex<HashMap<String, PendingCode>>,
+    pub(crate) threepid: crate::threepid::Sessions,
 }
 
 impl BuiltinOidc {
@@ -128,6 +131,7 @@ impl BuiltinOidc {
     pub fn new() -> Self {
         Self {
             codes: Mutex::new(HashMap::new()),
+            threepid: crate::threepid::Sessions::default(),
         }
     }
 }
@@ -149,7 +153,11 @@ struct ClientRecord {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
-        .route("/oauth2/registration", post(register_client))
+        .route(
+            "/oauth2/registration",
+            post(register_client)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_REGISTRATION_BODY)),
+        )
         .route("/oauth2/authorize", get(authorize_page).post(authorize))
         .route("/oauth2/token", post(token))
         .route("/oauth2/revoke", post(revoke))
@@ -224,16 +232,24 @@ struct RegistrationRequest {
 /// no secret to issue, PKCE is the proof of continuity.
 async fn register_client(
     State(state): State<AppState>,
+    source: ClientAddr,
     Json(request): Json<RegistrationRequest>,
 ) -> Result<(StatusCode, Json<Value>), OAuthError> {
     provider(&state)?;
-    if request.redirect_uris.is_empty() {
+    // Registration is open by design: a client has no credential before it
+    // has a client_id. Each call writes a durable row, so the budget and the
+    // size checks are what keep one caller from growing the store (#833).
+    if let Err(retry) = state.limiter.check(
+        &format!("oidc-register:source:{source}"),
+        crate::ratelimit::OIDC_REGISTER_PER_SOURCE,
+    ) {
         return Err(oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_redirect_uri",
-            "at least one redirect_uri is required",
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+            &format!("too many registrations; retry in {} ms", retry.as_millis()),
         ));
     }
+    check_registration(&request)?;
     let client_id = format!("oc_{}", random_hex(16));
     let record = ClientRecord {
         client_id: client_id.clone(),
@@ -259,6 +275,79 @@ async fn register_client(
             "response_types": ["code"],
         })),
     ))
+}
+
+/// The most a registration request body may be.
+const MAX_REGISTRATION_BODY: usize = 16 * 1024;
+const MAX_REDIRECT_URIS: usize = 8;
+const MAX_REDIRECT_URI_BYTES: usize = 2048;
+const MAX_CLIENT_NAME_BYTES: usize = 256;
+
+/// Refuse a registration that is oversized or names a redirect no honest
+/// client uses.
+///
+/// The scheme matters because the authorization response is sent to this
+/// URI: `javascript:` and its kin would turn the redirect into script in
+/// the browser. RFC 8252 allows `https`, loopback `http`, and private-use
+/// schemes written as a reversed domain name.
+fn check_registration(request: &RegistrationRequest) -> Result<(), OAuthError> {
+    let invalid =
+        |reason: &str| oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", reason);
+    if request.redirect_uris.is_empty() {
+        return Err(invalid("at least one redirect_uri is required"));
+    }
+    if request.redirect_uris.len() > MAX_REDIRECT_URIS {
+        return Err(invalid("too many redirect_uris"));
+    }
+    if request
+        .client_name
+        .as_ref()
+        .is_some_and(|name| name.len() > MAX_CLIENT_NAME_BYTES)
+    {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "client_name is too long",
+        ));
+    }
+    for uri in &request.redirect_uris {
+        if uri.len() > MAX_REDIRECT_URI_BYTES
+            || uri.chars().any(|c| c.is_control() || c.is_whitespace())
+            || !redirect_scheme_allowed(uri)
+        {
+            return Err(invalid("a redirect_uri is not acceptable"));
+        }
+    }
+    Ok(())
+}
+
+fn redirect_scheme_allowed(uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    match scheme.as_str() {
+        "https" => rest.starts_with("//") && rest.len() > 2,
+        "http" => {
+            let authority = rest.strip_prefix("//").unwrap_or_default();
+            let host = authority.split(['/', '?', '#']).next().unwrap_or_default();
+            let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+            let name = if host.starts_with('[') {
+                host.split(']').next().map_or("", |name| &name[1..])
+            } else {
+                host.split(':').next().unwrap_or_default()
+            };
+            matches!(name, "localhost" | "127.0.0.1" | "::1")
+        }
+        "javascript" | "data" | "vbscript" | "file" | "about" | "blob" | "ftp" => false,
+        other => {
+            other.contains('.')
+                && other.starts_with(|c: char| c.is_ascii_lowercase())
+                && other
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "+.-".contains(c))
+        }
+    }
 }
 
 fn load_client(state: &AppState, client_id: &str) -> Result<Option<ClientRecord>, MatrixError> {
@@ -520,6 +609,10 @@ fn login_page(
         format!("<p class=\"error\">{}</p>", escape(message))
     });
     let forgot = crate::recovery::recovery_links(state);
+    // An upstream sign-in ends back at this very authorization request,
+    // which then finds the browser session it started.
+    let upstream =
+        crate::upstream::buttons(state, &format!("/oauth2/authorize?{}", params.query(None)));
     let body = format!(
         "<form method=\"post\" action=\"/oauth2/authorize\">\
          <h1>Sign in to {server}</h1>\
@@ -527,7 +620,7 @@ fn login_page(
          <input name=\"username\" placeholder=\"Username\" autocomplete=\"username\" required>\
          <input name=\"password\" type=\"password\" placeholder=\"Password\" \
          autocomplete=\"current-password\" required>\
-         <button type=\"submit\">Sign in</button></form>{forgot}",
+         <button type=\"submit\">Sign in</button></form>{upstream}{forgot}",
         server = escape(&state.config.server.name),
         client = escape(client_name),
         host = escape(redirect_host(&params.redirect_uri)),
@@ -707,14 +800,23 @@ fn password_sign_in(
         )));
     }
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let good = accounts
-        .verify_password(&localpart, password)
-        .map_err(|error| {
+    let good = match accounts.verify_password(&localpart, password) {
+        Ok(good) => good,
+        // The password was never checked (#571); back to the form, as for
+        // a spent attempt budget.
+        Err(crate::accounts::AccountError::Busy) => {
+            state
+                .metrics
+                .record_login(LoginMethod::Oidc, LoginResult::RateLimited);
+            return Ok(Err((StatusCode::TOO_MANY_REQUESTS, web::HASHER_BUSY)));
+        }
+        Err(error) => {
             state
                 .metrics
                 .record_login(LoginMethod::Oidc, LoginResult::Error);
-            MatrixError::internal(&error.to_string())
-        })?;
+            return Err(MatrixError::internal(&error.to_string()).into());
+        }
+    };
     if !good {
         // Back to the form, not an OAuth error: a typo'd password is the
         // human's business, and the flow is still alive.
@@ -884,9 +986,7 @@ async fn revoke(
 ) -> Result<Json<Value>, OAuthError> {
     provider(&state)?;
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    accounts
-        .logout(&request.token)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    crate::mas::end_local_session(&state, &accounts, &request.token)?;
     Ok(Json(json!({})))
 }
 

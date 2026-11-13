@@ -63,6 +63,11 @@ impl ServerKey {
         let pair = Ed25519KeyPair::from_der(&document, KEY_VERSION.to_owned())
             .map_err(|error| SigningError::Unreadable(error.to_string()))?;
         store.put(&storage_key(KEY_VERSION), &document)?;
+        // The public half is published as soon as the server answers a key
+        // query. A key that a crash loses would be regenerated under the same
+        // key ID, and every signature made with the first would stop
+        // verifying (#810).
+        store.sync(spindle_store::Durability::Strict)?;
         Ok(Self { pair })
     }
 
@@ -85,6 +90,7 @@ impl ServerKey {
         let pair = Ed25519KeyPair::from_der(&document, version.clone())
             .map_err(|error| SigningError::Unreadable(error.to_string()))?;
         store.put(&storage_key(&version), &document)?;
+        store.sync(spindle_store::Durability::Strict)?;
         Ok(Self { pair })
     }
 
@@ -226,7 +232,7 @@ fn decode_base64_unpadded(encoded: &str) -> Result<Vec<u8>, SigningError> {
 /// Matrix uses unpadded base64 throughout, and a padded value is not merely
 /// ugly — it is a different string, so a peer comparing key bytes to a cached
 /// copy would see a mismatch.
-fn base64_unpadded(bytes: &[u8]) -> String {
+pub(crate) fn base64_unpadded(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

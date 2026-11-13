@@ -84,12 +84,20 @@ deviation from it.
   `matrix_server_name` is another server is refused rather than verified
   over federation. A remote participant's call is their own server's
   problem, or an external service's; when MSC4195's federation endpoint
-  lands, it is that endpoint's.
+  lands, it is that endpoint's. *Amended by #796:* in a call across
+  servers, each participant subscribes to the other servers' SFUs, so a
+  remote user's token request is part of a normal call. The service now
+  confirms another server's token at that server, as `lk-jwt-service`
+  does, and mints a subscribe-only token for a joined user of that
+  server.
 - **`roomCreate` is withheld** from the grant, because in LiveKit it
   also permits deleting a room, which ends everyone's call. The SFU's
   default `auto_create` makes the room on first join instead; a
   deployment that turned that off needs the external service or a room
-  created another way.
+  created another way. *Amended by #796:* the grant still withholds
+  it. The service now creates the room through the SFU's API for a
+  full-access user, as `lk-jwt-service` does, so an SFU with
+  `auto_create` off works.
 - **This couples the built-in path to LiveKit's token format.** That is
   accepted: the coupling is in one module behind one config section, and
   the external path is the escape hatch for any other transport.

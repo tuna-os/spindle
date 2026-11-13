@@ -41,6 +41,49 @@ pub fn store_marker() -> Vec<u8> {
     vec![0x00, 0x00]
 }
 
+/// The prefix of the migration ledger: one row per applied step, keyed by
+/// the step's id (#661).
+///
+/// Beside the marker and outside every [`Keyspace`] for the marker's reason:
+/// a step can change the key schema, so the record that it ran cannot be laid
+/// out by the schema it moves. The zero first byte keeps it clear of every
+/// keyspace (see the assertion below), and the second byte keeps it clear of
+/// the marker.
+#[must_use]
+pub fn migration_ledger_prefix() -> Vec<u8> {
+    vec![0x00, 0x01]
+}
+
+/// The ledger row recording that migration step `id` was applied.
+#[must_use]
+pub fn migration_applied(id: &str) -> Vec<u8> {
+    let mut key = migration_ledger_prefix();
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+/// The progress of the one step a `spindle migrate` run has not finished
+/// (#656). One key, not one per step: steps run in order, so at most one is
+/// ever part way through.
+#[must_use]
+pub fn migration_progress() -> Vec<u8> {
+    vec![0x00, 0x02]
+}
+
+/// Present while a `spindle restore` is writing rows, and absent before and
+/// after (#811).
+///
+/// Beside the marker and outside every [`Keyspace`], for the marker's reason.
+/// A restore writes rows as it reads them and checks the trailer last, so a
+/// crash or a failed check leaves a prefix of the backup with a valid schema
+/// marker: a store that opens, looks healthy and misses its tail. This row
+/// is written first and removed only after the last row is synced, and
+/// opening a store that holds it is refused.
+#[must_use]
+pub fn restore_in_progress() -> Vec<u8> {
+    vec![0x00, 0x03]
+}
+
 /// The marker's non-collision is a compile-time property, so it is checked at
 /// compile time: a zero `KEY_SCHEMA_VERSION` would put room keys in the
 /// marker's range, and that must fail the build rather than a test run.
@@ -432,6 +475,90 @@ pub enum Keyspace {
     StateKeyIntern = 0x59,
     /// Highest global position issued to a client, retained after queue drains.
     StreamCheckpoint = 0x5a,
+    /// `(destination, seq)` -> one EDU that must reach the peer: a
+    /// to-device message, a device-list update or a cross-signing key
+    /// update (#739).
+    ///
+    /// The EDU half of [`Self::FederationOutbox`]'s at-least-once: these
+    /// three carry key material and messages a client is waiting on, and
+    /// a peer that missed one does not ask again, so a failed transaction
+    /// or a restart must not lose them the way it loses typing. Deleted
+    /// only once the destination acknowledged the transaction carrying the
+    /// row; `seq` is per destination and keeps them in the order queued.
+    /// The bare `destination` key holds the next `seq`, kept after the
+    /// queue drains so a sequence is never issued twice ([`edu_outbox_next`]).
+    EduOutbox = 0x5b,
+    /// `seq` -> one push notification judged and not yet acknowledged by
+    /// its gateway, with the gateway's URL (#739).
+    ///
+    /// Written in the same batch that advances [`Self::PushCursor`] past
+    /// the event that produced it, so a crash leaves either both or
+    /// neither; deleted once the gateway answers or the notification is
+    /// given up on.
+    PushPending = 0x5c,
+    /// `(position, user_id)` -> nothing: the stream position at which a
+    /// user's presence last visibly changed (#745).
+    ///
+    /// Position first, so an incremental `/sync` reads "whose presence
+    /// changed since my token" as one range rather than a scan of every
+    /// user who ever set one. At most one live row per user: the
+    /// [`Self::Presence`] row names its current position, and a row whose
+    /// position disagrees is a superseded one a reader skips.
+    PresenceStream = 0x5f,
+    /// `room_id` -> the record of a partial-state join (MSC3706, #746): the
+    /// join that `send_join` answered with `members_omitted`, the server it
+    /// went through and the resident's `servers_in_room`. Present for as
+    /// long as the room's state lacks the member events the resident left
+    /// out; the background resync deletes it once the full state is folded
+    /// in, and a restart finds it here and resumes the resync.
+    PartialStateRoom = 0x61,
+    /// `room_id` -> where a partial-state room's resync completed: the
+    /// room and the stream position, as JSON. An incremental `/sync`
+    /// spanning that position tells its client the room afresh, with the
+    /// state the resync filled in: the member events it brought were never
+    /// timeline events, so nothing else would carry them.
+    PartialStateResynced = 0x62,
+    /// `(localpart, device_id)` -> nothing: a delegated user's device that
+    /// this server ended on its own authority (#615) -- the admin API, the
+    /// client API's device deletion or logout -- while the provider may
+    /// still vouch for the session. Introspection provisions a missing
+    /// device on first sight, so without this row the provider's next
+    /// "active" would bring the device back and the ended session with it.
+    /// Deleted when the device row is written again.
+    RevokedDevice = 0x63,
+    /// `room_id` -> the resolution of the room's open fork: the digest of
+    /// what it resolved (`RoomLog::current_inputs`) and its state's root,
+    /// whose nodes are stored like any other state's.
+    ///
+    /// A cache, not a record of the room: the log alone determines the
+    /// answer. It exists because the answer can cost seconds -- a large
+    /// room's thirteen-tip fork, resolved again at every restart (#724) --
+    /// and a reopened room whose tips, their states and its rejections
+    /// match the digest takes it instead. One that does not match is
+    /// ignored and overwritten by the next resolution.
+    CurrentState = 0x64,
+    /// `destination` -> how the federation outbox stands with a server
+    /// whose last delivery failed: the failures in a row, when they began,
+    /// when the next attempt is due, and whether it is catching up (#801).
+    ///
+    /// Kept so a restart resumes each dead server's backoff rather than
+    /// retrying thousands of them at once and starting every one's
+    /// schedule over -- Synapse's `destinations` table, for the same
+    /// reason. Written at each failed attempt and each reset, deleted on
+    /// the first acknowledged transaction; a healthy destination has no
+    /// row.
+    DestinationRetry = 0x65,
+    /// `(room_id, stream_id)` -> the change an append made to the room's
+    /// *current* state beyond the event itself (#819).
+    ///
+    /// Written in the batch of the event that caused it, under that event's
+    /// stream id, and only when a fork, a merge or a gap acceptance moved the
+    /// current state by more than the event. The value is JSON: the log index
+    /// of the event, and the `(type, state_key, event_id)` of every key whose
+    /// current event it set. A linear append has no row, because the event is
+    /// the whole change and the timeline carries it. Absent from a store
+    /// written before it existed, which then reads as "nothing but the events".
+    RoomStateDelta = 0x66,
     /// `(room_id, position)` -> one event of a filled federation gap: its
     /// ID and the root of the state after it. History backfilled into the
     /// *middle* of a room's timeline -- between the head this server held
@@ -454,6 +581,18 @@ pub enum Keyspace {
     /// still open: applied when backfill brings the target in, so history
     /// filled late is never served unredacted.
     PendingRedaction = 0x48,
+    /// `(upstream provider id, subject)` -> the localpart that upstream
+    /// identity signs in as (#610): the account link, as MAS keeps it in
+    /// `upstream_oauth_links`. Keyed by the provider's configured id
+    /// rather than its issuer, so an operator can move a provider to a new
+    /// URL without orphaning every link.
+    UpstreamLink = 0x49,
+    /// `(room_id, event_id)` -> a pushed PDU this server refused for
+    /// missing dependencies without storing a verdict (#822): its body, the
+    /// server that sent it, and how often it was tried again. The
+    /// gap-backfill loop retries each until it is applied or given up on,
+    /// so the newest event of a room that then goes quiet is not lost.
+    OwedEvent = 0x4b,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -501,6 +640,24 @@ pub enum Keyspace {
     /// became, for its sender only -- the same shape as
     /// [`Self::TransactionEcho`], and read at the same point.
     DelayEcho = 0x56,
+    /// `user_id` -> the `stream_id` of the newest `m.device_list_update`
+    /// this server minted for one of its own users (big-endian `u64`).
+    ///
+    /// The head of the user's device-list chain: the next update names it
+    /// as `prev_id`, and `GET /user/devices` serves it as `stream_id`, so a
+    /// peer that resynced from the snapshot recognises the next update as
+    /// following it. Unlike [`Self::DeviceListChange`] this is per user, not
+    /// a global stream position: two changes that share a sync position
+    /// (a batch device deletion) still need two links.
+    DeviceListOutbound = 0x5d,
+    /// `user_id` -> the newest device-list `stream_id` this server has
+    /// accounted for, for a user on another server (big-endian `u64`).
+    ///
+    /// An inbound update whose `prev_id` names something newer was preceded
+    /// by one that never arrived, and the user's device copy is refetched.
+    /// Left behind after a failed refetch, so the gap stays visible to the
+    /// next update rather than being papered over by it.
+    DeviceListInbound = 0x5e,
     /// `(room_id, epoch, li)` -> a hub's signed chain attestation for the
     /// entry it sequenced at `li` in that epoch (SPEC section 12.6, #22).
     /// Written only by a build with the `hub-mode` feature.
@@ -515,6 +672,32 @@ pub enum Keyspace {
     /// `(room_id, epoch, li)` -> a hub's signed checkpoint: the chain value
     /// and the state root at `li` (SPEC section 13.3).
     HubCheckpoint = 0x72,
+    /// `room_id` -> where a truncated room's hash chain restarts: the first
+    /// `li` the room still holds a chain for (i64 be) and `chain[li - 1]`,
+    /// the value the chain had just before it (32 bytes).
+    ///
+    /// Retention (#817) deletes the log entries below a watermark, and
+    /// `ChainHash::extend` needs the value before the first retained entry.
+    /// A load seeds the chain from this row instead of from the domain
+    /// seed. The row is written before the first delete, so a crash leaves a
+    /// room that reads as already truncated.
+    ChainCheckpoint = 0x67,
+    /// `(room_id, token, li)` -> nothing: one row for each word of an
+    /// event's `content.body`. Derived data, written in the event's own
+    /// batch when `[search] index` is on; the log is the truth. A row
+    /// outliving its body is harmless, because a search verifies every
+    /// candidate against the body.
+    ///
+    /// `0x80` and up, apart from the run other branches allocate from.
+    SearchPosting = 0x80,
+    /// `(room_id, token)` -> nothing: the words a room's postings use, so
+    /// a part of a word can find the words that contain it. Never pruned
+    /// by a redaction: a stale word only costs one empty posting scan.
+    SearchVocab = 0x81,
+    /// `room_id` -> the highest `li` below which every entry is indexed
+    /// (big-endian, order-preserving `i64`). A room without the row is
+    /// not indexed and is searched by scanning.
+    SearchMarker = 0x82,
 }
 
 // Adding a discriminant is additive: every key already written keeps its bytes
@@ -525,6 +708,44 @@ const _: () = assert!(
     Keyspace::Account as u8 > Keyspace::RoomMeta as u8,
     "new keyspaces take fresh discriminants; they never reuse an existing one"
 );
+
+/// The prefix of one word's postings in one room: every row under it is
+/// one event's `li`, in order. The NUL ends the word, which never holds one.
+#[must_use]
+pub fn search_posting_prefix(room_id: &str, token: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::SearchPosting, room_id);
+    key.extend_from_slice(token.as_bytes());
+    key.push(0);
+    key
+}
+
+/// One posting: `token` occurs in the body of the event at `li`.
+#[must_use]
+pub fn search_posting(room_id: &str, token: &str, li: LinearIndex) -> Vec<u8> {
+    let mut key = search_posting_prefix(room_id, token);
+    key.extend_from_slice(&order_preserving(li.get()));
+    key
+}
+
+/// The prefix of a room's vocabulary rows.
+#[must_use]
+pub fn search_vocab_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::SearchVocab, room_id)
+}
+
+/// The vocabulary row for one word of a room.
+#[must_use]
+pub fn search_vocab(room_id: &str, token: &str) -> Vec<u8> {
+    let mut key = search_vocab_prefix(room_id);
+    key.extend_from_slice(token.as_bytes());
+    key
+}
+
+/// The row that says how far a room is indexed.
+#[must_use]
+pub fn search_marker(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::SearchMarker, room_id)
+}
 
 /// The global-profile row for one user.
 #[must_use]
@@ -643,6 +864,12 @@ pub fn oidc_client(client_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn purge_watermark(room_id: &str) -> Vec<u8> {
     room_prefix(Keyspace::PurgeWatermark, room_id)
+}
+
+/// A room's chain checkpoint row ([`Keyspace::ChainCheckpoint`]).
+#[must_use]
+pub fn chain_checkpoint(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::ChainCheckpoint, room_id)
 }
 
 /// A room's administrative block row.
@@ -782,6 +1009,14 @@ pub fn federation_gap(room_id: &str, event_id: &str) -> Vec<u8> {
     key
 }
 
+/// One owed event ([`Keyspace::OwedEvent`]).
+#[must_use]
+pub fn owed_event(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::OwedEvent, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
 /// One backfilled gap event's row ([`Keyspace::FederationGapEvent`]),
 /// ordered by position within the room.
 #[must_use]
@@ -814,6 +1049,19 @@ pub fn pending_redaction(room_id: &str, target: &str) -> Vec<u8> {
     let mut key = room_prefix(Keyspace::PendingRedaction, room_id);
     key.extend_from_slice(target.as_bytes());
     key
+}
+
+/// A room's partial-state join record ([`Keyspace::PartialStateRoom`]).
+#[must_use]
+pub fn partial_state_room(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PartialStateRoom, room_id)
+}
+
+/// Where a room's partial-state resync completed
+/// ([`Keyspace::PartialStateResynced`]).
+#[must_use]
+pub fn partial_state_resynced(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::PartialStateResynced, room_id)
 }
 
 /// An imported auth PDU held outside the accepted timeline.
@@ -911,6 +1159,23 @@ pub fn delayed_event_by_id(delay_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::DelayedEventById as u8];
     key.extend_from_slice(delay_id.as_bytes());
     key
+}
+
+/// One room's row in the current-state delta index.
+///
+/// See [`Keyspace::RoomStateDelta`]. The stream id is big-endian after the
+/// room, as in [`room_stream`], so a scan starts at a client's token.
+#[must_use]
+pub fn room_state_delta(room_id: &str, stream_id: u64) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::RoomStateDelta, room_id);
+    key.extend_from_slice(&stream_id.to_be_bytes());
+    key
+}
+
+/// The prefix every current-state delta row for one room shares.
+#[must_use]
+pub fn room_state_delta_prefix(room_id: &str) -> Vec<u8> {
+    room_prefix(Keyspace::RoomStateDelta, room_id)
 }
 
 /// The prefix every reverse-index row for one room shares.
@@ -1040,6 +1305,24 @@ pub fn account_data_stream_prefix(user_id: &str, room_id: &str) -> Vec<u8> {
     key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(room);
     key
+}
+
+/// The prefix every account-data stream mark of one user shares, global and
+/// per-room together: one scan answers which rooms' data moved.
+#[must_use]
+pub fn account_data_stream_user_prefix(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::AccountDataStream, user_id)
+}
+
+/// The room an [`account_data_stream`] key of `user_id` names, empty for
+/// the global kind. `None` unless the key belongs to that user.
+#[must_use]
+pub fn account_data_stream_room<'a>(user_id: &str, key: &'a [u8]) -> Option<&'a str> {
+    let prefix = account_data_stream_user_prefix(user_id);
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let (len, rest) = rest.split_first_chunk::<2>()?;
+    let room = rest.get(..usize::from(u16::from_be_bytes(*len)))?;
+    std::str::from_utf8(room).ok()
 }
 
 /// The prefix every account-data key for one user and one room shares.
@@ -1172,6 +1455,14 @@ pub fn user_email_prefix(localpart: &str) -> Vec<u8> {
 pub fn email_owner(address: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::EmailOwner as u8];
     key.extend_from_slice(address.as_bytes());
+    key
+}
+
+/// The account link of one upstream identity ([`Keyspace::UpstreamLink`]).
+#[must_use]
+pub fn upstream_link(provider: &str, subject: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::UpstreamLink, provider);
+    key.extend_from_slice(subject.as_bytes());
     key
 }
 
@@ -1376,6 +1667,14 @@ pub fn sticky_parts(key: &[u8], room_id: &str) -> Option<(u64, String)> {
     Some((expires, event_id))
 }
 
+/// Where a room's event body is stored, by room and event ID.
+#[must_use]
+pub fn event_body(room_id: &str, event_id: &str) -> Vec<u8> {
+    let mut key = room_prefix(Keyspace::EventIndex, room_id);
+    key.extend_from_slice(event_id.as_bytes());
+    key
+}
+
 /// `(destination, seq)` key for [`Keyspace::FederationOutbox`].
 #[must_use]
 pub fn federation_outbox(destination: &str, seq: u64) -> Vec<u8> {
@@ -1409,6 +1708,96 @@ pub fn federation_outbox_destination(key: &[u8]) -> Option<String> {
     String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
 }
 
+/// `(destination, seq)` key for [`Keyspace::EduOutbox`]: framed like
+/// [`federation_outbox`], so one destination's rows sort together and in
+/// the order they were queued.
+#[must_use]
+pub fn edu_outbox(destination: &str, seq: u64) -> Vec<u8> {
+    let mut key = edu_outbox_prefix(destination);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The scan prefix for one destination's [`Keyspace::EduOutbox`] rows.
+#[must_use]
+pub fn edu_outbox_prefix(destination: &str) -> Vec<u8> {
+    let mut key = edu_outbox_all();
+    let (len, bytes) = framed(destination.as_bytes());
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(bytes);
+    key
+}
+
+/// The scan prefix covering every destination's [`Keyspace::EduOutbox`] rows.
+#[must_use]
+pub fn edu_outbox_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::EduOutbox as u8]
+}
+
+/// The row holding the next sequence [`edu_outbox`] issues for
+/// `destination`: the bare destination prefix, so it sorts before that
+/// destination's rows and is no row itself ([`edu_outbox_parts`] skips
+/// it). It outlives the queue draining, because transaction IDs are built
+/// from these sequences and one reused for different EDUs would be taken
+/// for a replay and dropped by the peer.
+#[must_use]
+pub fn edu_outbox_next(destination: &str) -> Vec<u8> {
+    edu_outbox_prefix(destination)
+}
+
+/// The destination and sequence an [`edu_outbox`] key names.
+#[must_use]
+pub fn edu_outbox_parts(key: &[u8]) -> Option<(String, u64)> {
+    let rest = key.strip_prefix(edu_outbox_all().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    let destination = String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()?;
+    let seq = u64::from_be_bytes(rest.get(2 + len..)?.try_into().ok()?);
+    Some((destination, seq))
+}
+
+/// `destination` key for [`Keyspace::DestinationRetry`]: the name is the
+/// whole rest of the key, as nothing sorts under it.
+#[must_use]
+pub fn destination_retry(destination: &str) -> Vec<u8> {
+    let mut key = destination_retry_all();
+    key.extend_from_slice(destination.as_bytes());
+    key
+}
+
+/// The scan prefix covering every [`Keyspace::DestinationRetry`] row.
+#[must_use]
+pub fn destination_retry_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::DestinationRetry as u8]
+}
+
+/// The destination a [`destination_retry`] key names.
+#[must_use]
+pub fn destination_retry_name(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(destination_retry_all().as_slice())?;
+    String::from_utf8(rest.to_vec()).ok()
+}
+
+/// `seq` key for [`Keyspace::PushPending`].
+#[must_use]
+pub fn push_pending(seq: u64) -> Vec<u8> {
+    let mut key = push_pending_all();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The scan prefix covering every [`Keyspace::PushPending`] row.
+#[must_use]
+pub fn push_pending_all() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::PushPending as u8]
+}
+
+/// The sequence a [`push_pending`] key names.
+#[must_use]
+pub fn push_pending_seq(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(push_pending_all().as_slice())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
 /// `(origin, txn_id)` key for [`Keyspace::FederationTxn`].
 #[must_use]
 pub fn federation_txn(origin: &str, txn_id: &str) -> Vec<u8> {
@@ -1422,6 +1811,18 @@ pub fn federation_txn(origin: &str, txn_id: &str) -> Vec<u8> {
     key
 }
 
+/// The scan prefix covering every [`Keyspace::FederationTxn`] row one origin
+/// wrote, and no other origin's: the origin is length-framed, so a name that
+/// is a prefix of another does not match it (#814).
+#[must_use]
+pub fn federation_txn_origin(origin: &str) -> Vec<u8> {
+    let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::FederationTxn as u8];
+    let (len, bytes) = framed(origin.as_bytes());
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(bytes);
+    key
+}
+
 /// The scan prefix covering every user's [`Keyspace::DeviceListChange`] row.
 #[must_use]
 pub fn device_list_change_prefix() -> Vec<u8> {
@@ -1432,6 +1833,18 @@ pub fn device_list_change_prefix() -> Vec<u8> {
 #[must_use]
 pub fn device_list_change(user_id: &str) -> Vec<u8> {
     user_prefix(Keyspace::DeviceListChange, user_id)
+}
+
+/// `user_id` key for [`Keyspace::DeviceListOutbound`].
+#[must_use]
+pub fn device_list_outbound(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::DeviceListOutbound, user_id)
+}
+
+/// `user_id` key for [`Keyspace::DeviceListInbound`].
+#[must_use]
+pub fn device_list_inbound(user_id: &str) -> Vec<u8> {
+    user_prefix(Keyspace::DeviceListInbound, user_id)
 }
 
 /// The user ID a [`Keyspace::DeviceListChange`] key names.
@@ -1629,4 +2042,50 @@ pub fn delay_echo(user_id: &str, event_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn presence(user_id: &str) -> Vec<u8> {
     user_prefix(Keyspace::Presence, user_id)
+}
+
+/// Every presence row, for the one scan that seeds the sweeper.
+#[must_use]
+pub fn presence_prefix() -> Vec<u8> {
+    keyspace_prefix(Keyspace::Presence)
+}
+
+/// The user a [`presence`] key names.
+#[must_use]
+pub fn presence_user(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(presence_prefix().as_slice())?;
+    let len = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+    String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()
+}
+
+/// One [`Keyspace::PresenceStream`] row: the position, then the user.
+#[must_use]
+pub fn presence_stream(position: u64, user_id: &str) -> Vec<u8> {
+    let mut key = presence_stream_at(position);
+    key.extend_from_slice(user_id.as_bytes());
+    key
+}
+
+/// Every [`Keyspace::PresenceStream`] row.
+#[must_use]
+pub fn presence_stream_prefix() -> Vec<u8> {
+    keyspace_prefix(Keyspace::PresenceStream)
+}
+
+/// Where the rows at `position` begin: a range bound for
+/// [`presence_stream`] scans, inclusive as a start, exclusive as an end.
+#[must_use]
+pub fn presence_stream_at(position: u64) -> Vec<u8> {
+    let mut key = presence_stream_prefix();
+    key.extend_from_slice(&position.to_be_bytes());
+    key
+}
+
+/// Read a [`presence_stream`] key back: `(position, user_id)`.
+#[must_use]
+pub fn presence_stream_parts(key: &[u8]) -> Option<(u64, String)> {
+    let rest = key.strip_prefix(presence_stream_prefix().as_slice())?;
+    let position: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let user = String::from_utf8(rest.get(8..)?.to_vec()).ok()?;
+    Some((u64::from_be_bytes(position), user))
 }

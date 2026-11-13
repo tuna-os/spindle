@@ -1,0 +1,24 @@
+# The built-in LiveKit minter in place of upstream's lk-jwt-service in the
+# first seat (#796): an override on top of docker-compose-spindle.yml, added
+# by run.sh when SPINDLE_RTC=builtin. docker-compose-builtin-rtc-othersite.yml
+# does the same for the second seat when it is a Spindle too.
+#
+# The Spindle gets the config with `[rtc.livekit]` and no appservice
+# registration, so it advertises itself as the transport and mints with
+# upstream's SFU key. nginx and the first SFU get copies of upstream's own
+# config that run.sh writes under backend/spindle-builtin-rtc/ with two
+# changes: nginx also proxies `/_spindle/rtc/livekit` to the homeservers
+# (upstream proxies only `/_matrix` and `/_synapse`), and the SFU sends its
+# webhooks to its homeserver instead of to lk-jwt-service. The
+# lk-jwt-service still starts, as upstream's compose file has it, and
+# nothing asks it anything.
+services:
+  synapse:
+    volumes:
+      - ${SPINDLE_CONTRIB:-.}/spindle-builtin-rtc.toml:/cfg/spindle.toml:ro,Z
+  nginx:
+    volumes:
+      - ./backend/spindle-builtin-rtc/dev_nginx.conf:/etc/nginx/conf.d/default.conf:Z
+  livekit:
+    volumes:
+      - ./backend/spindle-builtin-rtc/dev_livekit.yaml:/etc/livekit.yaml:Z

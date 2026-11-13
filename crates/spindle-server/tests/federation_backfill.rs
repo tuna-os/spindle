@@ -556,3 +556,73 @@ async fn pulled_history_is_pdus_that_hash_to_their_ids() {
         assert_eq!(ids, expected, "{what}");
     }
 }
+
+/// An erased local user's history reaches another server redacted on all
+/// three reads, whatever that server's membership, as Synapse's
+/// `filter_events_for_server` serves it with `filter_out_erased_senders`
+/// (#576). The redacted PDU keeps its signatures and still hashes to its
+/// ID, so the peer accepts it; anyone else's events go out whole.
+#[tokio::test]
+async fn an_erased_senders_history_reaches_peers_redacted() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let carol = harness.register("carol").await;
+    let room = harness.shared_room(&alice, &peer).await;
+    let (status, body) = harness
+        .send(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/join"),
+            &carol,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = harness.say(&room, &carol, "before").await;
+    let secret = harness.say(&room, &alice, "erasure-secret").await;
+    let last = harness.say(&room, &carol, "kept").await;
+    spindle_server::accounts::Accounts::new(harness.store.as_ref(), "example.org")
+        .set_erased("alice", true)
+        .unwrap();
+
+    let (status, event) = harness
+        .federation_get(&peer, &format!("/_matrix/federation/v1/event/{secret}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{event}");
+    let (status, backfill) = harness
+        .federation_get(
+            &peer,
+            &format!("/_matrix/federation/v1/backfill/{room}?v={last}&limit=3"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{backfill}");
+    let (status, missing) = harness
+        .federation_post(
+            &peer,
+            &format!("/_matrix/federation/v1/get_missing_events/{room}"),
+            &json!({ "earliest_events": [first], "latest_events": [last], "limit": 10 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+
+    for (what, pdus) in [
+        ("event", &event["pdus"]),
+        ("backfill", &backfill["pdus"]),
+        ("get_missing_events", &missing["events"]),
+    ] {
+        assert!(
+            !pdus.to_string().contains("erasure-secret"),
+            "{what} served the erased content: {pdus}"
+        );
+        let pdu = pdus
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pdu| reference_id(pdu) == secret)
+            .unwrap_or_else(|| panic!("{what} did not serve the erased event: {pdus}"));
+        assert_eq!(pdu["content"], json!({}), "{what}");
+        assert!(pdu["signatures"]["example.org"].is_object(), "{what}");
+        assert!(pdu["hashes"]["sha256"].is_string(), "{what}");
+    }
+    assert_eq!(bodies(&backfill["pdus"]), ["kept", "before"], "{backfill}");
+}

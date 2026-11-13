@@ -6,7 +6,8 @@ name: Release
 # attestation pushed beside it. The attestations are what let somebody
 # check that an artifact really came from this workflow on this commit
 # (`gh attestation verify`, see docs/releasing.md) rather than trusting
-# the file name; the SBOM says what is inside it.
+# the file name; the SBOM says what is inside it. Both the tarballs and
+# the image carry the offline importers in FEATURES below.
 # ROADMAP.md is the contract for what a tag means; v0.0.x is a prerelease
 # that promises nothing, and this workflow marks every v0.* tag as one.
 #
@@ -42,29 +43,45 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Read-only by default. Each job below names the grants it uses and no
+# more (#599), so a compromised step in the build cannot push a tag and
+# the step that pushes the tag cannot sign anything.
 permissions:
-  contents: write
-  packages: write
-  # Sigstore signs the attestations with a short-lived certificate tied to
-  # this workflow's OIDC identity; `attestations` is where GitHub stores
-  # them so `gh attestation verify` can find them.
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo features of every release artifact, tarball and image alike. The
+  # Dockerfile's FEATURES default is the same value, so a local build of
+  # the image matches the published one.
+  #
+  # `mas-import` is `spindle import-mas` (#802), the MAS-to-built-in
+  # cutover. `synapse-import` is `spindle import-synapse` (#240, #563,
+  # #826), the Synapse migration. An importer opens the store, so it must
+  # be the same build as the server: in the release itself, not in a
+  # variant image that an operator must match by tag. The two features add
+  # a pure-Rust PostgreSQL client and a bundled SQLite (one C file, a
+  # short extra build and about a megabyte of binary). Both run in
+  # offline commands only. The server code that `synapse-import` gates is
+  # the importer's own write path (`persist_synapse_*` in rooms/mod.rs);
+  # no request handler calls it.
+  FEATURES: mas-import,synapse-import
 
 jobs:
   cut:
     name: Decide the tag
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Reads CI's check runs on the candidate commit, then pushes the tag.
+    permissions:
+      contents: write
+      checks: read
     outputs:
       tag: ${{ steps.decide.outputs.tag }}
       sha: ${{ steps.decide.outputs.sha }}
       previous: ${{ steps.decide.outputs.previous }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1  # zizmor: ignore[artipacked] release-cut.sh pushes the tag with these credentials
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -76,11 +93,14 @@ jobs:
         run: scripts/release-cut.sh
       - name: Tag
         if: github.event_name != 'push' && steps.decide.outputs.tag != '' && !inputs.dry_run
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+          SHA: ${{ steps.decide.outputs.sha }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.decide.outputs.tag }}" -m "${{ steps.decide.outputs.tag }}: an addressable prerelease" "${{ steps.decide.outputs.sha }}"
-          git push origin "refs/tags/${{ steps.decide.outputs.tag }}"
+          git tag -a "$TAG" -m "$TAG: an addressable prerelease" "$SHA"
+          git push origin "refs/tags/$TAG"
 
   binaries:
     name: Build ${{ matrix.target }}
@@ -88,8 +108,16 @@ jobs:
     if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    # Sigstore signs the attestations with a short-lived certificate tied
+    # to this workflow's OIDC identity; `attestations` is where GitHub
+    # stores them so `gh attestation verify` can find them.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
+      TARGET: ${{ matrix.target }}
     strategy:
       matrix:
         include:
@@ -98,19 +126,31 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ needs.cut.outputs.sha }}
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
       - name: Build
-        run: cargo build --release -p spindle-server --bin spindle --locked
+        run: cargo build --release -p spindle-server --bin spindle --locked --features "$FEATURES"
+      # The importers are in the tarball (#802, #826): without the feature
+      # a command prints a rebuild hint and not its usage line.
+      - name: Check the importers are in the binary
+        run: |
+          usage=$(target/release/spindle import-mas 2>&1 || true)
+          grep -q 'usage: spindle import-mas' <<<"$usage"
+          usage=$(target/release/spindle import-synapse 2>&1 || true)
+          grep -q 'usage: spindle import-synapse' <<<"$usage"
       - name: Package
         run: |
-          name="spindle-${TAG}-${{ matrix.target }}"
+          name="spindle-${TAG}-${TARGET}"
           mkdir -p "dist/$name"
           cp target/release/spindle LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          # The unit and the example config, so the tarball alone can be
+          # installed as a service (docs/deploy.md, #825).
+          cp deploy/systemd/spindle.service spindle.example.toml "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -118,7 +158,7 @@ jobs:
       # The SBOM is read from the tree, so it names every crate Cargo.lock
       # pinned for this build, not just what a scanner can see in a binary.
       - name: Write the SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@v0.24.3
         with:
           path: .
           format: spdx-json
@@ -126,15 +166,15 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Attest the provenance of the tarball
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: dist/*.tar.gz
       - name: Attest the SBOM to the tarball
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest-sbom@v4.1.0
         with:
           subject-path: dist/*.tar.gz
           sbom-path: dist/${{ steps.package.outputs.name }}.spdx.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.target }}
           path: |
@@ -148,8 +188,15 @@ jobs:
     if: needs.cut.outputs.tag != '' && !inputs.dry_run
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    # Pushes the image, and its attestation beside it in the registry.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
+      ARCH: ${{ matrix.arch }}
     strategy:
       matrix:
         include:
@@ -158,16 +205,24 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ needs.cut.outputs.sha }}
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build and push the per-architecture image
         id: push
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${{ matrix.arch }}"
-          docker build -t "$image" .
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-${ARCH}"
+          docker build --build-arg FEATURES="$FEATURES" -t "$image" .
+          # The importers are in the image (#802, #826), checked before the push.
+          usage=$(docker run --rm "$image" import-mas 2>&1 || true)
+          grep -q 'usage: spindle import-mas' <<<"$usage"
+          usage=$(docker run --rm "$image" import-synapse 2>&1 || true)
+          grep -q 'usage: spindle import-synapse' <<<"$usage"
           docker push "$image"
           # The digest is the subject of the attestation: a tag can be moved,
           # a digest cannot.
@@ -176,50 +231,169 @@ jobs:
       # Pushed to the registry beside the image, so `gh attestation verify
       # oci://...` finds it without the release page.
       - name: Attest the provenance of the image
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+  # .deb and .rpm from the tarball's binary (#825). Packaging is a separate
+  # job and `continue-on-error`, and `publish` does not require it to pass:
+  # a broken packaging step (these tools have not yet run in this workflow)
+  # must never hold back the tarballs and the image. When it fails, the
+  # release has no packages and says nothing about them.
+  packages:
+    name: Packages for ${{ matrix.arch }}
+    needs: [cut, binaries]
+    if: needs.cut.outputs.tag != '' && !inputs.dry_run
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.cut.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      DEB_ARCH: ${{ matrix.deb }}
+      RPM_ARCH: ${{ matrix.rpm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            deb: amd64
+            rpm: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb: arm64
+            rpm: aarch64
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.cut.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.90.0
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: tarball
+      - name: Install the packaging tools
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      # The packages carry the tarball's binary, not a second build.
+      - name: Stage the files
+        run: |
+          mkdir -p target/release target/pkg dist
+          tar -xzf "tarball/spindle-${TAG}-${TARGET}.tar.gz" -C tarball
+          install -m 0755 "tarball/spindle-${TAG}-${TARGET}/spindle" target/release/spindle
+          # The tarball unit starts /usr/local/bin/spindle; a package installs /usr/bin.
+          sed 's|^ExecStart=/usr/local/bin/spindle |ExecStart=/usr/bin/spindle |' \
+            deploy/systemd/spindle.service > target/pkg/spindle.service
+          grep -q '^ExecStart=/usr/bin/spindle ' target/pkg/spindle.service
+      - name: Build the packages
+        run: |
+          version="${TAG#v}"
+          cargo deb -p spindle-server --no-build --deb-version "$version" \
+            --output "dist/spindle-${TAG}-${DEB_ARCH}.deb"
+          cargo generate-rpm -p crates/spindle-server \
+            --set-metadata "version = \"$version\"" \
+            --output "dist/spindle-${TAG}-${RPM_ARCH}.rpm"
+      - name: Check the packages hold what they should
+        run: |
+          deb="dist/spindle-${TAG}-${DEB_ARCH}.deb"
+          rpm="dist/spindle-${TAG}-${RPM_ARCH}.rpm"
+          dpkg-deb --contents "$deb" | tee deb.list
+          dpkg-deb --info "$deb"
+          for f in ./usr/bin/spindle ./usr/lib/systemd/system/spindle.service \
+                   ./etc/spindle/spindle.toml ./usr/share/doc/spindle/LICENSE-MIT \
+                   ./usr/share/doc/spindle/LICENSE-APACHE; do
+            grep -q " $f\$" deb.list
+          done
+          dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./conffiles | grep -qx /etc/spindle/spindle.toml
+          rpm -qlp "$rpm" | tee rpm.list
+          for f in /usr/bin/spindle /usr/lib/systemd/system/spindle.service \
+                   /etc/spindle/spindle.toml /usr/share/doc/spindle/LICENSE-MIT \
+                   /usr/share/doc/spindle/LICENSE-APACHE; do
+            grep -qx "$f" rpm.list
+          done
+          rpm -qcp "$rpm" | grep -qx /etc/spindle/spindle.toml
+      - name: Checksum
+        run: |
+          cd dist
+          for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done
+      - name: Attest the provenance of the packages
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: packages-${{ matrix.target }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.sha256
+
   publish:
     name: Publish the release
-    needs: [cut, binaries, image]
+    # `packages` is listed so its artifacts are ready when it succeeds, but
+    # the `if` below ignores its result: a failed or skipped packaging job
+    # still lets the release go out without .deb and .rpm files.
+    needs: [cut, binaries, image, packages]
+    if: ${{ !cancelled() && needs.cut.result == 'success' && needs.binaries.result == 'success' && needs.image.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Pushes the multi-architecture tag and creates the release.
+    permissions:
+      contents: write
+      packages: write
     env:
       TAG: ${{ needs.cut.outputs.tag }}
       SHA: ${{ needs.cut.outputs.sha }}
       PREVIOUS: ${{ needs.cut.outputs.previous }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1  # zizmor: ignore[artipacked] a later step creates the GitHub release with gh
         with:
           ref: ${{ needs.cut.outputs.sha }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
           merge-multiple: true
       - name: Log in to the registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Join the per-architecture images under the tag
+        id: manifest
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           docker manifest create "$image:${TAG}" \
             "$image:${TAG}-amd64" "$image:${TAG}-arm64"
-          docker manifest push "$image:${TAG}"
+          # The digest goes into the notes, so a deployment can pin it.
+          digest=$(docker manifest push "$image:${TAG}")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Write the notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           {
             echo "Built from \`${SHA}\`."
             echo
-            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}\` (amd64, arm64)."
+            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}@${DIGEST}\` (amd64, arm64)."
+            echo
+            echo "The tarballs and the image include \`spindle import-mas\`, the MAS importer (docs/delegated-auth.md), and \`spindle import-synapse\`, the Synapse importer (docs/migration-workspace.md)."
             echo
             echo "Every tarball and both images carry a Sigstore-signed provenance attestation, and each tarball an SBOM (\`.spdx.json\`) attested to it. To check one came from this workflow on this commit:"
             echo
             echo '```'
             echo "gh attestation verify spindle-${TAG}-x86_64-unknown-linux-gnu.tar.gz --repo ${GITHUB_REPOSITORY}"
+            echo "# The .deb and .rpm files, when the release has them, verify the same way."
             echo "gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY,,}:${TAG} --repo ${GITHUB_REPOSITORY}"
             echo '```'
             echo
@@ -252,6 +426,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Packages exist only if the packaging job passed; the glob must
+          # not turn a missing .deb into an error.
+          shopt -s nullglob
+          packages=(dist/*.deb dist/*.rpm)
           prerelease=""
           case "$TAG" in v0.*) prerelease="--prerelease" ;; esac
-          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md $prerelease dist/*.tar.gz dist/*.sha256 dist/*.spdx.json "${packages[@]}"

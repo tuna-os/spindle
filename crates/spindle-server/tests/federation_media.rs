@@ -6,30 +6,54 @@
 //! repeat downloads, thumbnails — is served from local storage.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 
-/// One full homeserver on a real TCP listener, named by its own address.
+/// One full homeserver on a real TCP listener, named by its own address,
+/// counting every request it is sent.
 struct Instance {
-    _dir: TempDir,
+    dir: TempDir,
     name: String,
     client: reqwest::Client,
+    store: Arc<FjallStore>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with("enabled = false", "").await
+    }
+
+    /// `ratelimit` is the body of `[ratelimit]`; `media` the body of
+    /// `[media]`, empty for the defaults.
+    async fn start_with(ratelimit: &str, media: &str) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        // The storage path too, not only the store: uploads and fetched
+        // remote media land under `<storage.path>/media`, and the default
+        // `./data` is the crate's source tree.
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
+            "[server]\nname = \"{name}\"\n[storage]\npath = \"{}\"\n\
+             [ratelimit]\n{ratelimit}\n[media]\n{media}\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
+            dir.path().display(),
         ))
         .unwrap();
-        let app = spindle_server::app(config, store).expect("the app builds");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let app = spindle_server::app(config, Arc::clone(&store))
+            .expect("the app builds")
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    next.run(request)
+                },
+            ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -39,9 +63,11 @@ impl Instance {
             .unwrap();
         });
         Instance {
-            _dir: dir,
+            dir,
             name,
             client: reqwest::Client::new(),
+            store,
+            requests,
         }
     }
 
@@ -63,6 +89,55 @@ impl Instance {
             .unwrap();
         let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
         body["access_token"].as_str().unwrap().to_owned()
+    }
+
+    /// Make `localpart` a server admin, as the CLI does offline.
+    fn promote(&self, localpart: &str) {
+        assert!(
+            spindle_server::accounts::Accounts::new(self.store.as_ref(), &self.name)
+                .set_admin(localpart, true)
+                .unwrap()
+        );
+    }
+
+    async fn admin_post(&self, token: &str, path: &str) -> (u16, Value) {
+        let response = self
+            .client
+            .post(format!("http://{}{path}", self.name))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// The status of every route that serves `server`/`media_id` to a
+    /// client, authenticated and legacy, download and thumbnail.
+    async fn client_statuses(&self, token: &str, server: &str, media_id: &str) -> Vec<u16> {
+        let paths = [
+            format!("/_matrix/client/v1/media/download/{server}/{media_id}"),
+            format!("/_matrix/client/v1/media/download/{server}/{media_id}/n.png"),
+            format!("/_matrix/client/v1/media/thumbnail/{server}/{media_id}?width=32&height=32"),
+            format!("/_matrix/media/v3/download/{server}/{media_id}"),
+            format!("/_matrix/media/v3/download/{server}/{media_id}/n.png"),
+            format!("/_matrix/media/v3/thumbnail/{server}/{media_id}?width=32&height=32"),
+        ];
+        let mut out = Vec::new();
+        for path in paths {
+            let response = self
+                .client
+                .get(format!("http://{}{path}", self.name))
+                .header("authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap();
+            out.push(response.status().as_u16());
+        }
+        out
     }
 
     async fn upload(&self, token: &str, content_type: &str, name: &str, bytes: &[u8]) -> String {
@@ -104,6 +179,21 @@ impl Instance {
             .to_owned();
         let bytes = response.bytes().await.unwrap().to_vec();
         (status, content_type, bytes)
+    }
+
+    /// An unauthenticated `GET` of `path`: status, the body parsed (or
+    /// `Value::Null` when it is not JSON), and the raw bytes.
+    async fn get(&self, path: &str) -> (u16, Value, Vec<u8>) {
+        let response = self
+            .client
+            .get(format!("http://{}{path}", self.name))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.unwrap().to_vec();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body, bytes)
     }
 }
 
@@ -202,4 +292,478 @@ async fn media_nobody_has_stays_a_404_not_a_fabrication() {
     // or a fabricated empty file.
     let (status, _, _) = mirror.download(&bob, "127.0.0.1:9", "whatever").await;
     assert_eq!(status, 404);
+}
+
+/// The frozen unauthenticated routes never fetch: remote media this server
+/// has not cached is a plain 404 that names no peer, and the peer is not
+/// asked. Once an authenticated download has cached it, they serve it.
+#[tokio::test]
+async fn the_legacy_routes_serve_cached_remote_media_and_never_fetch_it() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let media_id = origin
+        .upload(&alice, "image/png", "photo.png", &small_png())
+        .await;
+    let legacy = [
+        format!("/_matrix/media/v3/download/{}/{media_id}", origin.name),
+        format!(
+            "/_matrix/media/v3/download/{}/{media_id}/photo.png",
+            origin.name
+        ),
+        format!(
+            "/_matrix/media/v3/thumbnail/{}/{media_id}?width=32&height=32",
+            origin.name
+        ),
+    ];
+
+    let before = origin.requests.load(Ordering::SeqCst);
+    for path in &legacy {
+        let (status, body, _) = mirror.get(path).await;
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "{path}: {body}");
+        assert!(
+            !body["error"].as_str().unwrap().contains(&origin.name),
+            "the answer names no peer: {body}"
+        );
+    }
+    assert_eq!(
+        origin.requests.load(Ordering::SeqCst),
+        before,
+        "an unauthenticated request made no federation request"
+    );
+
+    // A peer that is not there gets the same plain answer: no fetch is
+    // tried, so there is no federation error to repeat.
+    let (status, body, _) = mirror
+        .get("/_matrix/media/v3/download/127.0.0.1:9/whatever")
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+    assert!(
+        !body["error"].as_str().unwrap().contains("127.0.0.1:9"),
+        "{body}"
+    );
+
+    // An authenticated download fetches the file and caches it...
+    let (status, _, bytes) = mirror.download(&bob, &origin.name, &media_id).await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, small_png());
+    let after_fetch = origin.requests.load(Ordering::SeqCst);
+    assert!(after_fetch > before, "the authenticated route fetched");
+
+    // ...and from then on the legacy routes serve it, from the cache.
+    for path in &legacy[..2] {
+        let (status, _, bytes) = mirror.get(path).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(bytes, small_png(), "{path}");
+    }
+    let (status, _, bytes) = mirror.get(&legacy[2]).await;
+    assert_eq!(status, 200);
+    image::load_from_memory(&bytes).expect("a decodable thumbnail");
+    assert_eq!(
+        origin.requests.load(Ordering::SeqCst),
+        after_fetch,
+        "the legacy routes served the cached copy"
+    );
+}
+
+/// A quarantined item is a 404 on every route that serves it, including to
+/// a peer over federation, and quarantining a remote item stops it being
+/// fetched again.
+#[tokio::test]
+async fn quarantined_media_is_served_nowhere_and_never_refetched() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let root = origin.register("root").await;
+    origin.promote("root");
+    let bob = mirror.register("bob").await;
+    let media_id = origin
+        .upload(&alice, "image/png", "photo.png", &small_png())
+        .await;
+    assert_eq!(
+        origin
+            .client_statuses(&alice, &origin.name, &media_id)
+            .await,
+        [200; 6]
+    );
+
+    let (status, body) = origin
+        .admin_post(
+            &root,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/{media_id}",
+                origin.name
+            ),
+        )
+        .await;
+    assert_eq!((status, &body), (200, &json!({})));
+    assert_eq!(
+        origin
+            .client_statuses(&alice, &origin.name, &media_id)
+            .await,
+        [404; 6],
+        "the origin's own client routes"
+    );
+    // The peer asks over federation: the origin must not send it.
+    let (status, _, _) = mirror.download(&bob, &origin.name, &media_id).await;
+    assert_eq!(status, 404, "not sent again over federation");
+
+    // Released, it is served again; then cached by the mirror.
+    origin
+        .admin_post(
+            &root,
+            &format!(
+                "/_synapse/admin/v1/media/unquarantine/{}/{media_id}",
+                origin.name
+            ),
+        )
+        .await;
+    let (status, _, _) = mirror.download(&bob, &origin.name, &media_id).await;
+    assert_eq!(status, 200);
+
+    // The mirror's admin quarantines its cached copy of the remote item.
+    mirror.promote("bob");
+    let (status, body) = mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/{media_id}",
+                origin.name
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        mirror.client_statuses(&bob, &origin.name, &media_id).await,
+        [404; 6]
+    );
+
+    // An item never cached can be quarantined too, and is not fetched.
+    let other = origin
+        .upload(&alice, "image/png", "other.png", &small_png())
+        .await;
+    mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/{other}",
+                origin.name
+            ),
+        )
+        .await;
+    let before = origin.requests.load(Ordering::SeqCst);
+    assert_eq!(
+        mirror.client_statuses(&bob, &origin.name, &other).await,
+        [404; 6]
+    );
+    assert_eq!(
+        origin.requests.load(Ordering::SeqCst),
+        before,
+        "a quarantined remote item is not fetched"
+    );
+}
+
+/// The cache purge removes cached remote media older than `before_ts` and
+/// nothing else: not newer cache entries, not local uploads, and not a
+/// quarantined item.
+#[tokio::test]
+async fn purging_the_cache_removes_only_old_remote_media() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    mirror.promote("bob");
+    let remote = origin
+        .upload(&alice, "image/png", "photo.png", &small_png())
+        .await;
+    let held = origin
+        .upload(&alice, "image/png", "held.png", &small_png())
+        .await;
+    let local = mirror
+        .upload(&bob, "image/png", "mine.png", &small_png())
+        .await;
+    for id in [&remote, &held] {
+        assert_eq!(mirror.download(&bob, &origin.name, id).await.0, 200);
+    }
+    mirror
+        .admin_post(
+            &bob,
+            &format!("/_synapse/admin/v1/media/quarantine/{}/{held}", origin.name),
+        )
+        .await;
+
+    let (status, body) = mirror
+        .admin_post(&bob, "/_synapse/admin/v1/purge_media_cache")
+        .await;
+    assert_eq!(status, 400, "before_ts is required: {body}");
+    // Nothing was cached before the epoch.
+    let (_, body) = mirror
+        .admin_post(&bob, "/_synapse/admin/v1/purge_media_cache?before_ts=1")
+        .await;
+    assert_eq!(body, json!({ "deleted": 0 }));
+    assert_eq!(
+        mirror.client_statuses(&bob, &origin.name, &remote).await,
+        [200; 6]
+    );
+
+    let (_, body) = mirror
+        .admin_post(
+            &bob,
+            "/_spindle/admin/v1/purge_media_cache?before_ts=99999999999999",
+        )
+        .await;
+    assert_eq!(body, json!({ "deleted": 1 }), "only the unquarantined copy");
+    // Legacy routes never fetch, so a 404 there means it is gone.
+    let (status, _, _) = mirror
+        .get(&format!(
+            "/_matrix/media/v3/download/{}/{remote}",
+            origin.name
+        ))
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        mirror.client_statuses(&bob, &mirror.name, &local).await,
+        [200; 6],
+        "this server's own upload stays"
+    );
+}
+
+/// A protected cached item survives the purge and is still served; once
+/// unprotected the same purge removes it. The actions are audited.
+#[tokio::test]
+async fn purging_the_cache_spares_protected_media_until_it_is_unprotected() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start().await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    mirror.promote("bob");
+    let plain = origin
+        .upload(&alice, "image/png", "plain.png", &small_png())
+        .await;
+    let kept = origin
+        .upload(&alice, "image/png", "kept.png", &small_png())
+        .await;
+    for id in [&plain, &kept] {
+        assert_eq!(mirror.download(&bob, &origin.name, id).await.0, 200);
+    }
+    let (status, body) = mirror
+        .admin_post(
+            &bob,
+            &format!("/_spindle/admin/v1/media/protect/{}/{kept}", origin.name),
+        )
+        .await;
+    assert_eq!((status, &body), (200, &json!({})));
+    let (status, _) = mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_spindle/admin/v1/media/protect/{}/neverfetched",
+                origin.name
+            ),
+        )
+        .await;
+    assert_eq!(status, 404, "an uncached remote item cannot be protected");
+
+    let purge = "/_synapse/admin/v1/purge_media_cache?before_ts=99999999999999";
+    let (_, body) = mirror.admin_post(&bob, purge).await;
+    assert_eq!(body, json!({ "deleted": 1 }), "only the unprotected copy");
+    assert_eq!(
+        mirror.client_statuses(&bob, &origin.name, &kept).await,
+        [200; 6],
+        "a protected item is still served"
+    );
+
+    let (status, _) = mirror
+        .admin_post(
+            &bob,
+            &format!("/_synapse/admin/v1/media/unprotect/{}/{kept}", origin.name),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, body) = mirror.admin_post(&bob, purge).await;
+    assert_eq!(
+        body,
+        json!({ "deleted": 1 }),
+        "unprotected, it is removable"
+    );
+}
+
+/// Distinct bytes of `len` bytes, so each upload is its own blob.
+fn blob(seed: u8, len: usize) -> Vec<u8> {
+    vec![seed; len]
+}
+
+/// How many blob files the instance's local media directory holds.
+fn blob_files(instance: &Instance) -> usize {
+    fn walk(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() { walk(&path) } else { 1 }
+                })
+                .sum()
+        })
+    }
+    walk(&instance.dir.path().join("media"))
+}
+
+/// A fetch of remote media spends from the asking account's own budget:
+/// one account's flood is refused once the budget is spent, another account
+/// on the same server is not affected, and media already cached stays free.
+#[tokio::test]
+async fn a_remote_media_flood_from_one_account_is_refused_and_others_are_not() {
+    let origin = Instance::start().await;
+    // Burst of 3 and a refill too slow to matter inside the test.
+    let mirror =
+        Instance::start_with("remote_media = { per_second = 0.0001, burst = 3 }", "").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let carol = mirror.register("carol").await;
+    let mut ids = Vec::new();
+    for seed in 1..=6_u8 {
+        ids.push(
+            origin
+                .upload(&alice, "application/octet-stream", "f.bin", &blob(seed, 64))
+                .await,
+        );
+    }
+
+    let mut statuses = Vec::new();
+    for id in &ids {
+        statuses.push(mirror.download(&bob, &origin.name, id).await.0);
+    }
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 200).count(),
+        3,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 429).count(),
+        3,
+        "{statuses:?}"
+    );
+
+    // The refusal is the spec's rate-limit error.
+    let response = mirror
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/download/{}/{}",
+            mirror.name, origin.name, ids[5]
+        ))
+        .header("authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 429);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+
+    // Cached media costs nothing to read, budget or no budget.
+    let (status, _, _) = mirror.download(&bob, &origin.name, &ids[0]).await;
+    assert_eq!(status, 200, "a cache hit spends nothing");
+
+    // Another account has its own budget.
+    let (status, _, _) = mirror.download(&carol, &origin.name, &ids[5]).await;
+    assert_eq!(status, 200, "carol is not limited by bob's flood");
+}
+
+/// The remote cache holds to its byte cap, oldest first, and an eviction
+/// removes the record and the bytes together.
+#[tokio::test]
+async fn the_remote_cache_evicts_oldest_first_rows_and_bytes_together() {
+    let origin = Instance::start().await;
+    // Room for two 1000-byte items, not three.
+    let mirror = Instance::start_with("enabled = false", "remote_cache_max_bytes = 2500").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let mut ids = Vec::new();
+    for seed in 1..=3_u8 {
+        ids.push(
+            origin
+                .upload(
+                    &alice,
+                    "application/octet-stream",
+                    "f.bin",
+                    &blob(seed, 1000),
+                )
+                .await,
+        );
+    }
+
+    for (index, id) in ids.iter().enumerate() {
+        let (status, _, _) = mirror.download(&bob, &origin.name, id).await;
+        assert_eq!(status, 200);
+        if index == 1 {
+            assert_eq!(blob_files(&mirror), 2, "both fit");
+        }
+        // Records are ordered by the millisecond they arrived.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Only cached items answer on the legacy route, which never fetches:
+    // the record is the oldest's, gone; the two newest remain.
+    let cached = |id: &str| format!("/_matrix/media/v3/download/{}/{id}", origin.name);
+    assert_eq!(mirror.get(&cached(&ids[0])).await.0, 404, "oldest evicted");
+    assert_eq!(mirror.get(&cached(&ids[1])).await.0, 200);
+    assert_eq!(mirror.get(&cached(&ids[2])).await.0, 200);
+    assert_eq!(blob_files(&mirror), 2, "the evicted item's bytes are gone");
+}
+
+/// The size cap never removes a quarantined item, even when it is the
+/// oldest and the cache is over its cap: the operator holds it as evidence.
+#[tokio::test]
+async fn the_remote_cap_never_evicts_quarantined_media() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start_with("enabled = false", "remote_cache_max_bytes = 2500").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    mirror.promote("bob");
+    let mut ids = Vec::new();
+    for seed in 1..=4_u8 {
+        ids.push(
+            origin
+                .upload(
+                    &alice,
+                    "application/octet-stream",
+                    "f.bin",
+                    &blob(seed, 1000),
+                )
+                .await,
+        );
+    }
+
+    // The oldest cached item is quarantined before the cache fills.
+    let (status, _, _) = mirror.download(&bob, &origin.name, &ids[0]).await;
+    assert_eq!(status, 200);
+    let (status, body) = mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/{}",
+                origin.name, ids[0]
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    for id in &ids[1..] {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (status, _, _) = mirror.download(&bob, &origin.name, id).await;
+        assert_eq!(status, 200);
+    }
+
+    let held = |id: &str| {
+        let key = spindle_core::keys::media(&format!("{}/{id}", origin.name));
+        spindle_store::ReadView::get(mirror.store.as_ref(), &key)
+            .unwrap()
+            .is_some()
+    };
+    assert!(held(&ids[0]), "the quarantined item is kept");
+    assert!(!held(&ids[1]), "older unquarantined items went instead");
+    assert!(!held(&ids[2]));
+    assert!(held(&ids[3]), "the item just written stays");
 }

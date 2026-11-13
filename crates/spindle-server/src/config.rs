@@ -42,9 +42,16 @@ pub struct Config {
     #[serde(default)]
     pub push: PushConfig,
     #[serde(default)]
+    pub presence: PresenceConfig,
+    #[serde(default)]
     pub registration: RegistrationConfig,
     #[serde(default)]
     pub rooms: RoomsConfig,
+    /// History retention (#817). Off unless `enabled`.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Absent means this server sends no notices and the admin endpoint
     /// says so.
     #[serde(default)]
@@ -54,6 +61,18 @@ pub struct Config {
     /// link.
     #[serde(default)]
     pub email: Option<EmailConfig>,
+}
+
+/// `/search` (#830).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Keep a word index of `content.body` in the store and use it to
+    /// narrow `/search`. Results are the same either way. Off by default;
+    /// a room is searched through the index once `spindle reindex-search`
+    /// has built it, or from its first event on while this is on.
+    #[serde(default)]
+    pub index: bool,
 }
 
 /// How to reach the SMTP relay.
@@ -193,6 +212,137 @@ impl EmailConfig {
     }
 }
 
+fn default_terms_version() -> String {
+    "1".to_owned()
+}
+
+fn default_terms_name() -> String {
+    "Terms of Service".to_owned()
+}
+
+impl RegistrationConfig {
+    /// Whether registration is open to anyone who can reach the server: no
+    /// token is required.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        !self.require_token
+    }
+}
+
+/// Which service checks the CAPTCHA token. All three take the same request
+/// and give the same answer, so the choice only sets the default URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptchaProvider {
+    Recaptcha,
+    Hcaptcha,
+    Turnstile,
+}
+
+impl CaptchaProvider {
+    /// The provider's public verification endpoint.
+    #[must_use]
+    pub const fn verify_url(self) -> &'static str {
+        match self {
+            Self::Recaptcha => "https://www.google.com/recaptcha/api/siteverify",
+            Self::Hcaptcha => "https://api.hcaptcha.com/siteverify",
+            Self::Turnstile => "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        }
+    }
+}
+
+/// `[registration.captcha]`.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptchaConfig {
+    pub provider: CaptchaProvider,
+    /// The public key a client shows the widget with.
+    pub site_key: String,
+    /// The secret key, inline. Prefer `secret_key_file`.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// A file holding the secret key (trailing newline ignored).
+    #[serde(default)]
+    pub secret_key_file: Option<PathBuf>,
+    /// Verify against this URL instead of the provider's. For tests and
+    /// for a proxy in front of the provider.
+    #[serde(default)]
+    pub verify_url: Option<String>,
+    /// CIDR ranges `verify_url` may sit in although they are not routable,
+    /// e.g. `["127.0.0.0/8"]` for a test stub. Same judgement as
+    /// `[push] allow_internal`.
+    #[serde(default)]
+    pub allow_internal: Vec<String>,
+}
+
+impl std::fmt::Debug for CaptchaConfig {
+    /// Everything but the secret key, which is never printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptchaConfig")
+            .field("provider", &self.provider)
+            .field("site_key", &self.site_key)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secret_key_file", &self.secret_key_file)
+            .field("verify_url", &self.verify_url)
+            .field("allow_internal", &self.allow_internal)
+            .finish()
+    }
+}
+
+impl CaptchaConfig {
+    /// The secret key, from wherever it was configured.
+    ///
+    /// # Errors
+    ///
+    /// When `secret_key_file` cannot be read. The message names the file,
+    /// never its contents.
+    pub fn resolve_secret(&self) -> Result<String, String> {
+        if let Some(path) = &self.secret_key_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| {
+                    format!(
+                        "registration.captcha.secret_key_file {}: {}",
+                        path.display(),
+                        error.kind()
+                    )
+                });
+        }
+        Ok(self.secret_key.clone().unwrap_or_default())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, message: &str| {
+            Err(ConfigError::Invalid {
+                field,
+                message: message.to_owned(),
+            })
+        };
+        if self.site_key.trim().is_empty() {
+            return invalid("registration.captcha.site_key", "must not be empty");
+        }
+        if self.secret_key.is_some() == self.secret_key_file.is_some() {
+            return invalid(
+                "registration.captcha.secret_key",
+                "set exactly one of secret_key and secret_key_file",
+            );
+        }
+        if let Some(url) = &self.verify_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return invalid(
+                "registration.captcha.verify_url",
+                "must be an http or https URL",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Who may register.
 ///
 /// Registration is open unless a token is required: an operator who
@@ -204,6 +354,20 @@ pub struct RegistrationConfig {
     /// Require an `m.login.registration_token` stage at registration.
     #[serde(default)]
     pub require_token: bool,
+    /// Policy document a new account must accept (`m.login.terms`). Absent,
+    /// registration asks for no acceptance. An `http` or `https` URL.
+    #[serde(default)]
+    pub terms_url: Option<String>,
+    /// The policy's version. Change it when the policy changes.
+    #[serde(default = "default_terms_version")]
+    pub terms_version: String,
+    /// The policy's name as a client shows it.
+    #[serde(default = "default_terms_name")]
+    pub terms_name: String,
+    /// A CAPTCHA every new account solves (`m.login.recaptcha`, the legacy
+    /// registration flow). Absent, registration asks for none.
+    #[serde(default)]
+    pub captcha: Option<CaptchaConfig>,
     /// Enable Synapse's shared-secret admin registration compatibility API.
     ///
     /// Absent by default: this secret can create administrator accounts, so
@@ -272,6 +436,29 @@ impl Default for PushConfig {
     }
 }
 
+/// Presence (#745): whether this server tracks who is online, tells
+/// clients in `/sync`, and trades `m.presence` with its peers.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceConfig {
+    /// On by default, as Synapse's `presence.enabled` is: clients render
+    /// an online indicator and expect it to move. Off is for a server
+    /// whose federation traffic matters more than that indicator --
+    /// presence is the largest EDU volume on the network. Off, `PUT
+    /// /presence` is still answered (the spec gives a client no way to
+    /// learn presence is off, so refusing would only break it) but
+    /// nothing is stored, `/sync` carries no `presence` section, and no
+    /// `m.presence` EDU is sent or applied.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// The caps on MSC4140 delayed events (#36).
 ///
 /// Both exist because a delayed event is storage this server holds on a
@@ -320,6 +507,47 @@ const fn default_max_per_room() -> usize {
 
 const fn default_max_per_user() -> usize {
     crate::delayed::DEFAULT_MAX_PER_USER
+}
+
+/// `[retention]`: truncating old history (#817, MSC1763).
+///
+/// With `enabled`, a background job truncates each room's log below the
+/// newest event older than the room's maximum lifetime
+/// ([`crate::rooms::retention`]). A room sets its own with an
+/// `m.room.retention` event. These limits clamp it.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Run the job at all. Off by default: truncation deletes history.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long, in days, any room keeps events. It is the default for a
+    /// room without an `m.room.retention` event and the most a room may
+    /// ask for. Absent, rooms without a policy keep everything.
+    #[serde(default)]
+    pub max_lifetime_days: Option<u32>,
+    /// The fewest days any room keeps events: a room's maximum lifetime is
+    /// raised to this when it is lower.
+    #[serde(default)]
+    pub min_lifetime_days: Option<u32>,
+    /// Minutes between two runs of the job.
+    #[serde(default = "default_retention_interval_minutes")]
+    pub interval_minutes: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lifetime_days: None,
+            min_lifetime_days: None,
+            interval_minutes: default_retention_interval_minutes(),
+        }
+    }
+}
+
+const fn default_retention_interval_minutes() -> u64 {
+    60
 }
 
 /// `[rooms]`: keeping rooms' forward extremities merged (#626).
@@ -384,6 +612,10 @@ const fn default_dummy_event_interval_secs() -> u64 {
 /// keys up to fifty -- and finite against one that has gone wrong or is
 /// trying to. A hit cap answers `M_LIMIT_EXCEEDED`, and a replacement of
 /// something already stored never counts against it.
+///
+/// The two `password_hashes_` fields are the exception: they bound the
+/// whole process, not one account, because the memory a password hash
+/// takes is the process's (#571).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct LimitsConfig {
     /// Stored `/sync` filters per user.
@@ -397,6 +629,16 @@ pub struct LimitsConfig {
     pub one_time_keys_per_device: usize,
     #[serde(default = "default_pushers_per_user")]
     pub pushers_per_user: usize,
+    /// Argon2 computations (login, registration, password change) the
+    /// process runs at once, each in a workspace kept for reuse: the
+    /// process holds at most this many times 19 MiB for them.
+    #[serde(default = "default_password_hashes_at_once")]
+    pub password_hashes_at_once: usize,
+    /// Callers that may wait for a free workspace; the next one is
+    /// refused with 429 `M_LIMIT_EXCEEDED`. Zero refuses whenever every
+    /// workspace is in use.
+    #[serde(default = "default_password_hashes_waiting")]
+    pub password_hashes_waiting: usize,
 }
 
 impl Default for LimitsConfig {
@@ -406,6 +648,8 @@ impl Default for LimitsConfig {
             account_data_per_user: default_account_data_per_user(),
             one_time_keys_per_device: default_one_time_keys_per_device(),
             pushers_per_user: default_pushers_per_user(),
+            password_hashes_at_once: default_password_hashes_at_once(),
+            password_hashes_waiting: default_password_hashes_waiting(),
         }
     }
 }
@@ -435,6 +679,21 @@ pub const DEFAULT_PUSHERS_PER_USER: usize = 100;
 
 const fn default_pushers_per_user() -> usize {
     DEFAULT_PUSHERS_PER_USER
+}
+
+/// Two at once keeps a login answered while another is hashed, at twice
+/// the memory of one; more cores do not make a single login faster.
+pub const DEFAULT_PASSWORD_HASHES_AT_ONCE: usize = 2;
+/// About a second of default-cost hashes at two at once: a queue a person
+/// logging in will not notice, and a bound a flood of logins meets fast.
+pub const DEFAULT_PASSWORD_HASHES_WAITING: usize = 32;
+
+const fn default_password_hashes_at_once() -> usize {
+    DEFAULT_PASSWORD_HASHES_AT_ONCE
+}
+
+const fn default_password_hashes_waiting() -> usize {
+    DEFAULT_PASSWORD_HASHES_WAITING
 }
 
 /// The operational scrape surface (#166).
@@ -555,7 +814,18 @@ pub struct LivekitConfig {
     /// `LiveKit`'s API key, the `iss` of every token minted.
     pub key: String,
     /// `LiveKit`'s API secret, the HMAC key every token is signed with.
+    ///
+    /// Set this or [`Self::secret_file`], not both. After loading it holds
+    /// the secret either way, so the minter and the supervised sidecar's
+    /// generated config read one value.
+    #[serde(default)]
     pub secret: String,
+    /// A file holding the API secret (trailing newline ignored), so the
+    /// secret can be mounted rather than written into the config, as
+    /// `lk-jwt-service` reads `LIVEKIT_SECRET_FROM_FILE`. Read once, at
+    /// startup.
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
     /// The supervised-sidecar model: the operator-supplied path to the
     /// `livekit-server` binary this server starts, watches and restarts.
     ///
@@ -585,6 +855,18 @@ pub struct LivekitConfig {
     /// needs it, knowing what the hour buys.
     #[serde(default = "default_livekit_ttl")]
     pub token_ttl_seconds: u64,
+    /// Other servers whose users may publish on this SFU, by server name.
+    ///
+    /// This server's own users always may. A user of any other server is
+    /// verified over federation (their server's `openid/userinfo`) and,
+    /// unless their server is listed here, minted a token that joins and
+    /// subscribes but does not publish: they can see and hear a call on
+    /// this SFU while their own media goes through their own server's. That
+    /// is `lk-jwt-service`'s split (`LIVEKIT_FULL_ACCESS_HOMESERVERS`),
+    /// minus its `*`: publishing costs this SFU's bandwidth, so every server
+    /// granted it is named.
+    #[serde(default)]
+    pub full_access_servers: Vec<String>,
 }
 
 impl LivekitConfig {
@@ -598,6 +880,40 @@ impl LivekitConfig {
             "local"
         } else {
             "remote"
+        }
+    }
+
+    /// Take the secret from [`Self::secret_file`] when that is the key set,
+    /// so that everything after loading reads [`Self::secret`]. Exactly one
+    /// of the two keys is set; an error names the file, never a secret.
+    fn read_secret_file(&mut self) -> Result<(), ConfigError> {
+        match (&self.secret_file, self.secret.is_empty()) {
+            (None, false) => Ok(()),
+            (Some(_), false) | (None, true) => Err(ConfigError::Invalid {
+                field: "rtc.livekit",
+                message: "set exactly one of secret and secret_file: LiveKit's API \
+                          secret, inline or in a file"
+                    .to_owned(),
+            }),
+            (Some(path), true) => {
+                let text = std::fs::read_to_string(path).map_err(|error| ConfigError::Invalid {
+                    field: "rtc.livekit.secret_file",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+                let secret = text.trim_end_matches(['\r', '\n']);
+                if secret.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        field: "rtc.livekit.secret_file",
+                        message: format!(
+                            "{} is empty, and a token signed with an empty secret \
+                             admits nobody",
+                            path.display()
+                        ),
+                    });
+                }
+                secret.clone_into(&mut self.secret);
+                Ok(())
+            }
         }
     }
 }
@@ -650,12 +966,140 @@ pub struct AuthConfig {
     /// The built-in provider's issuer, when it should differ from the
     /// client base URL (#609) — e.g. `https://auth.example.org/` to keep
     /// the issuer a retired MAS used, so clients that stored it keep
-    /// working. An origin only: the provider's routes are served at the
-    /// root of whichever host reaches this process, so a path here would
-    /// advertise endpoints nothing serves. Absent, the issuer is the
-    /// client base URL, as before.
+    /// working. It may carry a path (`https://example.org/auth/`) for a
+    /// reverse proxy that publishes the provider under one: the provider's
+    /// routes answer with that path in front and without it (for a proxy
+    /// that strips it), and every page link and redirect carries it.
+    /// Absent, the issuer is the client base URL, as before.
     #[serde(default)]
     pub oidc_issuer: Option<String>,
+    /// Upstream OIDC identity providers (#610): sign-in delegated to
+    /// Authelia, Keycloak, Kanidm and the like, with each upstream
+    /// identity linked to one account here, as MAS's `upstream_oauth2`
+    /// does. The built-in provider's authorization and account pages offer
+    /// them as buttons, and the client API offers them as `m.login.sso`.
+    /// Never beside `[auth.delegated]`, whose provider owns sign-in.
+    #[serde(default)]
+    pub upstream_oidc: Vec<UpstreamOidcConfig>,
+}
+
+/// One upstream identity provider.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamOidcConfig {
+    /// A stable name: part of the callback URL registered at the provider
+    /// (`{issuer}/upstream/callback/{id}`) and of every account link, so it
+    /// must not change. A MAS provider's ULID keeps MAS's callback URL.
+    pub id: String,
+    /// The button's label; the `id` when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The provider's issuer; its discovery document is read from
+    /// `{issuer}/.well-known/openid-configuration` on first use.
+    pub issuer: String,
+    pub client_id: String,
+    /// The client secret inline. Prefer `client_secret_file`.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// A file holding the client secret (trailing newline ignored).
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// How the secret is presented at the token endpoint.
+    #[serde(default)]
+    pub token_endpoint_auth_method: UpstreamClientAuth,
+    /// Must include `openid`.
+    #[serde(default = "default_upstream_scopes")]
+    pub scopes: Vec<String>,
+    /// The claim a new account's localpart is taken from.
+    #[serde(default = "default_localpart_claim")]
+    pub localpart_claim: String,
+    /// The claim a new account's display name is taken from.
+    #[serde(default = "default_displayname_claim")]
+    pub displayname_claim: String,
+    /// Link a first sign-in to the existing account whose confirmed address
+    /// is the provider's verified one — the standard `email` claim, with
+    /// `email_verified: true`, which is the only claim that flag vouches
+    /// for. Off by default: it hands the account
+    /// to whoever controls that address at the provider, which is only as
+    /// safe as the provider's own address verification.
+    #[serde(default)]
+    pub link_existing_by_email: bool,
+    /// Read the claims from the userinfo endpoint too, for a provider
+    /// (Authelia, by default) that puts only `sub` in its ID token.
+    #[serde(default)]
+    pub fetch_userinfo: bool,
+    /// Allow a plain-http `issuer` on a host other than loopback. Off: the
+    /// discovery document, the keys and the token answer would otherwise
+    /// cross the network unauthenticated, and whoever sits in between
+    /// could sign anyone in. A test rig's provider on another container may
+    /// need it.
+    #[serde(default)]
+    pub insecure_http: bool,
+}
+
+impl std::fmt::Debug for UpstreamOidcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamOidcConfig")
+            .field("id", &self.id)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "…"))
+            .field("client_secret_file", &self.client_secret_file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpstreamOidcConfig {
+    /// The client secret, from wherever it was configured; empty for a
+    /// public client.
+    ///
+    /// # Errors
+    ///
+    /// When `client_secret_file` cannot be read — naming the file, never
+    /// the contents.
+    pub fn resolve_secret(&self) -> Result<String, String> {
+        if let Some(path) = &self.client_secret_file {
+            return std::fs::read_to_string(path)
+                .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|error| {
+                    format!(
+                        "auth.upstream_oidc {:?} client_secret_file {}: {error}",
+                        self.id,
+                        path.display()
+                    )
+                });
+        }
+        Ok(self.client_secret.clone().unwrap_or_default())
+    }
+}
+
+/// RFC 6749 §2.3 client authentication at the upstream token endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClientAuth {
+    /// HTTP Basic, the method every provider must support.
+    #[default]
+    ClientSecretBasic,
+    /// The secret in the form body.
+    ClientSecretPost,
+    /// A public client: PKCE alone.
+    None,
+}
+
+fn default_upstream_scopes() -> Vec<String> {
+    ["openid", "profile", "email"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_localpart_claim() -> String {
+    "preferred_username".to_owned()
+}
+
+fn default_displayname_claim() -> String {
+    "name".to_owned()
 }
 
 /// The delegated provider, named explicitly rather than discovered at
@@ -688,6 +1132,19 @@ pub struct DelegatedAuthConfig {
     /// cannot manage accounts here.
     #[serde(default)]
     pub homeserver_secret: Option<String>,
+    /// How many seconds one introspection verdict is trusted before the
+    /// provider is asked again. This bounds only a revocation the provider
+    /// makes without telling this server: a logout, device deletion or
+    /// deactivation served here, or reported through `/_synapse/mas/*`,
+    /// ends the token at once. A verdict is never trusted past the token's
+    /// own `expires_in`. The default is Synapse's fixed two minutes; 0
+    /// asks the provider on every request.
+    #[serde(default = "default_introspection_cache_ttl_secs")]
+    pub introspection_cache_ttl_secs: u64,
+}
+
+const fn default_introspection_cache_ttl_secs() -> u64 {
+    120
 }
 
 impl DelegatedAuthConfig {
@@ -735,6 +1192,13 @@ pub struct ServerConfig {
     /// server name need not be the hostname.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as
+    /// addresses or CIDR networks. Behind a proxy on the same host this is
+    /// `["127.0.0.1", "::1"]`. Empty means the header is never read, which
+    /// is right when clients connect directly and wrong behind a proxy:
+    /// every client then shares the proxy's address and its limits.
+    #[serde(default)]
+    pub trusted_proxies: Vec<crate::client_addr::TrustedProxy>,
     /// Who to contact about this server (spec v1.10), served at
     /// `/.well-known/matrix/support`. Absent means the endpoint answers
     /// 404, which is what the spec says an unconfigured server does.
@@ -788,6 +1252,80 @@ pub struct RateLimitConfig {
     /// `enabled` is off, like every other rate here.
     #[serde(default = "default_rings_per_minute")]
     pub rings_per_minute: u32,
+    /// Room events one account may send (#741): `PUT /send`, `PUT /state`
+    /// and `PUT /redact`, ring or not. Synapse's `rc_message`, and its
+    /// default, so a client tuned against Synapse backs off here the same.
+    #[serde(default = "default_messages")]
+    pub messages: Rate,
+    /// Joins and knocks on a room this server is already in.
+    #[serde(default = "default_joins_local")]
+    pub joins_local: Rate,
+    /// Joins and knocks that go over federation: each is a `make_join`
+    /// and `send_join` handshake and a copy of the room's state to check,
+    /// so it is the most expensive request an account can make and has
+    /// the tightest budget (Synapse's `rc_joins.remote`).
+    #[serde(default = "default_joins_remote")]
+    pub joins_remote: Rate,
+    /// Invites one account may send, whoever they are to.
+    #[serde(default = "default_invites_per_issuer")]
+    pub invites_per_issuer: Rate,
+    /// Invites one user here may receive, whoever sends them and from
+    /// whichever server: the budget that stops a set of accounts taking
+    /// turns to spam one person, which the per-issuer budget cannot see.
+    #[serde(default = "default_invites_per_target")]
+    pub invites_per_target: Rate,
+    /// `POST /createRoom`: a room is a durable log and a set of state
+    /// events nobody can delete.
+    #[serde(default = "default_room_creation")]
+    pub room_creation: Rate,
+    /// New media IDs one account may mint: `POST /upload` and
+    /// `POST /media/v1/create`. Filling a reserved ID is the second half
+    /// of a create and is not counted again.
+    #[serde(default = "default_media_uploads")]
+    pub media_uploads: Rate,
+    /// `GET /preview_url` (#833): each new URL costs the server up to two
+    /// outbound fetches and a stored row. A cached answer is not exempt:
+    /// the budget bounds how fast one account can ask, which is the only
+    /// thing it can see before the fetch.
+    #[serde(default = "default_url_previews")]
+    pub url_previews: Rate,
+    /// Authenticated downloads and thumbnails of another server's media
+    /// that this server has not cached yet (#833). Each spends one request
+    /// from the asking account's budget before the fetch; media already
+    /// cached is free to read.
+    #[serde(default = "default_remote_media")]
+    pub remote_media: Rate,
+}
+
+/// A per-user write budget: `burst` requests at once, refilled at
+/// `per_second`.
+///
+/// Burst and rate rather than "N per window", because these are the
+/// ordinary writes of an ordinary account: a person pasting five messages
+/// is a burst, a script is a sustained rate, and a budget has to tell the
+/// two apart. It is also Synapse's shape (`per_second`, `burst_count`), so
+/// an operator's existing numbers carry over.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Rate {
+    pub per_second: f64,
+    pub burst: u32,
+}
+
+impl Rate {
+    #[must_use]
+    pub const fn new(per_second: f64, burst: u32) -> Self {
+        Self { per_second, burst }
+    }
+
+    /// Time to earn back one request. Saturates rather than panics for a
+    /// rate too small to represent; config validation refuses those, so
+    /// this only matters to a `Rate` built in code.
+    #[must_use]
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::try_from_secs_f64(1.0 / self.per_second)
+            .unwrap_or(std::time::Duration::MAX)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -795,12 +1333,64 @@ impl Default for RateLimitConfig {
         Self {
             enabled: true,
             rings_per_minute: default_rings_per_minute(),
+            messages: default_messages(),
+            joins_local: default_joins_local(),
+            joins_remote: default_joins_remote(),
+            invites_per_issuer: default_invites_per_issuer(),
+            invites_per_target: default_invites_per_target(),
+            room_creation: default_room_creation(),
+            media_uploads: default_media_uploads(),
+            url_previews: default_url_previews(),
+            remote_media: default_remote_media(),
         }
     }
 }
 
 const fn default_rings_per_minute() -> u32 {
     10
+}
+
+// Synapse 1.164's defaults, every one: `rc_message`, `rc_joins.local`,
+// `rc_joins.remote`, `rc_invites.per_issuer`, `rc_invites.per_user`,
+// `rc_room_creation`, `rc_media_create`. Inventing different numbers would
+// make a migration from Synapse a silent change in what clients may do.
+const fn default_messages() -> Rate {
+    Rate::new(0.2, 10)
+}
+
+const fn default_joins_local() -> Rate {
+    Rate::new(0.1, 10)
+}
+
+const fn default_joins_remote() -> Rate {
+    Rate::new(0.01, 10)
+}
+
+const fn default_invites_per_issuer() -> Rate {
+    Rate::new(0.3, 10)
+}
+
+const fn default_invites_per_target() -> Rate {
+    Rate::new(0.003, 5)
+}
+
+const fn default_room_creation() -> Rate {
+    Rate::new(0.016, 10)
+}
+
+const fn default_media_uploads() -> Rate {
+    Rate::new(10.0, 50)
+}
+
+// No Synapse default to follow: Synapse has no per-user preview limit. A page
+// with a few links in view is a burst; a script walking URLs is a rate.
+const fn default_url_previews() -> Rate {
+    Rate::new(0.5, 20)
+}
+
+// A client opening a room with many remote avatars and images is a burst.
+const fn default_remote_media() -> Rate {
+    Rate::new(2.0, 100)
 }
 
 const fn default_true() -> bool {
@@ -843,9 +1433,12 @@ pub struct FederationConfig {
     #[serde(default)]
     pub allow_internal: Vec<String>,
     /// Base retry delay for outbound delivery, milliseconds. Doubles per
-    /// consecutive failure per destination, capped at 64× unless the peer
-    /// has a `max_backoff_ms` of its own below. Tests shrink it; operators
-    /// should not need to touch it.
+    /// consecutive failure per destination, capped at 64×; once a
+    /// destination has failed for 600× this (ten minutes at the default),
+    /// each wait is as long as the outage so far, up to a day, and the
+    /// destination is caught up rather than sent its backlog. A peer with a
+    /// `max_backoff_ms` of its own below keeps doubling to that cap
+    /// instead. Tests shrink it; operators should not need to touch it.
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
     /// Peers reached by configuration rather than by resolving their name,
@@ -876,7 +1469,8 @@ pub struct FederationConfig {
     /// Fill recorded federation gaps in the background (SPEC §6.5): the
     /// history between this server's old head and an event it accepted
     /// across a gap is fetched with `/backfill`, verified and stored so
-    /// `/messages` and `/context` serve it. Off leaves the gaps recorded.
+    /// `/messages` and `/context` serve it. Off leaves the gaps recorded, and
+    /// leaves PDUs refused for missing dependencies unretried.
     #[serde(default = "default_true")]
     pub gap_backfill: bool,
     /// Events asked for per `/backfill` request, and so the most one chunk
@@ -913,6 +1507,16 @@ pub struct FederationConfig {
     /// The window both gap acceptance caps count over, seconds.
     #[serde(default = "default_gap_acceptance_window_secs")]
     pub gap_acceptance_window_secs: u64,
+    /// How long a dependency that failed verification is not fetched
+    /// again, seconds (#725). In that time a pushed PDU that names it is
+    /// refused at once, without the recovery and gap acceptance that
+    /// failed for it last time, and a peer's body for it that failed is
+    /// not fetched from that peer again. A sender does not send a
+    /// PDU again after a 200, so this server keeps the refused PDU and
+    /// judges it again after this expires. `0`
+    /// turns it off; at most a day.
+    #[serde(default = "default_dependency_failure_ttl_secs")]
+    pub dependency_failure_ttl_secs: u64,
     /// Notary servers asked for a peer's keys when the peer itself cannot
     /// answer: it is down, gone, or no longer publishes the key an old
     /// event was signed with. Each entry is a server name, or a table
@@ -941,6 +1545,17 @@ pub struct FederationConfig {
     /// `enabled = true` is a startup error rather than a silent no-op.
     #[serde(default)]
     pub hub: HubConfig,
+    /// Server names this server federates with, as `*`/`?` globs like a
+    /// room's `m.room.server_acl`. Empty means every server not in `deny`.
+    /// Set, it is a closed federation: any other server is refused in both
+    /// directions -- inbound after its signature verifies, outbound before
+    /// a name is resolved. Changes need a restart.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Server names refused in every room, in both directions, whatever
+    /// `allow` says. Same globs as `allow`. Changes need a restart.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// `[federation.hub]`: Spindle's MSC3995 hub mode, between Spindle peers.
@@ -1133,6 +1748,10 @@ const fn default_gap_acceptance_window_secs() -> u64 {
     600
 }
 
+const fn default_dependency_failure_ttl_secs() -> u64 {
+    300
+}
+
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
@@ -1153,8 +1772,11 @@ impl Default for FederationConfig {
             gap_acceptances_per_room: default_gap_acceptances_per_room(),
             gap_acceptances_per_origin: default_gap_acceptances_per_origin(),
             gap_acceptance_window_secs: default_gap_acceptance_window_secs(),
+            dependency_failure_ttl_secs: default_dependency_failure_ttl_secs(),
             trusted_key_servers: None,
             hub: HubConfig::default(),
+            allow: Vec::new(),
+            deny: Vec::new(),
         }
     }
 }
@@ -1169,12 +1791,14 @@ pub struct PeerConfig {
     /// rather than turning authentication off for every peer.
     pub url: String,
     /// The longest this server waits between delivery attempts while the
-    /// peer is unreachable, milliseconds. Unset means the ordinary cap of
-    /// 64× `retry_base_ms`, about a minute. A peer that is expected to be
-    /// dark for hours -- a phone, a gateway on a venue uplink -- is given
-    /// hours here, so that its queue waits at the cost of one connection
-    /// attempt per period rather than one a minute. Nothing queued is
-    /// dropped either way; rows leave the outbox only when the peer
+    /// peer is unreachable, milliseconds. Unset means the ordinary
+    /// schedule: at most 64× `retry_base_ms`, about a minute, for the first
+    /// ten minutes of an outage, then as long as the outage so far, up to
+    /// a day, with the peer's queue cut to each room's newest events. A
+    /// peer that is expected to be dark for hours -- a phone, a gateway on
+    /// a venue uplink -- is given hours here, so that its queue waits at
+    /// the cost of one connection attempt per period. Nothing queued for
+    /// such a peer is dropped; its rows leave the outbox only when it
     /// acknowledges them.
     #[serde(default)]
     pub max_backoff_ms: Option<u64>,
@@ -1230,6 +1854,64 @@ pub struct StorageConfig {
     /// up every other.
     #[serde(default = "default_warm_concurrency")]
     pub warm_concurrency: usize,
+    /// How many rooms may be open in memory at once. Past it, the rooms
+    /// untouched for longest are dropped and load again from the store when
+    /// something asks for them. A room in use, mid-load or mid-resync is
+    /// never dropped, so the count can run over while those are busy. `0`
+    /// means no limit.
+    #[serde(default = "default_max_resident_rooms")]
+    pub max_resident_rooms: usize,
+    /// How hard a commit is made durable before it is acknowledged.
+    /// `group` (the default) shares one fsync between concurrent commits.
+    /// See [`DurabilityMode`] for what each mode does to security writes.
+    #[serde(default)]
+    pub durability: DurabilityMode,
+    /// Under `relaxed`, how often the journal is fsynced in the background,
+    /// in milliseconds. A crash loses at most about this much. Ignored in
+    /// the other modes. Must be above zero.
+    #[serde(default = "default_relaxed_sync_interval_ms")]
+    pub relaxed_sync_interval_ms: u64,
+    /// Where `POST /_spindle/admin/v1/backup` writes backups (#813). Unset
+    /// turns the endpoint off: it answers with an error and writes nothing.
+    /// The endpoint takes no path from the request, so an admin token cannot
+    /// make the server write anywhere else.
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
+}
+
+/// `[storage] durability`: SPEC §8.3's three modes.
+///
+/// Security writes (tokens, accounts, devices, one-time keys, the signing
+/// key) ask the store for `group` at least. `strict` raises them to
+/// `strict`. `relaxed` leaves them at `group`: only room commits relax.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DurabilityMode {
+    /// fsync data and metadata before every acknowledgement.
+    Strict,
+    /// One fsync shared by concurrent commits, before they are acknowledged.
+    #[default]
+    Group,
+    /// Room commits wait for the OS page cache only; a timer fsyncs them.
+    Relaxed,
+}
+
+impl From<DurabilityMode> for spindle_store::Durability {
+    fn from(mode: DurabilityMode) -> Self {
+        match mode {
+            DurabilityMode::Strict => Self::Strict,
+            DurabilityMode::Group => Self::Group,
+            DurabilityMode::Relaxed => Self::Relaxed,
+        }
+    }
+}
+
+fn default_relaxed_sync_interval_ms() -> u64 {
+    1000
+}
+
+fn default_max_resident_rooms() -> usize {
+    4096
 }
 
 fn default_warm_concurrency() -> usize {
@@ -1244,6 +1926,58 @@ pub struct MediaConfig {
     /// when migrating so existing clients retain their upload allowance.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
+    /// Total bytes one account's uploads may hold (#741). Absent, which is
+    /// the default, there is no quota: the per-upload cap and the upload
+    /// rate bound how fast an account can fill the disk, not how far.
+    ///
+    /// Counted from the media records themselves, so it covers what was
+    /// uploaded before the quota was set, and deleting media gives the
+    /// bytes back. Appservice users and server admins are exempt, as from
+    /// the write rates: a bridge mirrors other networks' media by design.
+    #[serde(default)]
+    pub max_bytes_per_user: Option<u64>,
+    /// Most pixels (width times height) a source image may declare and still
+    /// be thumbnailed. A small, highly compressible file can declare a huge
+    /// canvas, and decoding it costs memory and CPU out of proportion to its
+    /// size, so the header is read first and an image over this is refused
+    /// with 413 `M_TOO_LARGE` before any pixel is decoded.
+    #[serde(default = "default_max_thumbnail_pixels")]
+    pub max_thumbnail_pixels: u64,
+    /// Days to keep media cached from other servers (#828). Absent, which
+    /// is the default, the cache is kept until an admin purges it with
+    /// `POST /_synapse/admin/v1/purge_media_cache`. Quarantined items and
+    /// this server's own uploads are never removed by it. A removed item
+    /// is fetched again if a client asks for it.
+    #[serde(default)]
+    pub remote_retention_days: Option<u32>,
+    /// Total bytes the URL preview cache may hold (#833): the stored
+    /// previews and the images re-hosted for them. Past it the oldest
+    /// previews are removed, rows and image bytes together. Separate from
+    /// `max_bytes_per_user`: a preview is the server's own copy, not an
+    /// account's upload, so it is never charged to the asking account.
+    #[serde(default = "default_preview_cache_max_bytes")]
+    pub preview_cache_max_bytes: u64,
+    /// Total bytes of other servers' media this server may cache (#833).
+    /// Past it the oldest cached items are removed, record and bytes. It
+    /// does not touch this server's own uploads. Age-based purging, where
+    /// configured, runs beside this and does not replace it.
+    #[serde(default = "default_remote_cache_max_bytes")]
+    pub remote_cache_max_bytes: u64,
+}
+
+fn default_max_thumbnail_pixels() -> u64 {
+    crate::media::DEFAULT_MAX_THUMBNAIL_PIXELS
+}
+
+/// Room for one preview's largest image and its row.
+const MIN_PREVIEW_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+const fn default_preview_cache_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+const fn default_remote_cache_max_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_max_upload_bytes() -> usize {
@@ -1254,6 +1988,11 @@ impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             max_upload_bytes: default_max_upload_bytes(),
+            max_bytes_per_user: None,
+            max_thumbnail_pixels: default_max_thumbnail_pixels(),
+            remote_retention_days: None,
+            preview_cache_max_bytes: default_preview_cache_max_bytes(),
+            remote_cache_max_bytes: default_remote_cache_max_bytes(),
         }
     }
 }
@@ -1264,6 +2003,10 @@ impl Default for StorageConfig {
             path: default_data_dir(),
             s3: None,
             warm_concurrency: default_warm_concurrency(),
+            max_resident_rooms: default_max_resident_rooms(),
+            durability: DurabilityMode::default(),
+            relaxed_sync_interval_ms: default_relaxed_sync_interval_ms(),
+            backup_dir: None,
         }
     }
 }
@@ -1288,10 +2031,22 @@ fn default_region() -> String {
     "us-east-1".to_owned()
 }
 
+/// The log filter when `[logging] filter` is absent (#726): `info`, except
+/// for the vendored ruma-state-res.
+///
+/// That crate logs two `INFO` lines for every event it authorizes, and more
+/// for every resolution, with no room in them. At plain `info` they were all
+/// a lightly used server logged, and they buried the warnings an operator
+/// acts on. At `warn` its real faults, such as a missing auth event, still
+/// show. An operator who wants the lines back names the target, e.g.
+/// `info,ruma_state_res=info`.
+pub const DEFAULT_LOG_FILTER: &str = "info,ruma_state_res=warn";
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// `tracing-subscriber` filter directive, e.g. `spindle=debug,warn`.
+    /// Absent means [`DEFAULT_LOG_FILTER`].
     #[serde(default)]
     pub filter: Option<String>,
     /// Where spans go, beside the log. Absent means nowhere, which is the
@@ -1299,6 +2054,14 @@ pub struct LoggingConfig {
     /// without an operator's say-so: no exporter is wired unless named.
     #[serde(default)]
     pub traces: Option<TraceExporter>,
+}
+
+impl LoggingConfig {
+    /// The filter directive the log is built with.
+    #[must_use]
+    pub fn filter_directive(&self) -> &str {
+        self.filter.as_deref().unwrap_or(DEFAULT_LOG_FILTER)
+    }
 }
 
 /// A span exporter an operator may switch on.
@@ -1327,16 +2090,36 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl Config {
+    /// Whether anyone who can reach the listener may create an account:
+    /// registration needs no token and the bind address is not loopback.
+    /// The server warns at start-up when this holds, because the quick-start
+    /// configuration is exactly this and nothing else limits sign-ups.
+    #[must_use]
+    pub fn open_registration_exposed(&self) -> bool {
+        // `bind` is validated as `address:port`, so a parse failure is not
+        // reachable; treat it as exposed rather than quiet.
+        let loopback = self
+            .server
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| address.ip().is_loopback());
+        self.registration.is_open() && !loopback
+    }
+
     /// Parse and validate configuration from TOML text.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if the document does not parse or a field is
-    /// unusable.
+    /// Returns [`ConfigError`] if the document does not parse, a field is
+    /// unusable, or a secret file it names (`rtc.livekit.secret_file`)
+    /// cannot be read.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|error| ConfigError::Syntax {
+        let mut config: Self = toml::from_str(text).map_err(|error| ConfigError::Syntax {
             message: error.to_string(),
         })?;
+        if let Some(livekit) = &mut config.rtc.livekit {
+            livekit.read_secret_file()?;
+        }
         config.validate()?;
         config.validate_media()?;
         config.federation.hub.validate()?;
@@ -1467,6 +2250,16 @@ impl Config {
         Ok(())
     }
 
+    fn validate_storage(&self) -> Result<(), ConfigError> {
+        if self.storage.relaxed_sync_interval_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "storage.relaxed_sync_interval_ms",
+                message: "must be greater than zero; a zero interval would never wait".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_rooms(&self) -> Result<(), ConfigError> {
         // One extremity is a room with no fork; a threshold below two would
         // send a dummy event into a room after every fork, however young.
@@ -1487,6 +2280,94 @@ impl Config {
                     .to_owned(),
             });
         }
+        if self.media.max_thumbnail_pixels == 0 {
+            return Err(ConfigError::Invalid {
+                field: "media.max_thumbnail_pixels",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+        // Zero is not "no quota" -- that is leaving it out -- but a quota
+        // that refuses every upload, which nobody means.
+        if self.media.max_bytes_per_user == Some(0) {
+            return Err(ConfigError::Invalid {
+                field: "media.max_bytes_per_user",
+                message: "must be greater than zero; omit it for no quota".to_owned(),
+            });
+        }
+        if self.media.remote_retention_days == Some(0) {
+            return Err(ConfigError::Invalid {
+                field: "media.remote_retention_days",
+                message: "must be greater than zero; omit it to keep the cache".to_owned(),
+            });
+        }
+        if let Some(captcha) = &self.registration.captcha {
+            captcha.validate()?;
+        }
+        if let Some(url) = &self.registration.terms_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(ConfigError::Invalid {
+                field: "registration.terms_url",
+                message: "must be an http or https URL".to_owned(),
+            });
+        }
+        // One preview can hold a re-hosted image of up to 10 MiB beside its
+        // row. A cap below that would evict the preview being served.
+        if self.media.preview_cache_max_bytes < MIN_PREVIEW_CACHE_BYTES {
+            return Err(ConfigError::Invalid {
+                field: "media.preview_cache_max_bytes",
+                message: format!("must be at least {MIN_PREVIEW_CACHE_BYTES} (16 MiB)"),
+            });
+        }
+        // A zero cap would evict everything at once, so remote media would
+        // never be served from the cache it fills.
+        if self.media.remote_cache_max_bytes == 0 {
+            return Err(ConfigError::Invalid {
+                field: "media.remote_cache_max_bytes",
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_ratelimit(&self) -> Result<(), ConfigError> {
+        // A ring budget of zero is not "unlimited" either: it refuses every
+        // ring, and a call nobody can be summoned to is a feature silently
+        // off.
+        if self.ratelimit.rings_per_minute == 0 {
+            return Err(ConfigError::Invalid {
+                field: "ratelimit.rings_per_minute",
+                message: "must be greater than zero; a zero budget refuses every ring".to_owned(),
+            });
+        }
+        let limits = &self.ratelimit;
+        for (field, rate) in [
+            ("ratelimit.messages", limits.messages),
+            ("ratelimit.joins_local", limits.joins_local),
+            ("ratelimit.joins_remote", limits.joins_remote),
+            ("ratelimit.invites_per_issuer", limits.invites_per_issuer),
+            ("ratelimit.invites_per_target", limits.invites_per_target),
+            ("ratelimit.room_creation", limits.room_creation),
+            ("ratelimit.media_uploads", limits.media_uploads),
+            ("ratelimit.url_previews", limits.url_previews),
+            ("ratelimit.remote_media", limits.remote_media),
+        ] {
+            // Same reasoning as the ring: zero burst or zero rate refuses
+            // every request forever, and NaN or a rate whose refill
+            // interval cannot be represented is a typo, not a policy.
+            // "Unlimited" is `enabled = false`.
+            let refill = 1.0 / rate.per_second;
+            if rate.burst == 0
+                || !rate.per_second.is_finite()
+                || rate.per_second <= 0.0
+                || std::time::Duration::try_from_secs_f64(refill).is_err()
+            {
+                return Err(ConfigError::Invalid {
+                    field,
+                    message: "burst must be at least 1 and per_second a positive number".to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1497,16 +2378,9 @@ impl Config {
         // it meant something else, so say so rather than starting.
         self.validate_delayed_events()?;
         self.validate_rooms()?;
+        self.validate_storage()?;
         self.validate_peers()?;
-        // A ring budget of zero is not "unlimited" either: it refuses every
-        // ring, and a call nobody can be summoned to is a feature silently
-        // off.
-        if self.ratelimit.rings_per_minute == 0 {
-            return Err(ConfigError::Invalid {
-                field: "ratelimit.rings_per_minute",
-                message: "must be greater than zero; a zero budget refuses every ring".to_owned(),
-            });
-        }
+        self.validate_ratelimit()?;
         for (field, value) in [
             ("limits.filters_per_user", self.limits.filters_per_user),
             (
@@ -1517,6 +2391,12 @@ impl Config {
             (
                 "limits.one_time_keys_per_device",
                 self.limits.one_time_keys_per_device,
+            ),
+            // Zero workspaces would refuse every login. Zero waiting is a
+            // real choice -- refuse rather than queue -- so it is allowed.
+            (
+                "limits.password_hashes_at_once",
+                self.limits.password_hashes_at_once,
             ),
         ] {
             if value == 0 {
@@ -1559,6 +2439,7 @@ impl Config {
             });
         }
         self.validate_builtin_oidc()?;
+        self.validate_upstream_oidc()?;
         if let Some(email) = &self.email {
             email.validate(self.auth.builtin_oidc)?;
         }
@@ -1688,13 +2569,115 @@ impl Config {
                         .to_owned(),
                 });
             }
+            if let Some(name) = livekit
+                .full_access_servers
+                .iter()
+                .find(|name| ruma::ServerName::parse(name.as_str()).is_err())
+            {
+                return Err(ConfigError::Invalid {
+                    field: "rtc.livekit.full_access_servers",
+                    message: format!(
+                        "{name:?} is not a server name — list servers by name; \
+                         there is no wildcard"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream providers: never beside delegation, each with an id that
+    /// is safe in a URL and unique, an http(s) issuer, `openid` among its
+    /// scopes, and a secret configured exactly when its client method
+    /// presents one.
+    fn validate_upstream_oidc(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            field: "auth.upstream_oidc",
+            message,
+        };
+        if !self.auth.upstream_oidc.is_empty() && self.auth.delegated.is_some() {
+            return Err(invalid(
+                "cannot be combined with auth.delegated — the delegated provider owns sign-in"
+                    .to_owned(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.auth.upstream_oidc {
+            let id = &provider.id;
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            {
+                return Err(invalid(format!(
+                    "id {id:?} must be 1-64 characters of letters, digits and - . _ ~ \
+                     (it is part of the callback URL)"
+                )));
+            }
+            if !seen.insert(id.as_str()) {
+                return Err(invalid(format!("id {id:?} is used twice")));
+            }
+            let Some(rest) = provider
+                .issuer
+                .strip_prefix("https://")
+                .or_else(|| provider.issuer.strip_prefix("http://"))
+            else {
+                return Err(invalid(format!(
+                    "{id:?}: issuer {:?} is not an http(s) URL",
+                    provider.issuer
+                )));
+            };
+            if provider.issuer.starts_with("http://") && !provider.insecure_http {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let host = authority
+                    .strip_prefix('[')
+                    .and_then(|bracketed| bracketed.split_once(']'))
+                    .map_or_else(
+                        || {
+                            authority
+                                .rsplit_once(':')
+                                .map_or(authority, |(host, _)| host)
+                        },
+                        |(host, _)| host,
+                    );
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback());
+                if !loopback {
+                    return Err(invalid(format!(
+                        "{id:?}: issuer {:?} is plain http on a host that is not loopback; \
+                         use https, or set insecure_http = true for a test rig",
+                        provider.issuer
+                    )));
+                }
+            }
+            if provider.client_id.is_empty() {
+                return Err(invalid(format!("{id:?}: client_id is empty")));
+            }
+            if !provider.scopes.iter().any(|scope| scope == "openid") {
+                return Err(invalid(format!(
+                    "{id:?}: scopes must include \"openid\" — without it there is no ID token"
+                )));
+            }
+            let secrets = usize::from(provider.client_secret.is_some())
+                + usize::from(provider.client_secret_file.is_some());
+            let wants_secret = provider.token_endpoint_auth_method != UpstreamClientAuth::None;
+            if secrets > 1 || (secrets == 1) != wants_secret {
+                return Err(invalid(format!(
+                    "{id:?}: set exactly one of client_secret and client_secret_file, or \
+                     neither with token_endpoint_auth_method = \"none\""
+                )));
+            }
         }
         Ok(())
     }
 
     /// The built-in provider's settings: never beside delegation, and
     /// `auth.oidc_issuer` meaningful only with the provider and an http(s)
-    /// origin with nothing after the host.
+    /// URL with no query, fragment or credentials, whose path (if any) is
+    /// one the server can tell apart from its own routes.
     fn validate_builtin_oidc(&self) -> Result<(), ConfigError> {
         // One identity authority is the point of both modes; a server
         // with two would mint accounts nobody can say who owns.
@@ -1726,21 +2709,67 @@ impl Config {
                 message: format!("{issuer:?} is not an http(s) URL"),
             });
         };
-        let host = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
         if host.is_empty()
-            || host.contains(['/', '?', '#', '@', ' ', '\\'])
+            || host.contains(['?', '#', '@', ' ', '\\'])
             || host.chars().any(char::is_control)
         {
             return Err(ConfigError::Invalid {
                 field: "auth.oidc_issuer",
                 message: format!(
-                    "{issuer:?} must be an origin such as \"https://auth.example.org/\" — \
-                     the provider's endpoints live at the root of the host, so a path, \
-                     query or credentials here would advertise URLs nothing serves"
+                    "{issuer:?} must be an http(s) URL such as \"https://auth.example.org/\" — \
+                     a query, fragment or credentials here would advertise URLs nothing serves"
                 ),
             });
         }
+        let path = path.trim_end_matches('/');
+        if !path.is_empty() {
+            let segments: Vec<&str> = path[1..].split('/').collect();
+            let plain = segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && *segment != "."
+                    && *segment != ".."
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            });
+            // The path is stripped from a request before routing; a first
+            // segment that is itself a route (or a `_matrix`-style prefix)
+            // would make a real request look like a prefixed one.
+            let first = segments.first().copied().unwrap_or_default();
+            let collides = first.starts_with(['_', '.'])
+                || ["account", "oauth2", "upstream", "health", "ready"].contains(&first);
+            if !plain || collides {
+                return Err(ConfigError::Invalid {
+                    field: "auth.oidc_issuer",
+                    message: format!(
+                        "{issuer:?} has a path the provider cannot be served under: use plain \
+                         segments (letters, digits, - . _ ~) whose first is not one of the \
+                         server's own routes, e.g. \"https://example.org/auth/\""
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The path of `auth.oidc_issuer`, without a trailing slash: `/auth`
+    /// for `https://example.org/auth/`, empty for an issuer at the root of
+    /// its host or none configured. Only the configured issuer counts: the
+    /// client base URL's path was never served as the provider's, and an
+    /// issuer that does not name one keeps the routes exactly where they were.
+    #[must_use]
+    pub fn oidc_issuer_path(&self) -> String {
+        let Some(issuer) = self.auth.oidc_issuer.as_deref() else {
+            return String::new();
+        };
+        let rest = issuer
+            .strip_prefix("https://")
+            .or_else(|| issuer.strip_prefix("http://"))
+            .unwrap_or(issuer);
+        rest.find('/').map_or_else(String::new, |at| {
+            rest[at..].trim_end_matches('/').to_owned()
+        })
     }
 
     /// The built-in provider's issuer without its trailing slash: the
@@ -1795,3 +2824,25 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod open_registration_tests {
+    use super::Config;
+
+    fn exposed(extra: &str) -> bool {
+        Config::parse(&format!("[server]\nname = \"x.org\"\n{extra}"))
+            .unwrap()
+            .open_registration_exposed()
+    }
+
+    #[test]
+    fn open_registration_is_exposed_only_off_loopback_without_a_token() {
+        assert!(!exposed("bind = \"127.0.0.1:8008\"\n"));
+        assert!(!exposed("bind = \"[::1]:8008\"\n"));
+        assert!(exposed("bind = \"0.0.0.0:8008\"\n"));
+        assert!(exposed("bind = \"[::]:8008\"\n"));
+        assert!(!exposed(
+            "bind = \"0.0.0.0:8008\"\n[registration]\nrequire_token = true\n"
+        ));
+    }
+}

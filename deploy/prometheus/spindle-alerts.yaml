@@ -131,3 +131,18 @@ groups:
             the last five minutes. The `route` label on the same metric says
             which endpoints.
           runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleServerErrors.md
+      # Only for servers that use the backup endpoint: the series is 0
+      # until the first backup, and 0 is not alerted on.
+      - alert: SpindleBackupStale
+        expr: >
+          spindle_last_successful_backup_timestamp_seconds > 0
+            and time() - spindle_last_successful_backup_timestamp_seconds > 2 * 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: The last online backup is more than two days old
+          description: >
+            No backup has finished through the admin endpoint for two days.
+            Check the job that calls it and the space in `backup_dir`.
+          runbook_url: https://github.com/tuna-os/spindle/blob/main/runbooks/SpindleBackupStale.md

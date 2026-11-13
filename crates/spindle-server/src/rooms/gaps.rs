@@ -33,13 +33,14 @@
 //! old head's side of it and the gap event's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use ruma::events::StateEventType;
 use ruma::state_res::events::Event as _;
 use serde_json::{Value, json};
 use spindle_core::{EventId, RoomLog, Sideline, StateKey, StateRoot, StateSnapshot};
 
-use super::{RoomError, Rooms, canonical_to_json, current_state, event_body_key, power_level};
+use super::{RoomError, Rooms, canonical_to_json, event_body_key, power_level};
 use crate::authorize::StoredEvent;
 
 /// The band of positions segments live in.
@@ -90,6 +91,17 @@ pub(crate) mod band {
             None => (position, 0),
         }
     }
+}
+
+/// Events one room may owe at once ([`Rooms::owe_event`]). Bounds what a
+/// server in a room can make this server keep and retry.
+pub(crate) const MAX_OWED_PER_ROOM: usize = 64;
+
+/// The event ID at the end of an owed-event key: the bytes after the
+/// room's prefix.
+fn record_event_id(key: &[u8], room_id: &str) -> Option<String> {
+    let prefix = spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::OwedEvent, room_id);
+    String::from_utf8(key.strip_prefix(prefix.as_slice())?.to_vec()).ok()
 }
 
 /// One gap's segment: the sequence numbers its events occupy, inclusive.
@@ -660,6 +672,89 @@ impl Rooms {
         Ok(())
     }
 
+    /// Remember a pushed PDU refused for missing dependencies, so the
+    /// backfill loop tries it again (#822). The sender does not resend an
+    /// event it was answered 200 for, so without this the event is gone
+    /// until a later one names it. Idempotent: an event already owed keeps
+    /// its retry count. A room holds at most [`MAX_OWED_PER_ROOM`]; past
+    /// that the event is not kept and `false` is returned.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the store cannot be read or written.
+    pub fn owe_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        origin: &str,
+        pdu: &Value,
+    ) -> Result<bool, RoomError> {
+        let key = spindle_core::keys::owed_event(room_id, event_id);
+        if spindle_store::ReadView::get(self.store.as_ref(), &key)?.is_some() {
+            return Ok(true);
+        }
+        let prefix =
+            spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::OwedEvent, room_id);
+        if spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?.len()
+            >= MAX_OWED_PER_ROOM
+        {
+            return Ok(false);
+        }
+        let record = json!({ "origin": origin, "pdu": pdu, "attempts": 0, "next_ms": 0 });
+        spindle_store::Store::put(self.store.as_ref(), &key, record.to_string().as_bytes())?;
+        Ok(true)
+    }
+
+    /// Every owed event, as `(room_id, event_id, record)`.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the rows cannot be read.
+    pub fn owed_events(&self) -> Result<Vec<(String, String, Value)>, RoomError> {
+        let prefix = vec![
+            spindle_core::keys::KEY_SCHEMA_VERSION,
+            spindle_core::keys::Keyspace::OwedEvent as u8,
+        ];
+        Ok(
+            spindle_store::ReadView::scan_prefix(self.store.as_ref(), &prefix)?
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let room = spindle_core::keys::room_from_prefixed(&key)?.to_owned();
+                    let event = record_event_id(&key, &room)?;
+                    Some((room, event, serde_json::from_slice(&value).ok()?))
+                })
+                .collect(),
+        )
+    }
+
+    /// Rewrite an owed event's record after a retry that did not settle it.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the row cannot be written.
+    pub fn put_owed_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        record: &Value,
+    ) -> Result<(), RoomError> {
+        spindle_store::Store::put(
+            self.store.as_ref(),
+            &spindle_core::keys::owed_event(room_id, event_id),
+            record.to_string().as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Forget an owed event: applied, or given up on.
+    ///
+    /// # Errors
+    /// Returns [`RoomError`] if the row cannot be deleted.
+    pub fn delete_owed_event(&self, room_id: &str, event_id: &str) -> Result<(), RoomError> {
+        spindle_store::Store::delete(
+            self.store.as_ref(),
+            &spindle_core::keys::owed_event(room_id, event_id),
+        )?;
+        Ok(())
+    }
+
     /// Remove a gap marker whose backfill finished.
     ///
     /// # Errors
@@ -675,43 +770,93 @@ impl Rooms {
     /// The remote servers with a member joined to the room right now, the
     /// most-joined first (#620).
     ///
-    /// Read from the current state's member events themselves, not from
-    /// the membership index, and counting only `join` -- an invite is not
-    /// a server in the room, and a server whose users all left answers a
-    /// request about the room with 403. Ordered by how many members each
-    /// has joined, because the server with the most is the likeliest to
-    /// hold the room's history and to still be in it; ties by name, so the
-    /// order is stable.
+    /// Read from the current state's member keys and the membership index,
+    /// counting only `join`: an invite is not a server in the room, and a
+    /// server whose users all left answers a request about the room with
+    /// 403. That is [`Self::server_in_room`]'s rule, so every server named
+    /// here is one this server would itself answer as in the room. Ordered
+    /// by how many members each has joined, because the server with the
+    /// most is the likeliest to hold the room's history and to still be in
+    /// it; ties by name, so the order is stable.
+    ///
+    /// The ranking is cached against the state root it was read from, as
+    /// [`Self::destinations_in`] is: it costs a point read per member, the
+    /// recovery and gap paths ask for it per received PDU, and only a
+    /// state change can change the answer -- a cache keyed by time, as the
+    /// backfill loop once kept, served a departed server for minutes.
+    ///
+    /// A partial-state room (MSC3706) holds few member events, so the
+    /// resident's `servers_in_room` follows the ranked ones, the server the
+    /// join went through first, until the resync brings the members in --
+    /// [`Self::server_in_room`] counts them as in the room meanwhile.
     ///
     /// # Errors
-    /// Returns [`RoomError`] if the room or a member event cannot be read.
+    /// Returns [`RoomError`] if the room or the membership index cannot be
+    /// read.
     pub fn participating_servers(&self, room_id: &str) -> Result<Vec<String>, RoomError> {
-        let members = self.with_room_read(room_id, |rooms, log| {
-            Ok(current_state(log)
-                .into_iter()
-                .filter(|(key, _)| {
-                    key.event_type().as_str() == "m.room.member"
-                        && domain_of(key.state_key())
-                            .is_some_and(|domain| domain != rooms.server_name)
-                })
-                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
-                .collect::<Vec<_>>())
-        })?;
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for (user_id, event_id) in members {
-            let Ok(body) = self.read_event(room_id, &EventId::new(event_id.as_str())) else {
-                continue;
-            };
-            if body["content"]["membership"].as_str() != Some(super::JOIN_STR) {
-                continue;
+        let ranked = self.with_room_read(room_id, |rooms, log| rooms.ranked_in(log, room_id))?;
+        let mut servers = ranked.as_ref().clone();
+        if let Some(partial) = self.partial_state(room_id) {
+            let resident = std::iter::once(&partial.via).chain(&partial.servers_in_room);
+            for server in resident {
+                if *server != self.server_name && !servers.contains(server) {
+                    servers.push(server.clone());
+                }
             }
-            if let Some(domain) = domain_of(&user_id) {
+        }
+        Ok(servers)
+    }
+
+    /// [`Self::participating_servers`] from the members the room's state
+    /// holds, from a log the caller holds: the membership index is read
+    /// under the same lock the append path writes it under, so the ranking
+    /// cached against this root is the one this root implies.
+    fn ranked_in(&self, log: &RoomLog, room_id: &str) -> Result<Arc<Vec<String>>, RoomError> {
+        let Some(state) = log.current_state() else {
+            return Ok(Arc::new(Vec::new()));
+        };
+        let root = *state.root().as_bytes();
+        if let Some((cached, ranked)) = self
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+            && *cached == root
+        {
+            return Ok(Arc::clone(ranked));
+        }
+        let mut members = Vec::new();
+        state.for_each(|key, _| {
+            if key.event_type().as_str() == "m.room.member"
+                && domain_of(key.state_key()).is_some_and(|domain| domain != self.server_name)
+            {
+                members.push(key.state_key().to_owned());
+            }
+        });
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for user_id in members {
+            let membership = spindle_store::ReadView::get(
+                self.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    &user_id,
+                    room_id,
+                ),
+            )?;
+            if membership.as_deref() == Some(super::JOIN_STR.as_bytes())
+                && let Some(domain) = domain_of(&user_id)
+            {
                 *counts.entry(domain.to_owned()).or_default() += 1;
             }
         }
         let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
         ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        Ok(ranked.into_iter().map(|(domain, _)| domain).collect())
+        let ranked = Arc::new(ranked.into_iter().map(|(domain, _)| domain).collect());
+        self.participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), (root, Arc::clone(&ranked)));
+        Ok(ranked)
     }
 
     /// Of `ids`, the ones a gap walk still has to fetch: not in the log,
@@ -841,7 +986,7 @@ impl Rooms {
 
     /// Whether `sender` may redact others' events in `state`: their power
     /// reaches the room's `redact` level, or they created the room.
-    fn may_redact(
+    pub(super) fn may_redact(
         &self,
         room_id: &str,
         state: &StateSnapshot,
@@ -874,6 +1019,71 @@ impl Rooms {
             .unwrap_or(0);
         let needed = content.get("redact").and_then(power_level).unwrap_or(50);
         power >= needed
+    }
+
+    /// Refuse a redaction authored here unless `sender` may redact `target`:
+    /// they hold the room's `redact` power, or the target is their own event.
+    /// The auth rules of room v3 and later let any member *send* a redaction;
+    /// whether it takes effect is decided here, before anything is stored.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Forbidden`] if the sender may not redact the
+    /// target, or a read error for the target.
+    pub(super) fn check_may_redact(
+        &self,
+        log: &RoomLog,
+        room_id: &str,
+        sender: &str,
+        target: &str,
+    ) -> Result<(), RoomError> {
+        let body = self.read_event(room_id, &EventId::new(target))?;
+        if body["sender"].as_str() == Some(sender) {
+            return Ok(());
+        }
+        let power_ok = log
+            .current_state()
+            .is_some_and(|state| self.may_redact(room_id, state, sender, &HashMap::new()));
+        if power_ok {
+            Ok(())
+        } else {
+            Err(RoomError::Forbidden(
+                "you do not have permission to redact this event".to_owned(),
+            ))
+        }
+    }
+
+    /// Whether `sender` held the `redact` power in `state`, the room state
+    /// at a received redaction.
+    pub(super) fn redact_power_in(
+        &self,
+        room_id: &str,
+        state: &StateSnapshot,
+        sender: &str,
+    ) -> bool {
+        self.may_redact(room_id, state, sender, &HashMap::new())
+    }
+
+    /// Apply a received redaction to its held target only if it takes
+    /// effect: `power_ok` (decided against the state at the redaction) or
+    /// the same server vouching for both senders. The redaction event stays
+    /// in the room either way; an ineffective one just leaves the target.
+    pub(super) fn apply_received_redaction(
+        &self,
+        room_id: &str,
+        target: &str,
+        redaction_id: &str,
+        sender: &str,
+        power_ok: bool,
+    ) -> Result<(), RoomError> {
+        let body = self.read_event(room_id, &EventId::new(target))?;
+        if redaction_applies(
+            power_ok,
+            sender,
+            body["sender"].as_str().unwrap_or_default(),
+        ) {
+            self.apply_redaction(room_id, target, redaction_id)?;
+        }
+        Ok(())
     }
 
     /// Note a redaction whose target this server does not hold, in a room
@@ -1144,9 +1354,22 @@ impl Rooms {
             let mut rewritten: HashSet<String> = HashSet::new();
             if !chunk.events.is_empty() {
                 let mut state = rooms.gap_state(log, room_id, chunk.state_before, &create_id)?;
-                // Only the nodes the room's current state lacks: the
-                // chunk's state is usually that state less a few changes.
-                for (address, node) in state.delta_nodes(log.current_state()) {
+                // Only the nodes a stored state lacks: the chunk's state is
+                // usually the room's state less a few changes. The base must
+                // be a state whose nodes are on disk, which `current_state()`
+                // need not be in a forked room -- there it is the tips'
+                // resolution, computed in memory and stored only as a cache
+                // (`Keyspace::CurrentState`) that the next resolution
+                // replaces and a failed write leaves out, so a node the
+                // chunk shared with it could be referenced and never stored,
+                // and `spindle gc` sweeps any stray copy. The newest log
+                // entry's state was written with the entry and stays
+                // resident; without it, write the whole trie.
+                let persisted = log
+                    .entries()
+                    .next_back()
+                    .and_then(|head| log.state_after(head.li));
+                for (address, node) in state.delta_nodes(persisted) {
                     writes.push((
                         spindle_core::keys::content_addressed(
                             spindle_core::keys::Keyspace::StateNode,

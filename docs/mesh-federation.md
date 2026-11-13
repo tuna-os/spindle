@@ -181,17 +181,25 @@ over federation:
 | a peer asks for our users' device keys | `POST /_matrix/federation/v1/user/keys/query` | served |
 | a peer claims our users' one-time keys | `POST /_matrix/federation/v1/user/keys/claim` | served |
 | a peer wants a user's whole device list | `GET /_matrix/federation/v1/user/devices/{user}` | served |
-| our client asks for a remote user's keys | `/keys/query` and `/keys/claim` ask that user's server, one request per server, and keep the answer as a copy | the same, via the fork's `keys_query` client |
+| our client asks for a remote user's keys | `/keys/query` and `/keys/claim` send one request to each server, all at the same time, and keep the answer as a copy. They stop at the client's `timeout` (10 s if not given). A server that did not answer in time, or that the outbox could not reach recently, goes in `failures` | the same, via the fork's `keys_query` client |
 | a to-device message for a user elsewhere | one `m.direct_to_device` EDU per destination in the next transaction, named by the client's transaction so a retry does not deliver twice | the same |
 | a to-device message for a user here | delivered from the EDU to the device, or to every device for `*`, the sender checked against the origin | the same |
-| a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox; on receipt the keys are stored, or the list re-fetched if the update carried none | the same |
+| a device appears, changes or is deleted | `m.device_list_update` to every server sharing a room with the user, through the durable outbox, each naming the user's previous update as `prev_id`; on receipt an update that follows is applied as it stands, and one behind a lost update, or carrying no keys, re-fetches the whole list once | updates sent and received; the rig does not exercise the chain |
 | cross-signing keys uploaded | `m.signing_key_update` to the same servers | not sent; stored if received |
 
-The two-Spindle suite `tests/e2ee_federation.rs` pins the directory, the
-claim handed out once, to-device both ways including the `*` fan-out
-resolved on the recipient's server, and a device change arriving as
-`device_lists.changed` on the server sharing a room. The rig runs the
-same six probes against the Neutrino node.
+The two-Spindle suite `tests/e2ee_federation.rs` pins the directory and
+the claim that the server hands out once. It also pins to-device in both
+directions, with the `*` fan-out on the recipient's server. Last, it pins
+a device change that reaches the other room member as
+`device_lists.changed`. The rig runs the same six probes against the
+Neutrino node. The suite also pins a request to two servers when one
+server never answers. The request stops at its `timeout`, it has the
+keys from the other server, and the silent server is in `failures`.
+
+`tests/e2ee_device_list_chain.rs` pins the chain. Each update names the
+previous update. A server applies a contiguous chain without a fetch.
+After a gap, the server fetches the list one time only. The served
+`stream_id` is the ID that the next update names.
 
 A note on what a gateway sees: ciphertext and keys, never plaintext.
 Which is the point of choosing federation over a bridge, and what makes
@@ -281,14 +289,13 @@ mesh's question, and the harder one; the Companion project's
    and `/capabilities` advertising it as unstable. When the number is
    assigned, the string changes and nothing else does.
 
-   What it does not do yet is resolve a state-DAG fork: two accepted
-   state events neither of which names the other. Today that is the
-   fork the log already classifies (docs/divergence.md), and the
-   contested key is set aside rather than resolved, exactly as for a
-   stock room. Neutrino runs state resolution 2.1 over the same inputs,
-   so on a fork the two can disagree until the resolver is wired in --
-   the same gap #16 names, now with a version whose whole point is that
-   the resolver's inputs are trustworthy.
+   What it does not have yet is evidence on a state-DAG fork. In such a
+   fork, neither of two accepted events of state names the other. Spindle
+   resolves this fork as it resolves all forks (ADR 0005). It uses state
+   resolution 2.1, which Neutrino also uses, over the states of the
+   parents of an event. No test drives such a fork between Spindle and
+   Neutrino yet. Thus only the shared algorithm, not an observed run,
+   supports their agreement.
 
 4. **MatrixRTC on the node: done here, as a patch.**
    `contrib/neutrino/0002-matrixrtc.patch` serves MSC4143 transports and

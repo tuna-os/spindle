@@ -21,9 +21,12 @@ path = "src/main.rs"
 
 [dependencies]
 argon2.workspace = true
+bcrypt.workspace = true
+unicode-normalization.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 form_urlencoded.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustls.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
@@ -32,12 +35,13 @@ hmac.workspace = true
 hickory-resolver.workspace = true
 lettre.workspace = true
 blake3.workspace = true
+ring.workspace = true
 image.workspace = true
 rand.workspace = true
 ruma.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 regex.workspace = true
 spindle-core = { path = "../spindle-core" }
 spindle-store = { path = "../spindle-store" }
@@ -54,10 +58,53 @@ tracing-opentelemetry = "0.34"
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 
+# Distribution packages (#825). release.yml builds them from the release
+# binary with cargo-deb and cargo-generate-rpm; nothing here changes a normal
+# `cargo build`. `target/pkg/` is staged by the workflow: the unit is the
+# one in deploy/systemd with ExecStart moved from /usr/local/bin (where the
+# tarball puts the binary) to /usr/bin. The unit uses DynamicUser, so no
+# maintainer script creates an account, and nothing enables the service:
+# the operator edits the config first.
+[package.metadata.deb]
+name = "spindle"
+section = "net"
+priority = "optional"
+maintainer = "TunaOS <https://github.com/tuna-os/spindle>"
+extended-description = "Spindle is a Matrix homeserver in one binary over an embedded store."
+depends = "$auto, ca-certificates"
+conf-files = ["/etc/spindle/spindle.toml"]
+assets = [
+    ["target/release/spindle", "usr/bin/spindle", "755"],
+    ["../../target/pkg/spindle.service", "usr/lib/systemd/system/spindle.service", "644"],
+    ["../../spindle.example.toml", "etc/spindle/spindle.toml", "600"],
+    ["../../LICENSE-MIT", "usr/share/doc/spindle/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/spindle/LICENSE-APACHE", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "spindle"
+summary = "Spindle Matrix homeserver"
+assets = [
+    { source = "target/release/spindle", dest = "/usr/bin/spindle", mode = "755" },
+    { source = "../../target/pkg/spindle.service", dest = "/usr/lib/systemd/system/spindle.service", mode = "644" },
+    { source = "../../spindle.example.toml", dest = "/etc/spindle/spindle.toml", mode = "600", config = "noreplace" },
+    { source = "../../LICENSE-MIT", dest = "/usr/share/doc/spindle/LICENSE-MIT", mode = "644", doc = true },
+    { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/spindle/LICENSE-APACHE", mode = "644", doc = true },
+]
+
 [features]
-# Off by default: the reader is a one-shot migration path, and neither the
-# server binary nor the hot CI gate should pay a C compile for it.
+# Off by default: the reader is a one-shot migration path, and the hot CI
+# gate and a development build should not pay a C compile for it. The
+# release builds turn it on (FEATURES in .github/workflows/release.yml and
+# the Dockerfile, #826): the importer must be the same build as the server
+# whose store it opens.
 synapse-import = ["dep:postgres", "dep:rusqlite"]
+# `spindle import-mas` (#797): reads a MAS PostgreSQL database. Off by
+# default, so the hot CI gate and a development build do not compile a
+# PostgreSQL client for a one-shot migration. The release builds turn it
+# on (FEATURES in .github/workflows/release.yml and the Dockerfile, #802):
+# the importer must be the same build as the server whose store it opens.
+mas-import = ["dep:postgres"]
 # Enable the production-corpus replay harness.
 corpus-replay = []
 # MSC3995 linearized hub mode (#22, SPEC section 12). Off by default and off

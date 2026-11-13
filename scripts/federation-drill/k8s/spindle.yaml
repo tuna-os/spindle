@@ -144,7 +144,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: front
-        image: nginxinc/nginx-unprivileged:1.27-alpine
+        image: nginxinc/nginx-unprivileged:1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
         env:
         - {name: SERVER_NAME, value: "reilly.asia"}
         - {name: FED_HOST, value: "matrix.reilly.asia"}
@@ -187,7 +187,7 @@ spec:
         - {name: work, mountPath: /work, readOnly: true}
         - {name: tls, mountPath: /tls, readOnly: true}
       - name: netwatch
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -u, /netwatch/netwatch.py]
         env:
         - {name: ALLOWED, value: "resolver=10.111.63.10:53,peer=10.111.63.11:443"}

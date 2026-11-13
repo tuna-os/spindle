@@ -52,6 +52,9 @@ to let back in.
 - A leaked URI is a leaked file, for as long as the file exists. That is
   the spec's model; deleting the upload is the remedy the spec offers,
   and `Media` supports it.
+- An admin can quarantine an item, a user's uploads, or a room's media.
+  A quarantined item answers 404 on every route and to peers, and its
+  bytes stay as evidence.
 - If per-room media scoping ever enters the spec (MSC3911 is the
   candidate), this ADR is superseded by implementing it, not by adding a
   local rule.
@@ -59,3 +62,31 @@ to let back in.
   makes the route require a token at all, and the underscore records
   that the identity is authenticated and then, by this decision, not
   consulted.
+
+## Amendment: the frozen unauthenticated surface is served
+
+Clients showed that the authenticated routes were not the whole story.
+This server claims no spec version past v1.3. Before this change it sent
+no MSC3916 flag. So nothing moved a client to the authenticated endpoints.
+
+Clients that predate those endpoints fetch avatars and thumbnails from
+the frozen
+`/_matrix/media/v3/download` and `/thumbnail` endpoints. Those fetches
+got 404s. The spec froze those endpoints but keeps them. All reference
+servers still serve them.
+
+The server now serves them as pure capability URLs. It returns the same
+bytes from the same content-addressed store. It binds no token next to
+the URI. This extends decision 1. The IDs hold 128 random bits, so the
+URI itself stays the authorization. The `download_needs_a_token` pin
+still guards the authenticated routes.
+
+These endpoints are frozen as Synapse freezes them. They serve local
+media, and remote media that this server has in its cache. They never
+fetch remote media. A fetch there would let a caller with no account
+make this server download and keep the files of any peer. For remote
+media that is not in the cache, the answer is a plain `M_NOT_FOUND`
+that gives no detail about the peer. An authenticated download puts the
+file in the cache, and after that the frozen endpoints serve it.
+`the_legacy_routes_serve_cached_remote_media_and_never_fetch_it` in
+`tests/federation_media.rs` holds this.

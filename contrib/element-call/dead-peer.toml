@@ -1,0 +1,24 @@
+# The config of each server in docker-compose-dead-peers.yml (#795).
+# entrypoint.sh replaces @SERVER_NAME@ with the service's
+# SPINDLE_SERVER_NAME. The name carries its port, so a peer goes straight
+# to the TLS listener below: it does not try .well-known or SRV first.
+[server]
+name = "@SERVER_NAME@"
+bind = "0.0.0.0:8008"
+
+[storage]
+path = "/data/store"
+
+[ratelimit]
+enabled = false
+
+[registration]
+shared_secret = "test_shared_secret_for_local_dev_only"
+
+[federation]
+# The other sites are reached through nginx on the compose network, which is
+# RFC 1918 space the address guard refuses by default (#288).
+allow_internal = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+bind = "0.0.0.0:8448"
+tls_cert = "/cfg/tls.crt"
+tls_key = "/data/cfg/tls.key"

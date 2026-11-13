@@ -221,6 +221,35 @@ polling in lockstep while someone types. A restart forgets it, correctly.
 numbers, because workers must share it. We have one process; the divergence
 is having less machinery, and it holds only until scale-out (#24) reopens it.
 
+### 4.9 Partial-state joins filled in place (`server/src/rooms/partial.rs`, SPEC §11.5)
+
+A remote join asks `send_join` for `omit_members` (MSC3706, spec v1.6).
+The resident can leave the roster out. Then the snapshots of the new room
+lack most member events.
+
+A background resync gets the state at the join. It fills each member slot
+that a snapshot from the join on does not hold. It changes only the state
+root of each entry (`RoomLog::fill_partial_state`). No event moves, and the
+chain stays the same. The fill never replaces a slot that an event at or
+after the join wrote.
+
+**Siblings:** Synapse is the model. It differs in three places:
+
+- A partial room in Synapse resolves the claimed auth events of an event
+  against its partial state. Spindle takes from the claimed auth events
+  only the member slots that the partial state lacks. Thus a ban or a
+  leave that Spindle holds always wins.
+- Synapse keeps a partial room out of a `/sync` without lazy members until
+  the resync ends. Spindle sends the room with the state that it has. After
+  the resync, the next incremental sync sends the room again, with the full
+  roster.
+- Synapse checks the auth of each event again after the resync, and it can
+  reject an event after the fact. Spindle does not do this. The log gave
+  that event to clients already, and it cannot take the event back.
+  Synapse also gave its clients those events before it checked them again.
+
+conduwuit-lineage servers do not ask for partial joins.
+
 ## 5. What we take from the siblings without taking their code
 
 Tuwunel and continuwuity have run real Matrix traffic; we have not. Their

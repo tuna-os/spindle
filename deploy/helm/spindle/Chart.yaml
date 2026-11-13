@@ -1,0 +1,10 @@
+apiVersion: v2
+name: spindle
+description: Spindle, a Rust Matrix homeserver, as one StatefulSet replica over one volume
+type: application
+version: 0.1.0
+# The image tag has no default: set image.tag (and best image.digest).
+appVersion: "0.0.0"
+home: https://github.com/tuna-os/spindle
+sources:
+  - https://github.com/tuna-os/spindle

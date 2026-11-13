@@ -1204,6 +1204,7 @@ pub async fn fire_loop(
                             &event.event_type,
                             &event.content,
                             event.sticky_ms,
+                            None,
                         )
                         .await
                 }

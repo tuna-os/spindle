@@ -15,6 +15,9 @@ use spindle_core::{EventId, LogEntry};
 use super::{RoomError, Rooms, StateAtAnchor, event_body_key};
 use crate::admin::AdminActor;
 
+/// Body deletes per atomic batch in a purge.
+const PURGE_BATCH: usize = 1024;
+
 /// One log entry as the admin timeline shows it: the spine always, the
 /// body only while it exists. `json: None` with the entry present is the
 /// mark of a purge — the distinction #83 §3 says a purge must preserve.
@@ -342,6 +345,7 @@ impl RoomAdmin<'_> {
             &spindle_core::keys::purge_watermark(room_id),
             &mark.to_be_bytes(),
         )?;
+        spindle_store::Store::sync(self.rooms.store.as_ref(), spindle_store::Durability::Group)?;
         // A filled federation gap's segment sits just below its anchor, so
         // a cutoff at or above the anchor takes the segment's bodies too.
         let mut victims = victims;
@@ -363,15 +367,50 @@ impl RoomAdmin<'_> {
                 }
             }
         }
-        let mut purged = 0;
+        let mut doomed = Vec::new();
         for event_id in &victims {
             let key = event_body_key(room_id, event_id);
-            if spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)?.is_some() {
-                spindle_store::Store::delete(self.rooms.store.as_ref(), &key)?;
-                purged += 1;
+            if let Some(bytes) = spindle_store::ReadView::get(self.rooms.store.as_ref(), &key)? {
+                // The words go with the body: an index row for a body that
+                // is gone would only cost a read, but it is derived data.
+                if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    self.rooms.unindex_body(room_id, event_id, &body)?;
+                }
+                doomed.push(spindle_store::BatchOp::Delete(key));
             }
         }
-        Ok(purged)
+        // Batched and synced: a purge is a promise that content is gone, so
+        // a power cut must not bring bodies back that the call reported
+        // deleted. Chunks keep one batch from growing without bound; the
+        // watermark above already makes a half-done purge read as purged.
+        for chunk in doomed.chunks(PURGE_BATCH) {
+            spindle_store::Store::commit_ops(
+                self.rooms.store.as_ref(),
+                chunk,
+                spindle_store::Durability::Group,
+            )?;
+        }
+        Ok(doomed.len() as u64)
+    }
+
+    /// [`Self::purge_history`], then remove the log below `before_li` too
+    /// ([`Rooms::truncate_room_log`], #817).
+    ///
+    /// The bodies below the cutoff go first, as an ordinary purge does. The
+    /// truncation then lowers its floor to what is safe, so the part
+    /// between that floor and `before_li` is purged and not truncated.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::purge_history`].
+    pub fn truncate_history(
+        &self,
+        room_id: &str,
+        before_li: i64,
+    ) -> Result<(u64, super::TruncationReport), RoomError> {
+        let purged = self.purge_history(room_id, before_li)?;
+        let report = self.rooms.truncate_room_log(room_id, before_li)?;
+        Ok((purged, report))
     }
 
     /// One state event's content, read as an operator.

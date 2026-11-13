@@ -28,6 +28,9 @@ const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 /// The largest `og:image` that will be rehosted.
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
+/// The cache cap when none is configured; the config default.
+const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// How long a cached preview serves before being refetched.
 const CACHE_SECONDS: u64 = 3600;
 
@@ -38,6 +41,13 @@ pub struct Previews {
     /// The same ranges the resolver honours, for URLs that carry a literal
     /// IP and therefore never reach DNS.
     allowed: Vec<Cidr>,
+    /// `[media] preview_cache_max_bytes`.
+    cache_cap: u64,
+    /// Bytes the cache holds: every row plus the image re-hosted for it.
+    /// Built from the rows the first time it is needed and kept in step
+    /// after, like the media quota's count. The lock also serialises
+    /// stores, so two concurrent previews of one URL cannot both win.
+    cache_bytes: tokio::sync::Mutex<Option<u64>>,
 }
 
 #[derive(Debug)]
@@ -96,7 +106,17 @@ impl Previews {
             media,
             client,
             allowed,
+            cache_cap: DEFAULT_CACHE_BYTES,
+            cache_bytes: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Hold the preview cache, rows and re-hosted images together, to `cap`
+    /// bytes, removing the oldest previews first.
+    #[must_use]
+    pub const fn with_cache_cap(mut self, cap: u64) -> Self {
+        self.cache_cap = cap;
+        self
     }
 
     /// Fetch (or serve from cache) the `OpenGraph` preview of `url`.
@@ -142,14 +162,121 @@ impl Previews {
         }
 
         let og = self.fetch_preview(&parsed).await?;
-        let record = json!({ "fetched_at": now, "og": og });
-        Store::put(
-            self.store.as_ref(),
-            &cache_key,
-            record.to_string().as_bytes(),
-        )
-        .map_err(|error| PreviewError::Storage(error.to_string()))?;
+        self.store_entry(&cache_key, now, og).await
+    }
+
+    /// Write a fetched preview, drop what it replaces, and evict the oldest
+    /// previews while the cache is over its cap. Returns the preview to
+    /// serve: another request's, if one stored a fresh entry for the same
+    /// URL while this one was fetching.
+    async fn store_entry(
+        &self,
+        cache_key: &[u8],
+        now: u64,
+        og: Value,
+    ) -> Result<Value, PreviewError> {
+        let storage = |error: &dyn std::fmt::Display| PreviewError::Storage(error.to_string());
+        let mut held = self.cache_bytes.lock().await;
+        let mut total = match *held {
+            Some(total) => total,
+            None => self
+                .scan_entries(None)?
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum(),
+        };
+        let existing = self.read_entry(cache_key)?;
+        if let Some(entry) = &existing
+            && entry
+                .fetched_at
+                .is_some_and(|at| now.saturating_sub(at) < CACHE_SECONDS)
+        {
+            // Lost the race: keep the winner's, whose image is the one a
+            // client may already hold, and discard our copy of the image.
+            if let Some(id) = image_id(&self.media, &og) {
+                self.media
+                    .delete_unheld(&id)
+                    .await
+                    .map_err(|e| storage(&e))?;
+            }
+            *held = Some(total);
+            return Ok(entry.og.clone());
+        }
+        let row = json!({ "fetched_at": now, "og": og }).to_string();
+        Store::put(self.store.as_ref(), cache_key, row.as_bytes()).map_err(|e| storage(&e))?;
+        total = total.saturating_add(entry_bytes(&self.media, row.len(), &og));
+        if let Some(old) = existing {
+            // Replaced because stale: its image was re-hosted for it alone.
+            total = total.saturating_sub(old.bytes);
+            // Never a quarantined or protected image: a stale preview's
+            // image may have been quarantined as evidence since it was made.
+            if let Some(id) = old.media_id {
+                self.media
+                    .delete_unheld(&id)
+                    .await
+                    .map_err(|e| storage(&e))?;
+            }
+        }
+        let evicted = self.evict_over_cap(cache_key, &mut total).await;
+        *held = Some(total);
+        evicted?;
         Ok(og)
+    }
+
+    /// Remove the oldest entries other than `keep` until `total` fits the
+    /// cap. The row goes first, so a half-finished eviction leaves an
+    /// orphan image the media audit can see, never a preview that points
+    /// at bytes that are gone.
+    async fn evict_over_cap(&self, keep: &[u8], total: &mut u64) -> Result<(), PreviewError> {
+        if *total <= self.cache_cap {
+            return Ok(());
+        }
+        let mut entries = self.scan_entries(Some(keep))?;
+        entries.sort_by(|a, b| (a.fetched_at, &a.key).cmp(&(b.fetched_at, &b.key)));
+        for entry in entries {
+            if *total <= self.cache_cap {
+                break;
+            }
+            // A quarantined image is evidence and a protected one was kept on
+            // purpose: the preview that carries either stays, row and image,
+            // even if that leaves the cache over its cap.
+            if let Some(id) = &entry.media_id
+                && self
+                    .media
+                    .is_held(id)
+                    .map_err(|error| PreviewError::Storage(error.to_string()))?
+            {
+                continue;
+            }
+            Store::delete(self.store.as_ref(), &entry.key)
+                .map_err(|error| PreviewError::Storage(error.to_string()))?;
+            *total = total.saturating_sub(entry.bytes);
+            if let Some(id) = entry.media_id {
+                self.media
+                    .delete_unheld(&id)
+                    .await
+                    .map_err(|error| PreviewError::Storage(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_entry(&self, key: &[u8]) -> Result<Option<Entry>, PreviewError> {
+        let row = ReadView::get(self.store.as_ref(), key)
+            .map_err(|error| PreviewError::Storage(error.to_string()))?;
+        Ok(row.map(|value| Entry::parse(&self.media, key.to_vec(), &value)))
+    }
+
+    /// Every cached preview except `skip`.
+    fn scan_entries(&self, skip: Option<&[u8]>) -> Result<Vec<Entry>, PreviewError> {
+        let prefix = vec![keys::KEY_SCHEMA_VERSION, Keyspace::UrlPreview as u8];
+        let rows = ReadView::scan_prefix(self.store.as_ref(), &prefix)
+            .map_err(|error| PreviewError::Storage(error.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter(|(key, _)| skip != Some(key.as_slice()))
+            .map(|(key, value)| Entry::parse(&self.media, key, &value))
+            .collect())
     }
 
     fn client_allows(&self, address: IpAddr) -> bool {
@@ -218,13 +345,67 @@ impl Previews {
         }
         let bytes = read_limited(response, MAX_IMAGE_BYTES).await?;
         let size = bytes.len() as u64;
+        // The server's own copy, not an account's upload: no quota to hold
+        // it to, and refusing it would only break the preview.
         let media_id = self
             .media
-            .put(&bytes, &content_type, None, "url-preview")
+            .put(
+                &bytes,
+                &content_type,
+                None,
+                "url-preview",
+                crate::media::Quota::Exempt,
+            )
             .await
             .map_err(|error| PreviewError::Storage(error.to_string()))?;
         Ok((self.media.mxc(&media_id), size))
     }
+}
+
+/// One cached preview, as the cache accounting sees it.
+struct Entry {
+    key: Vec<u8>,
+    /// `None` for a row that does not parse: the oldest, so evicted first.
+    fetched_at: Option<u64>,
+    og: Value,
+    /// The row plus the image re-hosted for it.
+    bytes: u64,
+    /// The re-hosted image's media ID, if it has one.
+    media_id: Option<String>,
+}
+
+impl Entry {
+    fn parse(media: &Media, key: Vec<u8>, value: &[u8]) -> Self {
+        let cached = serde_json::from_slice::<Value>(value).unwrap_or(Value::Null);
+        let og = cached["og"].clone();
+        Self {
+            key,
+            fetched_at: cached["fetched_at"].as_u64(),
+            bytes: entry_bytes(media, value.len(), &og),
+            media_id: image_id(media, &og),
+            og,
+        }
+    }
+}
+
+/// The media ID of the image re-hosted for `og`, read back from its `mxc://`
+/// URI: no second record to keep in step with the row.
+fn image_id(media: &Media, og: &Value) -> Option<String> {
+    og["og:image"]
+        .as_str()?
+        .strip_prefix(media.mxc("").as_str())
+        .map(str::to_owned)
+}
+
+fn entry_bytes(media: &Media, row_len: usize, og: &Value) -> u64 {
+    let image = if image_id(media, og).is_some() {
+        og["matrix:image:size"].as_u64().unwrap_or(0)
+    } else {
+        0
+    };
+    u64::try_from(row_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(image)
 }
 
 /// Read at most `limit` bytes of a response body, refusing bigger.

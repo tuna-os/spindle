@@ -77,7 +77,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: import
-        image: rust:1.94-bookworm
+        image: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
         command:
         - /work/bin/spindle
         - import-synapse-rehearsal
@@ -148,7 +148,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: spindle
-        image: rust:1.94-bookworm
+        image: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
         command: [/work/bin/spindle, /conf/spindle.toml]
         ports:
         - {name: client, containerPort: 8008}
@@ -165,7 +165,7 @@ spec:
         - {name: conf, mountPath: /conf, readOnly: true}
         - {name: work, mountPath: /work}
       - name: netwatch
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -u, /netwatch/netwatch.py]
         env:
         - {name: ALLOWED_DB, value: "none"}

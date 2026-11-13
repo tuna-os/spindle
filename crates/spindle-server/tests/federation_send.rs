@@ -21,7 +21,8 @@ use axum::http::{Request, StatusCode};
 use ruma::RoomVersionId;
 use ruma::signatures::{Ed25519KeyPair, hash_and_sign_event};
 use serde_json::{Value, json};
-use spindle_server::metrics::{Metrics, PduOutcome};
+use spindle_server::inbound::INGEST_SLOTS;
+use spindle_server::metrics::{BlockingTask, Metrics, PduOutcome};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -146,6 +147,7 @@ fn now_millis() -> u64 {
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    state: spindle_server::AppState,
     store: Arc<FjallStore>,
     metrics: Arc<Metrics>,
 }
@@ -160,11 +162,13 @@ impl Harness {
         )
         .unwrap();
         let metrics = Arc::new(Metrics::new());
-        let app = spindle_server::app_with_metrics(config, store.clone(), Arc::clone(&metrics))
-            .expect("the app builds");
+        let (app, state) =
+            spindle_server::app_with_state(config, store.clone(), Arc::clone(&metrics))
+                .expect("the app builds");
         Self {
             _dir: dir,
             app,
+            state,
             store,
             metrics,
         }
@@ -453,6 +457,230 @@ async fn a_remote_join_and_message_land_and_read_back_over_the_cs_api() {
         json!("hello from over there")
     );
     assert_eq!(messages["chunk"][0]["sender"], json!(peer.user()));
+}
+
+fn redaction_event(
+    store: &Arc<FjallStore>,
+    peer: &Peer,
+    room: &str,
+    prev: &str,
+    target: &str,
+) -> Value {
+    peer.event(federation_auth::with_auth_events(
+        store,
+        json!({
+            "type": "m.room.redaction",
+            "sender": peer.user(),
+            "room_id": room,
+            "content": { "redacts": target },
+            "origin_server_ts": now_millis(),
+            "depth": 12,
+            "prev_events": [prev],
+            "auth_events": [],
+        }),
+    ))
+}
+
+/// Room v3 and later let any member send a redaction; whether it takes
+/// effect is the receiver's call. A remote member without the `redact` power
+/// stays in the timeline as an event but must not strip someone else's
+/// message, while the same member redacting their own message does apply.
+#[tokio::test]
+async fn a_powerless_remote_redaction_is_kept_but_does_not_strip_the_target() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, body) = harness.deliver(&peer, "t1", vec![join]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, sent) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/a1"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "alice's words" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let target = sent["event_id"].as_str().unwrap().to_owned();
+
+    let head = harness.head_event(&room, &alice).await;
+    let redaction = redaction_event(&harness.store, &peer, &room, &head, &target);
+    let (status, body) = harness.deliver(&peer, "t2", vec![redaction]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["pdus"].as_object().unwrap().values().next().unwrap(),
+        &json!({}),
+        "{body}"
+    );
+
+    // The redaction event is in the room, as on other servers.
+    let redaction_id = harness.head_event(&room, &alice).await;
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{redaction_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["type"], "m.room.redaction", "{event}");
+
+    // But the target was not stripped.
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{target}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["content"]["body"], "alice's words", "{event}");
+
+    // The peer's own message is theirs to redact.
+    let head = harness.head_event(&room, &alice).await;
+    let own = message_event(&harness.store, &peer, &room, &head, "bob's words");
+    let own_id = harness.deliver(&peer, "t3", vec![own]).await.1["pdus"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let head = harness.head_event(&room, &alice).await;
+    let redaction = redaction_event(&harness.store, &peer, &room, &head, &own_id);
+    let (status, body) = harness.deliver(&peer, "t4", vec![redaction]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, event) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/event/{own_id}"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(event["content"], json!({}), "{event}");
+}
+
+/// `m.room.server_acl`, both halves: once the room denies the peer, its
+/// PDUs are refused before verification, its room reads are forbidden,
+/// and nothing after the ACL is queued to it on the outbox. The ACL event
+/// itself is: it is how the peer learns it was denied (Complement's
+/// `TestACLs` waits for it on the denied server).
+#[tokio::test]
+async fn a_server_acl_closes_both_directions() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, body) = harness.deliver(&peer, "acl-join", vec![join]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["pdus"].as_object().unwrap().values().next().unwrap(),
+        &json!({})
+    );
+
+    let outbox_rows = |destination: &str| -> usize {
+        spindle_store::ReadView::scan_prefix(
+            harness.store.as_ref(),
+            &spindle_core::keys::federation_outbox_all(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|(key, _)| {
+            spindle_core::keys::federation_outbox_destination(key).as_deref() == Some(destination)
+        })
+        .count()
+    };
+    let before_acl = outbox_rows(&peer.name);
+    assert!(before_acl > 0, "the join's fan-out should have queued rows");
+
+    // Alice denies the peer. The ACL event itself is the last thing the
+    // peer is told.
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.server_acl"),
+            &alice,
+            // The peer's name is `127.0.0.1:port`; the ACL matches hosts
+            // with the port stripped, so the deny names the host.
+            &json!({ "allow": ["*"], "deny": ["127.0.0.1"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after_acl = outbox_rows(&peer.name);
+    assert_eq!(
+        after_acl,
+        before_acl + 1,
+        "the ACL event must reach the server it denies"
+    );
+
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/after-acl"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "not for you" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        outbox_rows(&peer.name),
+        after_acl,
+        "nothing after the ACL goes to the denied server"
+    );
+
+    // Inbound: the peer's message is refused, naming the ACL, and lands
+    // nowhere.
+    let head = harness.head_event(&room, &alice).await;
+    let message = message_event(&harness.store, &peer, &room, &head, "let me in");
+    let (status, body) = harness.deliver(&peer, "acl-denied", vec![message]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, result) = body["pdus"].as_object().unwrap().iter().next().unwrap();
+    assert!(
+        result["error"].as_str().unwrap().contains("server ACL"),
+        "{body}"
+    );
+    assert_eq!(
+        harness.head_event(&room, &alice).await,
+        head,
+        "the denied message must not land"
+    );
+
+    // Room reads are forbidden too.
+    let uri = format!("/_matrix/federation/v1/state_ids/{room}?event_id={head}");
+    let mut object = json!({
+        "method": "GET",
+        "uri": uri,
+        "origin": peer.name,
+        "destination": "example.org",
+    });
+    sign_value(&peer.name, &peer.pair, &mut object);
+    let signature = object["signatures"][&peer.name]["ed25519:0"]
+        .as_str()
+        .unwrap();
+    let header = format!(
+        "X-Matrix origin=\"{}\",destination=\"example.org\",key=\"ed25519:0\",sig=\"{signature}\"",
+        peer.name
+    );
+    let (status, body) = harness
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("server ACL"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -1013,4 +1241,258 @@ async fn a_typing_edu_is_applied_for_the_origins_own_joined_user_only() {
         !typing_of(&sync).contains(&"@alice:example.org".to_owned()),
         "the forged claim is ignored: {sync}"
     );
+}
+
+/// MSC4163: a server the room's ACL denies has its typing and read
+/// receipts dropped like its PDUs. Before the ACL both land; after it,
+/// neither a stop-typing nor a newer receipt changes what alice sees.
+#[tokio::test]
+async fn a_server_acl_drops_the_denied_servers_typing_and_receipts() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+    let join = join_event(&harness.store, &peer, &room, &head);
+    let (status, _) = harness.deliver(&peer, "edu-join", vec![join]).await;
+    assert_eq!(status, StatusCode::OK);
+    let joined_head = harness.head_event(&room, &alice).await;
+
+    let receipt_edu = |event_id: &str| {
+        json!({
+            "edu_type": "m.receipt",
+            "content": {
+                &room: { "m.read": { peer.user(): {
+                    "event_ids": [event_id],
+                    "data": { "ts": now_millis() },
+                } } }
+            },
+        })
+    };
+    let sync = || async {
+        let (status, body) = harness
+            .call(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
+    let ephemeral = |body: &Value, kind: &str| -> Value {
+        body["rooms"]["join"][&room]["ephemeral"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|event| event["type"] == kind)
+            .map_or(Value::Null, |event| event["content"].clone())
+    };
+
+    let (status, body) = harness
+        .deliver_with_edus(
+            &peer,
+            "edu-before",
+            Vec::new(),
+            vec![
+                typing_edu(&room, &peer.user(), true),
+                receipt_edu(&joined_head),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = sync().await;
+    assert_eq!(
+        ephemeral(&before, "m.typing")["user_ids"],
+        json!([peer.user()]),
+        "{before}"
+    );
+    assert!(
+        ephemeral(&before, "m.receipt")[&joined_head]["m.read"][peer.user()].is_object(),
+        "{before}"
+    );
+
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.server_acl"),
+            &alice,
+            &json!({ "allow": ["*"], "deny": ["127.0.0.1"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let acl_event = body["event_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = harness
+        .deliver_with_edus(
+            &peer,
+            "edu-after",
+            Vec::new(),
+            vec![
+                typing_edu(&room, &peer.user(), false),
+                receipt_edu(&acl_event),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = sync().await;
+    assert_eq!(
+        ephemeral(&after, "m.typing")["user_ids"],
+        json!([peer.user()]),
+        "the denied server's stop-typing is dropped: {after}"
+    );
+    assert!(
+        ephemeral(&after, "m.receipt")[&acl_event].is_null(),
+        "the denied server's receipt is dropped: {after}"
+    );
+}
+
+/// #614: a server back from an outage meets every peer's backlog at once,
+/// most of it for the same busy room. Here that room is held -- standing in
+/// for an ingest working through it -- while three times as many
+/// transactions as there are ingest slots arrive for it, on a runtime whose
+/// blocking pool has a few threads beyond the slots. Then as many room
+/// reads as there are workers arrive and wait on the same room, each
+/// handing its worker on (`blocking::section`), which takes a pool thread.
+///
+/// Liveness and readiness must still answer, with the room still held. The
+/// backlog beyond the slots waits as tasks, so the pool keeps threads for
+/// the readers' hand-offs. Admitted all at once, the backlog took every
+/// pool thread; each reader then held its worker while it waited for a
+/// thread that never came, and with both workers stopped `/health` was
+/// not polled again until the room was let go.
+///
+/// Waits here are on the test's own thread: once the workers stop, an
+/// async timer in this future would never fire.
+#[test]
+fn probes_answer_while_a_federation_backlog_waits_on_one_room() {
+    const WORKERS: usize = 2;
+    const SPARE_THREADS: usize = 8;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .max_blocking_threads(INGEST_SLOTS + SPARE_THREADS)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let peer = Arc::new(Peer::start().await);
+        let harness = Arc::new(Harness::new());
+        let alice = harness.register("alice").await;
+        let (room, head) = harness.room_with_invite(&alice, &peer.user()).await;
+        let join = join_event(&harness.store, &peer, &room, &head);
+        let (status, body) = harness.deliver(&peer, "join", vec![join]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let head = harness.head_event(&room, &alice).await;
+
+        let backlog = 3 * INGEST_SLOTS;
+        let messages: Vec<Value> = (0..backlog)
+            .map(|n| message_event(&harness.store, &peer, &room, &head, &format!("backlog {n}")))
+            .collect();
+
+        let (release, holder) = hold_on_a_thread(harness.state.rooms.lock_for_test(&room).unwrap());
+
+        let deliveries: Vec<_> = messages
+            .into_iter()
+            .enumerate()
+            .map(|(n, message)| {
+                let harness = Arc::clone(&harness);
+                let peer = Arc::clone(&peer);
+                tokio::spawn(async move {
+                    harness
+                        .deliver(&peer, &format!("backlog-{n}"), vec![message])
+                        .await
+                })
+            })
+            .collect();
+        let in_flight = |task| harness.metrics.blocking_in_flight(task);
+        wait_on_this_thread("the backlog reaches the held room", || {
+            in_flight(BlockingTask::FederationSend) >= INGEST_SLOTS as u64
+        });
+
+        let readers: Vec<_> = (0..2 * WORKERS)
+            .map(|_| {
+                let harness = Arc::clone(&harness);
+                let request = Request::builder()
+                    .uri(format!(
+                        "/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1"
+                    ))
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap();
+                tokio::spawn(async move { harness.call(request).await.0 })
+            })
+            .collect();
+        wait_on_this_thread("the readers wait on the held room", || {
+            in_flight(BlockingTask::LockWait) >= WORKERS as u64
+        });
+
+        let answered = probes_from_a_task(harness.app.clone());
+        for _ in 0..2 {
+            let (path, status) = answered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the probes answer while the backlog waits on the room");
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+        assert_eq!(
+            in_flight(BlockingTask::FederationSend),
+            INGEST_SLOTS as u64,
+            "the rest of the backlog waits for a turn, holding no thread"
+        );
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        for delivery in deliveries {
+            let (status, body) = delivery.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(only_result(&body), &json!({}), "{body}");
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), StatusCode::OK);
+        }
+    });
+}
+
+/// Hold `lock` exclusively on a thread of its own until told to let go, or
+/// until the sender is dropped -- by a failed assertion, say -- so that the
+/// runtime can shut down.
+fn hold_on_a_thread<T: Send + Sync + 'static>(
+    lock: Arc<std::sync::RwLock<T>>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = lock.write().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Poll `done` on the calling thread, never on a runtime timer.
+fn wait_on_this_thread(what: &str, done: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Ask `/health`, then `/ready`, from a spawned task -- which needs a
+/// worker to run, as a kubelet's probe does -- and hand back each answer.
+fn probes_from_a_task(app: axum::Router) -> std::sync::mpsc::Receiver<(&'static str, StatusCode)> {
+    let (answered_tx, answered) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        for path in ["/health", "/ready"] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            // A test that gave up waiting has dropped the receiver.
+            let _ = answered_tx.send((path, response.status()));
+        }
+    });
+    answered
 }

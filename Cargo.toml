@@ -14,10 +14,16 @@ repository = "https://github.com/tuna-os/spindle"
 
 [workspace.dependencies]
 argon2 = "0.6"
+# Verifying passwords imported from MAS (#797): bcrypt is what Synapse wrote
+# and what MAS keeps for the users syn2mas moved, and MAS's
+# `unicode_normalization` option hashes the NFKC form of the password. The
+# same bcrypt crate MAS verifies with.
+bcrypt = "0.19"
+unicode-normalization = "0.1"
 axum = "0.8"
 form_urlencoded = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "stream"] }
-axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 sha2 = "0.11"
 # TURN's REST credential scheme is specified as HMAC-SHA1 and coturn
@@ -26,6 +32,10 @@ sha2 = "0.11"
 sha1 = "0.11"
 hmac = "0.13"
 blake3 = "1.8"
+# Verifying upstream identity providers' ID tokens (#610): RS256/PS256,
+# ES256/ES384 and EdDSA signatures from a JWKS. Already in the tree as the
+# rustls and lettre crypto provider, so this adds no crate.
+ring = "0.17"
 # Thumbnails only. Default features off and codecs named, because the default
 # set drags in every format the crate knows -- each decoder is attack surface
 # fed with attacker-controlled bytes, so the list is the formats we thumbnail
@@ -39,7 +49,7 @@ rand = "0.10"
 # `synapse-import` feature. `bundled` compiles SQLite itself: a one-shot
 # migration tool is not a reason to make every operator install a system
 # library, nor to make the default build pay for one.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # Native reads from a live Synapse PostgreSQL database. Kept behind the same
 # one-shot migration feature as the SQLite fixture reader.
 postgres = "0.19"
@@ -58,8 +68,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Appservice registration files are YAML by spec, and their namespaces are
 # anchored regular expressions — both formats arrive from the operator, not
-# the network.
-serde_yaml = "0.9"
+# the network. serde-saphyr rather than serde_yaml: that crate is deprecated
+# and parses through `unsafe-libyaml`, an unmaintained machine translation
+# of C (RUSTSEC-2024-0449, #653). This one is a maintained native Rust parser, and
+# only reading is needed, so only the deserializer is built.
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 regex = "1"
 tempfile = "3"
 # Tests only: the certificate a test server needs to bring up its TLS

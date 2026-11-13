@@ -8,6 +8,8 @@
 
 pub mod account;
 pub mod account_data;
+pub mod account_data_routes;
+pub mod account_routes;
 pub mod accounts;
 pub mod admin;
 pub mod admin_federation;
@@ -15,30 +17,41 @@ pub mod admin_media;
 pub mod admin_tasks;
 pub mod admin_ui;
 pub mod appservice_proxy;
+pub mod appservice_routes;
 pub mod appservices;
 pub mod auth;
 pub mod authorize;
+pub mod backup_stream;
 pub mod backups;
 pub mod blobs;
 pub mod blocking;
+pub mod captcha;
+pub mod client_addr;
 pub mod config;
 pub mod dehydrated;
 pub mod delayed;
+pub mod delayed_routes;
 pub mod delegated;
+pub mod device_routes;
 pub mod devices;
 pub mod directory;
+pub mod directory_routes;
+pub mod discovery_routes;
 pub mod e2ee_federation;
 pub mod email;
 pub mod errors;
 pub mod federation;
+pub mod federation_routes;
 pub mod filters;
 #[cfg(feature = "hub-mode")]
 pub mod hub;
 pub mod import;
 pub mod inbound;
+pub mod keys_routes;
 pub mod livekit;
 pub mod mas;
 pub mod media;
+pub mod media_routes;
 pub mod metrics;
 pub mod moderation_routes;
 pub mod netguard;
@@ -48,19 +61,27 @@ pub mod policy;
 pub mod presence;
 pub mod presence_routes;
 pub mod previews;
+pub mod profile_routes;
 pub mod profiles;
 pub mod push;
+pub mod push_routes;
 pub mod push_rules;
 pub mod pushers;
 pub mod ratelimit;
 pub mod receipts;
 pub mod recovery;
+pub mod registration_stages;
+pub mod registration_terms;
 pub mod registration_tokens;
+pub mod remote_space;
 pub mod rendezvous;
+pub mod room_routes;
 pub mod rooms;
 pub mod routes;
 pub mod s3;
+pub mod search_index;
 pub mod secrets;
+pub mod server_acl;
 pub mod server_notices;
 pub mod shared_secret_registration;
 pub mod signing;
@@ -69,9 +90,15 @@ pub mod state_res;
 pub mod state_res_v1;
 pub mod stream;
 pub mod surface;
+pub mod sync_routes;
 pub mod telemetry;
+pub mod threepid;
+pub mod timeline_routes;
 pub mod tokens;
+pub mod txn_replay;
 pub mod typing;
+pub mod upstream;
+pub mod voip_routes;
 pub mod web;
 
 use std::sync::Arc;
@@ -90,6 +117,8 @@ pub struct AppState {
     pub key: Arc<signing::ServerKey>,
     pub rooms: Arc<rooms::Rooms>,
     pub typing: Arc<typing::Typing>,
+    /// Sliding-sync connections (MSC4186), in memory: `sliding.rs` says why.
+    pub sliding: Arc<sliding::Connections>,
     pub account_data: Arc<account_data::AccountData>,
     pub directory: Arc<directory::Directory>,
     pub filters: Arc<filters::Filters>,
@@ -107,6 +136,9 @@ pub struct AppState {
     /// Present exactly when the built-in OIDC provider is configured
     /// (#159): this server is then its own MSC3861 issuer.
     pub oidc: Option<Arc<oidc::BuiltinOidc>>,
+    /// Present exactly when upstream identity providers are configured
+    /// (#610): sign-in delegated to them, accounts linked here.
+    pub upstream: Option<Arc<upstream::Upstream>>,
     pub federation: Arc<federation::Federation>,
     /// The one registry every counter in this server records into, and
     /// the one `/metrics` renders.
@@ -115,12 +147,15 @@ pub struct AppState {
     /// The push gateway client, and the judgement on which gateways it
     /// reaches; `set_pusher` asks it before storing a URL.
     pub push: Arc<push::Gateway>,
+    /// The CAPTCHA check, when `[registration.captcha]` is set.
+    pub captcha: Option<Arc<captcha::Verifier>>,
     /// Single-use challenges for Synapse-compatible shared-secret account
     /// creation. Process-local because a restart invalidates them.
     pub registration_nonces: Arc<shared_secret_registration::RegistrationNonces>,
     pub rendezvous: Arc<rendezvous::Rendezvous>,
     /// One dependency recovery per room at a time, and the peers resting
-    /// after a 429 (`inbound::recovery`).
+    /// after a 429, and the turns inbound transactions take at room work
+    /// (`inbound::recovery`).
     pub recovery: Arc<inbound::RecoveryGate>,
     pub transactions: Arc<policy::TransactionLocks>,
     /// The background fill of recorded federation gaps, which a client
@@ -134,6 +169,10 @@ pub struct AppState {
     /// and restarted. Present in every state — the remote model and the
     /// unconfigured server simply report through it rather than spawn.
     pub sfu: Arc<livekit::SfuSupervisor>,
+    /// The built-in `LiveKit` minter's process state: its client for the
+    /// SFU's room API, and the servers recently unreachable when asked to
+    /// confirm an `OpenID` token.
+    pub minter: Arc<livekit::Minter>,
     /// MSC3995 hub mode's process state (#22): who answered the capability
     /// probe, how far each hubbed room's attestations have gone, counters.
     #[cfg(feature = "hub-mode")]
@@ -149,8 +188,12 @@ pub enum AppError {
     PreviewConfig(String),
     FederationConfig(String),
     PushConfig(String),
+    Captcha(String),
     Appservice(String),
     Email(String),
+    Upstream(String),
+    /// The store could not be read to resume the stream (#815).
+    Store(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -160,8 +203,11 @@ impl std::fmt::Display for AppError {
             Self::PreviewConfig(why) => write!(formatter, "preview config: {why}"),
             Self::FederationConfig(why) => write!(formatter, "federation config: {why}"),
             Self::PushConfig(why) => write!(formatter, "push config: {why}"),
+            Self::Captcha(why) => write!(formatter, "captcha: {why}"),
             Self::Appservice(why) => write!(formatter, "appservice registration: {why}"),
             Self::Email(why) => write!(formatter, "email: {why}"),
+            Self::Upstream(why) => write!(formatter, "upstream identity provider: {why}"),
+            Self::Store(why) => write!(formatter, "store: {why}"),
         }
     }
 }
@@ -377,6 +423,7 @@ fn federation_client(
         client
             .with_peers(&config.federation.peers)
             .with_enabled(config.federation.enabled)
+            .with_server_lists(&config.federation.allow, &config.federation.deny)
             .with_metrics(Arc::clone(metrics)),
     ))
 }
@@ -418,32 +465,59 @@ pub fn app_with_mailer(
     Ok(routes::router(state))
 }
 
+/// The rooms of a store, refusing to start when it cannot be read to find
+/// where the stream resumes (#815).
+fn open_rooms(
+    config: &Config,
+    store: &Arc<FjallStore>,
+    metrics: &Arc<metrics::Metrics>,
+) -> Result<Arc<rooms::Rooms>, AppError> {
+    let rooms = rooms::Rooms::try_with_metrics(
+        Arc::clone(store),
+        config.server.name.clone(),
+        Arc::clone(metrics),
+    )
+    .map_err(|error| AppError::Store(error.to_string()))?;
+    rooms.set_max_resident_rooms(config.storage.max_resident_rooms);
+    rooms.set_search_index(config.search.index);
+    Ok(Arc::new(rooms))
+}
+
+fn captcha_for(config: &Config) -> Result<Option<Arc<captcha::Verifier>>, AppError> {
+    config
+        .registration
+        .captcha
+        .as_ref()
+        .map(captcha::Verifier::new)
+        .transpose()
+        .map(|verifier| verifier.map(Arc::new))
+        .map_err(AppError::Captcha)
+}
+
 fn app_state_with(
     config: Config,
     store: Arc<FjallStore>,
     metrics: Arc<metrics::Metrics>,
     mailer: Option<Arc<dyn email::Mailer>>,
 ) -> Result<AppState, AppError> {
+    passwords::configure(&config.limits);
     let key =
         Arc::new(signing::ServerKey::load_or_create(store.as_ref()).map_err(AppError::Signing)?);
-    let rooms = Arc::new(rooms::Rooms::with_metrics(
-        Arc::clone(&store),
-        config.server.name.clone(),
-        Arc::clone(&metrics),
-    ));
+    let rooms = open_rooms(&config, &store, &metrics)?;
     let limiter = Arc::new(ratelimit::RateLimiter::with_enabled(
         config.ratelimit.enabled,
     ));
     let store_for_filters = Arc::clone(&store);
     let store_for_devices = Arc::clone(&store);
-    let store_for_delayed = Arc::clone(&store);
-    let store_for_presence = Arc::clone(&store);
+    let presence = presence_for(&config, &store);
     let store_for_backups = Arc::clone(&store);
     let account_data = Arc::new(account_data::AccountData::new(Arc::clone(&store)));
-    let blobs = blobs_for(&config);
     let media = Arc::new(
-        media::Media::new(Arc::clone(&store), blobs, config.server.name.clone())
-            .with_max_upload_bytes(config.media.max_upload_bytes),
+        media::Media::new(Arc::clone(&store), blobs_for(&config), &config.server.name)
+            .with_max_upload_bytes(config.media.max_upload_bytes)
+            .with_quota_bytes(config.media.max_bytes_per_user)
+            .with_max_thumbnail_pixels(config.media.max_thumbnail_pixels)
+            .with_remote_cache_cap(Some(config.media.remote_cache_max_bytes)),
     );
     let directory = Arc::new(directory::Directory::new(
         Arc::clone(&store),
@@ -460,6 +534,7 @@ fn app_state_with(
             Arc::clone(&media),
             &config.previews.allow_private,
         )
+        .map(|previews| previews.with_cache_cap(config.media.preview_cache_max_bytes))
         .map_err(|error| AppError::PreviewConfig(error.to_string()))?,
     );
     let federation = federation_client(&config, &store, &key, &metrics)?;
@@ -473,9 +548,15 @@ fn app_state_with(
         .auth
         .builtin_oidc
         .then(|| Arc::new(oidc::BuiltinOidc::new()));
+    let upstream = upstream::Upstream::new(&config.auth.upstream_oidc)
+        .map_err(AppError::Upstream)?
+        .map(Arc::new);
     let push =
         Arc::new(push::Gateway::new(&config.push.allow_internal).map_err(AppError::PushConfig)?);
-    let delayed_caps = config.delayed_events.clone();
+    let captcha = captcha_for(&config)?;
+    let delayed = delayed_for(&config, &store);
+    let dependency_failure_ttl =
+        std::time::Duration::from_secs(config.federation.dependency_failure_ttl_secs);
     let config_for_sfu = config.clone();
     let store_for_sfu = Arc::clone(&store);
     let state = AppState {
@@ -486,6 +567,7 @@ fn app_state_with(
         key,
         rooms,
         typing: Arc::new(typing::Typing::new()),
+        sliding: Arc::new(sliding::Connections::new()),
         account_data,
         directory,
         filters: Arc::new(filters::Filters::new(Arc::clone(&store_for_filters))),
@@ -493,40 +575,58 @@ fn app_state_with(
         media,
         devices: Arc::new(devices::Devices::new(store_for_devices)),
         backups: Arc::new(backups::Backups::new(store_for_backups)),
-        presence: Arc::new(presence::Presence::new(Arc::clone(&store_for_presence))),
+        presence,
         previews,
         profiles,
         appservices,
         delegated,
         oidc: oidc_provider,
+        upstream,
         federation,
-        delayed: Arc::new(
-            delayed::Delayed::with_limits(
-                Arc::clone(&store_for_delayed),
-                delayed_caps.max_delay_ms,
-                delayed_caps.max_per_room,
-            )
-            .with_user_cap(delayed_caps.max_per_user),
-        ),
+        delayed,
         push,
+        captcha,
         registration_nonces: Arc::new(shared_secret_registration::RegistrationNonces::new()),
         rendezvous: Arc::new(rendezvous::Rendezvous::new()),
-        recovery: Arc::new(inbound::RecoveryGate::new()),
+        recovery: Arc::new(inbound::RecoveryGate::new(dependency_failure_ttl)),
         backfill: Arc::new(inbound::GapBackfill::new()),
         metrics,
         mailer,
         sfu: livekit::SfuSupervisor::new(config_for_sfu, store_for_sfu),
+        minter: livekit::Minter::new(),
         #[cfg(feature = "hub-mode")]
         hub: Arc::new(hub::Hub::new()),
     };
-    // Resident rooms are counted at scrape time, from the registry itself,
-    // rather than kept as a counter every admission path would have to
-    // remember to move. Weakly, so the registry never outlives the server.
+    probe_resident_rooms(&state);
+    Ok(state)
+}
+
+/// Resident rooms are counted at scrape time, from the registry itself,
+/// rather than kept as a counter every admission path would have to
+/// remember to move. Weakly, so the registry never outlives the server.
+fn probe_resident_rooms(state: &AppState) {
     let resident = Arc::downgrade(&state.rooms);
     state
         .metrics
         .set_resident_rooms_probe(move || resident.upgrade()?.resident_count());
-    Ok(state)
+}
+
+/// The delayed-event store (MSC4140), capped as `[delayed_events]` says.
+fn delayed_for(config: &Config, store: &Arc<FjallStore>) -> Arc<delayed::Delayed> {
+    let caps = &config.delayed_events;
+    Arc::new(
+        delayed::Delayed::with_limits(Arc::clone(store), caps.max_delay_ms, caps.max_per_room)
+            .with_user_cap(caps.max_per_user),
+    )
+}
+
+/// The presence store, switched as `[presence] enabled` says.
+fn presence_for(config: &Config, store: &Arc<FjallStore>) -> Arc<presence::Presence> {
+    Arc::new(presence::Presence::new(
+        Arc::clone(store),
+        config.presence.enabled,
+        config.server.name.clone(),
+    ))
 }
 
 /// The delivery loops that run for the life of the process. Spawned only
@@ -551,6 +651,24 @@ fn spawn_delivery_loops(state: &AppState) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
+    // Cached remote media past its retention is removed, hourly (#828).
+    if let Some(days) = state.config.media.remote_retention_days {
+        tokio::spawn(media::retention_loop(
+            Arc::downgrade(&state.media),
+            days,
+            std::time::Duration::from_secs(60 * 60),
+        ));
+    }
+    // Presence's clock -- idle, stopped syncing, a peer gone quiet -- at
+    // Synapse's cadence. A pass reads only the users not already offline.
+    if state.presence.enabled() {
+        tokio::spawn(presence::sweep_loop(
+            Arc::downgrade(&state.presence),
+            Arc::downgrade(&state.rooms),
+            Arc::downgrade(&state.federation),
+            presence::SWEEP_INTERVAL,
+        ));
+    }
     // A tenth of a second, the push loop's tick, so a call's departure and
     // its ring land with the same delay. It was a second until #36's
     // comparison against Synapse measured what that cost: a delay landed
@@ -572,12 +690,22 @@ fn spawn_delivery_loops(state: &AppState) {
         rooms::extremities::MergePolicy::of(&state.config.rooms),
         std::time::Duration::from_secs(60),
     ));
+    // History retention truncates expired history on a schedule (#817).
+    // Off unless `[retention] enabled`: it deletes.
+    if state.config.retention.enabled {
+        tokio::spawn(rooms::retention_loop(
+            Arc::downgrade(&state.rooms),
+            Arc::downgrade(&state.metrics),
+            state.config.retention.clone(),
+        ));
+    }
     // Disabled federation leaves queued rows in the outbox and never starts
     // the drain that would only be refused, row by row.
     if state.config.federation.enabled {
         tokio::spawn(federation::drain_outbox(
             Arc::downgrade(&state.store),
             Arc::downgrade(&state.federation),
+            state.rooms.outbox(),
             std::time::Duration::from_millis(state.config.federation.retry_base_ms),
         ));
     }
@@ -596,6 +724,22 @@ fn spawn_delivery_loops(state: &AppState) {
             },
             inbound::BackfillSettings::of(&state.config.federation),
         ));
+    }
+    // Rooms joined with `members_omitted` resync their full state in the
+    // background (`inbound::resync`), resuming after a restart. Not tied to
+    // `gap_backfill`: a partial room is unusable for its roster until this
+    // runs, where an unfilled gap only lacks history.
+    if state.config.federation.enabled {
+        tokio::spawn(inbound::run_resync(inbound::ResyncSources {
+            rooms: Arc::downgrade(&state.rooms),
+            federation: Arc::downgrade(&state.federation),
+            key: Arc::downgrade(&state.key),
+            metrics: Arc::downgrade(&state.metrics),
+            recovery: Arc::downgrade(&state.recovery),
+            wake: state.rooms.partial_state_wake(),
+            server_name: state.config.server.name.clone(),
+            retry: std::time::Duration::from_millis(state.config.federation.retry_base_ms),
+        }));
     }
     // Push delivery shares the outbox's retry base for the same reason
     // the appservice push does, below.

@@ -19,19 +19,34 @@ Two different things are bounded here, and they fail differently:
 
 ## Rates
 
-There are six. Three sit on the unauthenticated edge. The other three are
-MatrixRTC's, and they are the only authenticated rates this server
-enforces: the one thing an account can do that makes every phone in a
-room sound (#39), and the two credential mints a call needs (#38).
+There are two kinds. The fixed windows below guard the unauthenticated
+edge and MatrixRTC (#38, #39). The per-account write budgets after them
+(#741) limit the usual writes of an account.
 
 | Endpoint | Key | Limit | Counted when |
 |---|---|---|---|
 | `POST /login` (password) | account | 5 per 60 s | a failed attempt; a success forgets both keys' history |
 | `POST /login` (password) | source address | 30 per 60 s | a failed attempt |
 | `POST /register` | source address | 5 per 300 s | a request that carries `auth`, i.e. after the mandatory first 401 |
+| `POST /oauth2/registration` (built-in provider) | source address | 20 per 3600 s | every request. The body is at most 16 KiB, with at most 8 redirect URIs of 2 KiB each, and the scheme must be `https`, loopback `http` or a reversed-domain private scheme |
 | `PUT /send/m.rtc.notification` (and the MSC4075 unstable name) | account | `[ratelimit] rings_per_minute`, 10 | every attempt, delayed or not, whether or not the room then refuses it |
 | `POST /user/{userId}/openid/request_token` | user | 20 per 60 s | every request, before the token is minted |
-| `POST /_spindle/rtc/livekit/sfu/get` (built-in LiveKit service) | user | 20 per 60 s | every request that carried a live OpenID token, before the membership check |
+| `POST /_spindle/rtc/livekit/sfu/get` and `.../get_token` (built-in LiveKit service), MSC4195's `get_token` | user | 20 per 60 s | every request that carried a live OpenID token or access token, before the membership check |
+| the same, with another server's OpenID token, and the MSC4195 federation `get_token` | that server | 60 per 60 s | every request that names the server, before this server asks it to confirm the token |
+
+Source limits key on the TCP peer address. Behind a reverse proxy that is
+the proxy, so set `[server] trusted_proxies` to the proxy addresses. The
+server then reads the last `X-Forwarded-For` entry that no trusted proxy
+wrote. From any other peer it ignores the header. IPv6 sources share one key
+per /64 network. When the counter table is full, the server drops the oldest
+counters that are still under their limit and keeps every counter that is
+refusing a caller.
+
+A registration token spends its use before the account is made, and
+gives it back if the account is not made. Two parallel requests cannot
+spend one use twice. Account creation checks the name again under a lock.
+The delegated-auth provider is asked once about a token it calls inactive.
+The answer is kept for up to 30 seconds.
 
 The two mints are limited because they are not reads: an OpenID token is a
 durable row written on the caller's say-so, and both tokens exist to make
@@ -40,61 +55,138 @@ and a room on the SFU there, which is the asymmetry #38 names. A client
 mints one of each per call it joins, so twenty a minute is a busy user
 several times over and a loop within seconds.
 
+A token request with another server's OpenID token makes this server ask
+that server over federation before it knows who is asking. So the limit
+for those requests is per server, and it applies before the question.
+Requests that name one server use only that server's budget. A server
+that does not answer is also not asked again for thirty seconds.
+
 Both login keys are checked before the password is, so a caller over the
 limit does not get an Argon2 verification out of each attempt. Both are
 needed: per-account alone misses credential stuffing, per-source alone
 locks out everyone behind one NAT. The reasoning is in the module header.
 
-**Nothing else an authenticated account does is rate limited.** Event
-sends, room creation, invites, joins, media uploads, device registration,
-sync — none of it. The ring is the exception because it is not an ordinary
-send: it is routed by `m.mentions` to every member it names at high
-priority, past do-not-disturb, and a script making a room ring
-continuously is a nuisance no other event can be (#39). That the rest is
-unlimited is a choice this document records rather than defends:
-the caps below bound what a single account can make the server *hold*,
-and the benchmark rig depends on being able to issue requests as fast as
-the server takes them. A per-account send rate is the obvious next limit
-if abuse ever needs one, and it belongs in `[ratelimit]` beside `enabled`.
+### Per-account write budgets
+
+Every room event, join, invite, room creation and upload spends from a
+per-account token bucket: `burst` requests at once, refilled at
+`per_second`. Each row is its own bucket, so an account that has spent its
+sends can still join. Configured in `[ratelimit]`; the defaults are
+Synapse 1.164's, so an operator's numbers and a client's backoff carry
+across a migration in either direction.
+
+| Endpoint | Key | Default | Synapse name | Counted when |
+|---|---|---|---|---|
+| `PUT /rooms/{id}/send/{type}/{txn}` (rings too), `PUT /rooms/{id}/state/...`, `PUT /rooms/{id}/redact/...` | account | `messages`: burst 10, 0.2/s | `rc_message` | every attempt, delayed or not, except a retried transaction ID, which is answered from what it recorded |
+| `POST /join/{idOrAlias}`, `POST /rooms/{id}/join`, `POST /knock/{idOrAlias}`, answered here | account | `joins_local`: burst 10, 0.1/s | `rc_joins.local` | before the membership event is built |
+| the same, carried to another server (`make_join`/`send_join`, `make_knock`/`send_knock`) | account | `joins_remote`: burst 10, 0.01/s | `rc_joins.remote` | before the handshake; a join that tries locally and finds no room spends both |
+| `POST /rooms/{id}/invite` | inviter | `invites_per_issuer`: burst 10, 0.3/s | `rc_invites.per_issuer` | every attempt |
+| `POST /rooms/{id}/invite`, and `PUT /_matrix/federation/v2/invite` from other servers | invitee | `invites_per_target`: burst 5, 0.003/s | `rc_invites.per_user` | every local attempt that passed the inviter's budget, and every federated invite for a local user, before this server co-signs it |
+| `POST /createRoom` | account | `room_creation`: burst 10, 0.016/s | `rc_room_creation` | every attempt; the request's own `invite` list is not counted again |
+| `POST /media/v3/upload`, `POST /media/v1/create` | account | `media_uploads`: burst 50, 10/s | `rc_media_create` | every attempt; filling a created ID (`PUT /media/v3/upload/{server}/{id}`) is not counted again |
+| `GET /media/v1/preview_url` | account | `url_previews`: burst 20, 0.5/s | none | every request, before the cache is read; a cached answer spends too |
+| `GET /media/v1/download` and `.../thumbnail` of another server's media | requesting account | `remote_media`: burst 100, 2/s | none | only when the media is not cached yet, before the fetch; media already cached is free |
+
+Synapse has no limit for either of the two last rows, so the defaults are
+this server's own. A preview costs up to two outbound fetches. Each remote download needs one fetch and leaves the bytes behind. Each is spent by the
+account that asks, so one account's flood does not use up the budget of
+another. The unauthenticated media routes never fetch and are not limited.
+
+The refusal is 429 `M_LIMIT_EXCEEDED`, with `retry_after_ms` and a
+`Retry-After` header. Both give the time until the bucket has one more
+request. A refusal spends nothing. Thus a client that tries again and
+again does not make its own wait longer.
+
+These limits are buckets, not windows like the login limits. A window
+is correct against password attacks, where any steady rate is the
+attack. For usual writes, a steady rate below the refill is the correct
+use. The bucket must find the difference between a burst from a person
+and a flood from a script. `ratelimit.rs` gives the full reason.
+
+**Exempt** accounts follow Synapse and the appservice spec:
+
+- The sender user of each appservice.
+- The users in the namespaces of a registration with `rate_limited:
+  false`. A registration without the key has limits, as the spec says.
+- Server admins. Synapse does this per account with its override table.
+  This server has no such table. An admin who removes spam must not get
+  a refusal for too many sends.
+
+The server reads the exemption only after a budget is empty. Thus the
+usual path costs no account read.
+
+**No budget** applies to these writes: device registration, profile
+changes, `PUT /typing`, receipts, account data, to-device messages and
+room upgrades. Sync and all other reads have no limit. That is a decision:
+the benchmark rig measures reads, and the caps below limit what an
+account can make the server *hold*.
 
 ## Caps
 
 | What | Cap | Configured by | Refusal |
 |---|---|---|---|
 | Media upload body | 50 MiB by default | `[media] max_upload_bytes`; advertised by `/media/config` | 413 `M_TOO_LARGE` |
+| Media bytes held per account | none by default | `[media] max_bytes_per_user` | 403 `M_RESOURCE_LIMIT_EXCEEDED`, with `admin_contact` from `[server.support]` when set; checked before any byte is stored; deleting media gives its bytes back; appservice users and admins exempt as from the write budgets |
+| Cached remote media | kept until purged by default | `[media] remote_retention_days`; `POST /_synapse/admin/v1/purge_media_cache?before_ts=` | none; an hourly job removes cache entries older than the setting, and never quarantined or protected items or local uploads |
+| URL preview cache | 256 MiB by default | `[media] preview_cache_max_bytes` | not refused. The oldest previews are removed, each row with its re-hosted image, until the cache fits. Below 16 MiB is refused at startup |
+| Cached media from other servers | 2 GiB by default | `[media] remote_cache_max_bytes` | not refused. The oldest cached items are removed, record and bytes, until the cache fits. Quarantined items are never removed. An item bigger than the cap is refused with 413 `M_TOO_LARGE`. Zero is refused at startup |
 | Filters held per user | 1,000 | `[limits] filters_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | Account-data types per user (global + per-room) | 20,000 | `[limits] account_data_per_user` | 400 `M_LIMIT_EXCEEDED`; rewriting an existing type is free |
 | One-time keys held per device | 1,000 | `[limits] one_time_keys_per_device` | 400 `M_LIMIT_EXCEEDED`; counts held plus the batch offered |
 | Pushers registered per user | 100 | `[limits] pushers_per_user` | 400 `M_LIMIT_EXCEEDED`; replacing a registration is free |
 | Pending delayed events per sender per room | 100 | `[delayed_events] max_per_room` | 400 `M_LIMIT_EXCEEDED` |
 | Longest delay | 24 h | `[delayed_events] max_delay_ms` | 400, naming the limit |
-| Rate-limit counter keys | 65,536; identifiers at most 512 bytes | `ratelimit::MAX_TRACKED_KEYS`, `MAX_KEY_BYTES` | new identifiers refused at saturation; expired counters reclaimed without resetting live budgets |
+| Rate-limit counter keys | 65,536 windows and 65,536 write buckets; identifiers at most 512 bytes | `ratelimit::MAX_TRACKED_KEYS`, `MAX_KEY_BYTES` | new identifiers refused at saturation; expired windows and refilled buckets reclaimed without resetting live budgets |
 | Peer-key fetches | 32 concurrent direct fetches; 8,192 entries in each direct-fetch cache | `federation::MAX_CONCURRENT_KEY_FETCHES`, `MAX_KEY_FETCH_ORIGINS` | excess direct fetches refused; failures retained for 60 s and successful refetches throttled for 10 s |
 | Incoming EDUs processed per transaction | 100 | `inbound::send` | additional EDUs ignored; entire transaction body limited to 1 MiB |
 | Pending delayed events per sender across rooms | 1,000 | `[delayed_events] max_per_user` | 400 `M_LIMIT_EXCEEDED` |
 | PDUs per federation transaction | 50 | fixed (the spec's own number) | 400 `M_BAD_JSON` |
 | Federation transaction id length | 255 bytes | fixed | 400 `M_BAD_JSON`; the id is a replay key, and an unbounded key is a storage sink |
 | Peer key-document validity | 7 days regardless of what the peer claims | `federation::MAX_KEY_VALIDITY` | refetch |
+| Ephemeral EDUs (typing, presence) waiting per federation destination | 100 | `Federation::queue_edu` | oldest dropped; held in memory only, and dropped with a transaction that fails |
+| Readers' receipts waiting per federation destination | 1,000 | `federation::MAX_PENDING_RECEIPTS` | a new reader's receipt is not queued; a waiting reader's is replaced |
+| PDUs queued for a destination down for ten minutes or more | the newest 10 of each room | `federation::retry::CATCH_UP_PER_ROOM`; the ten minutes are 600× `[federation] retry_base_ms` | older ones dropped (`spindle_federation_catch_up_dropped_total`); the peer fetches them through `prev_events` if it wants them. A peer with `[federation] peers.max_backoff_ms` keeps its whole queue |
+| PDUs queued for a destination down for ten minutes or more, as new ones arrive | 5,000 | `federation::outbox::MAX_QUEUED_PER_DESTINATION` | the oldest are dropped, down to 4,500 (`spindle_federation_outbox_capped_total`, and a log line); the peer fetches them through `prev_events` and backfill when it returns. A peer with `[federation] peers.max_backoff_ms` is never capped |
+| Wait between delivery attempts to a failing destination | 64× `retry_base_ms` (about a minute) for the first ten minutes, then as long as the outage so far, up to 24 h | `federation::retry::MAX_BACKOFF`, `[federation] peers.max_backoff_ms` | a request from the destination ends the wait; kept in the store, so a restart does not retry every dead server at once |
+| Durable EDUs (to-device, device-list, cross-signing) per outbound transaction | 50 of the spec's 100 | `federation::edu_outbox::PER_TRANSACTION` | the rest wait, in order, for the next transaction; ephemeral EDUs fill the remaining slots |
+| Push notifications waiting per gateway URL | 10,000 | `push::QUEUE_CAP` | oldest dropped, with its stored row; each is stored until its gateway answers, so a restart resumes them |
+| Password hashes (login, registration, password change), for the whole process | 2 at once; 32 more wait | `[limits] password_hashes_at_once`, `password_hashes_waiting` | 429 `M_LIMIT_EXCEEDED` with `retry_after_ms`, at once, when the queue is full. Each hash at once keeps a 19 MiB workspace for reuse (#571). |
 
 Every configurable cap refuses zero at startup. A zero would reject every
 write, and a config that quietly disables a feature is worse than one that
-will not load.
+will not load. `password_hashes_waiting` is the exception. A zero there
+means no queue: a login gets a 429 when all workspaces are in use.
+
+Previews do not count against the quota of the account that asked. A preview
+is a copy that the server owns. Everyone who sees the link shares its image,
+so a per-user quota would charge the wrong person. The preview cache has its
+own cap above, and the per-account rate limits how fast one account can fill
+it. After an hour the server replaces a cached preview and deletes its old
+image.
+
+The cap on remote media removes the oldest items first. A purge by age
+(`[media] remote_retention_days`, #847) removes from the same end. You can turn
+on both. The cap bounds the disk whatever you set for the age, and the age
+setting frees bytes before the cap applies. Neither removes quarantined media,
+which stays as evidence.
 
 ## Account-driven storage growth
 
 Each of these grows with what an ordinary registered account chooses to
-do, and nothing stops it. Listed with the shape a cap would take, so the
-next one is a small change and not a design discussion.
+do, and no cap stops it; the write budgets above bound how fast, not how
+far. Listed with the shape a cap would take, so the next one is a small
+change and not a design discussion.
 
 | Growth | Driven by | Shape of a cap |
 |---|---|---|
-| Rooms created per user | `POST /createRoom` | per-user count, in `[limits]` |
+| Rooms created per user | `POST /createRoom` (budgeted: `room_creation`) | per-user count, in `[limits]` |
 | Aliases per room | `PUT /directory/room/{alias}` (members only since #291) | per-room count |
-| Media objects, and bytes, per user | `POST /upload`, `POST /create` | per-user count and total bytes; the object-level cap exists, the account-level one does not |
+| Media objects per user | `POST /upload`, `POST /create` (budgeted: `media_uploads`) | per-user count; total bytes are capped by `[media] max_bytes_per_user` when it is set |
 | Devices per user | `POST /login` on a new device, `POST /register` | per-user count |
 | Room tags per room per user | `PUT /tags/{tag}` | per-user-per-room count |
-| Invites outstanding per sender | `POST /invite` | per-user count of pending invites |
-| Events per room, and rooms joined per user | `PUT /send`, `POST /join` | a per-account send rate (above), not a cap: a room's history is the product |
+| Invites outstanding per sender | `POST /invite` (budgeted: `invites_per_issuer`) | per-user count of pending invites |
+| Events per room, and rooms joined per user | `PUT /send`, `POST /join` (budgeted: `messages`, `joins_local`, `joins_remote`) | none: a room's history is the product, and the budgets are the bound |
+| To-device messages, device-list and cross-signing updates owed to an unreachable server | `PUT /sendToDevice` to its users; key changes while sharing a room with it | per-destination count. These rows (`Keyspace::EduOutbox`) are kept until the peer acknowledges them, because dropping one is an undecryptable message later (#739). The PDU outbox is cut for a long-dead peer; these are not (#801) |
 
 
 
@@ -106,15 +198,17 @@ and can be closed.
 
 For v0.1, close registration and bound ingress.
 Set a process memory ceiling and monitor storage quotas. See
-[operations.md](operations.md). These are operator-enforced bounds; Spindle
-does not supply general quotas for storage per account.
+[operations.md](operations.md). The media quota is the one per-account
+storage bound Spindle supplies, and it is off unless configured; the rest
+are operator-enforced.
 
 ## How to read this against the code
 
 The inventory is hand-written, which is the failure mode this repository
 usually refuses. The mitigation is that every row in the two bounded
 tables names the constant or config field that enforces it, so a reader
-can grep for it, and the `[limits]` and `[delayed_events]` fields are held
+can grep for it, and the `[limits]`, `[delayed_events]`, `[media]` and
+`[ratelimit]` fields are held
 to `spindle.example.toml` by `scripts/config-drift.py`. A cap that lands
 without a row here is not documented; a row here without a cap behind it
 is a lie. Keep both columns honest.

@@ -1,0 +1,20 @@
+# LiveKit's config for compose.livekit.yaml. Spindle does not start or
+# manage this SFU here: it only mints tokens for it.
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: true
+room:
+  # Spindle creates each room through the API. Users of other servers
+  # cannot open one on this SFU.
+  auto_create: false
+keys:
+  # Same key and secret as [rtc.livekit] in spindle-rtc.toml.
+  # Make a secret with: openssl rand -hex 32
+  APIspindle: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+webhook:
+  api_key: APIspindle
+  urls:
+    # Spindle releases a held call leave when a member leaves the SFU.
+    - http://spindle:8008/_spindle/rtc/livekit/sfu/webhook

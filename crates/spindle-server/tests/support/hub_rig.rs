@@ -4,18 +4,29 @@
 //! A node's server name is its proxy's address, so everything another
 //! server sends it -- transactions, key fetches, hub submissions, probes --
 //! crosses the proxy, and [`Node::partition`] severs all of it at once,
-//! established connections included. The test's own client requests go to
-//! the listener directly, so a partitioned server can still be driven.
+//! established connections included. It severs what the node sends, too:
+//! a signed request names its origin, and every proxy refuses one from a
+//! node that is cut off. Without that, a "gone" server's outbox would still
+//! deliver. The test's own client requests go to the listener directly, so
+//! a partitioned server can still be driven.
 
 #![allow(dead_code, reason = "shared by test binaries that each use a part")]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use spindle_server::AppState;
 use spindle_store::FjallStore;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+
+/// Every node's switch, by server name, for the proxies to look up the
+/// origin of a request.
+static SWITCHES: LazyLock<Mutex<HashMap<String, watch::Sender<bool>>>> =
+    LazyLock::new(Mutex::default);
 
 /// One full homeserver, reached by peers through a proxy it can close.
 pub struct Node {
@@ -27,7 +38,7 @@ pub struct Node {
     pub state: AppState,
     pub store: Arc<FjallStore>,
     client: reqwest::Client,
-    cut: tokio::sync::watch::Sender<bool>,
+    cut: watch::Sender<bool>,
 }
 
 impl Node {
@@ -65,7 +76,8 @@ impl Node {
             .await
             .unwrap();
         });
-        let (cut, _) = tokio::sync::watch::channel(false);
+        let (cut, _) = watch::channel(false);
+        SWITCHES.lock().unwrap().insert(name.clone(), cut.clone());
         tokio::spawn(forward(proxy, direct.clone(), cut.clone()));
         Node {
             _dir: dir,
@@ -78,7 +90,8 @@ impl Node {
         }
     }
 
-    /// Cut this node off from every other server, or reconnect it.
+    /// Cut this node off from every other server, both ways, or reconnect
+    /// it.
     pub fn partition(&self, cut: bool) {
         self.cut.send_replace(cut);
     }
@@ -301,13 +314,10 @@ impl Node {
     }
 }
 
-/// Forward each connection to `direct` until the node is cut off; while it
-/// is, refuse new ones and drop the ones open.
-async fn forward(
-    proxy: tokio::net::TcpListener,
-    direct: String,
-    cut: tokio::sync::watch::Sender<bool>,
-) {
+/// Forward each connection to `direct` until the node, or the node the
+/// connection comes from, is cut off; while either is, refuse new ones and
+/// drop the ones open.
+async fn forward(proxy: tokio::net::TcpListener, direct: String, cut: watch::Sender<bool>) {
     loop {
         let Ok((mut inbound, _)) = proxy.accept().await else {
             return;
@@ -317,17 +327,84 @@ async fn forward(
             continue;
         }
         let direct = direct.clone();
-        let mut watch = cut.subscribe();
+        let mut to = cut.subscribe();
         tokio::spawn(async move {
+            let Some((head, origin)) = request_head(&mut inbound).await else {
+                return;
+            };
+            let mut from = origin.and_then(|origin| {
+                SWITCHES
+                    .lock()
+                    .unwrap()
+                    .get(&origin)
+                    .map(watch::Sender::subscribe)
+            });
+            if *to.borrow() || from.as_ref().is_some_and(|from| *from.borrow()) {
+                return;
+            }
             let Ok(mut outbound) = tokio::net::TcpStream::connect(&direct).await else {
                 return;
             };
+            if outbound.write_all(&head).await.is_err() {
+                return;
+            }
+            let from_cut = async {
+                match from.as_mut() {
+                    Some(from) => drop(from.wait_for(|cut| *cut).await),
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
-                _ = watch.wait_for(|cut| *cut) => {}
+                _ = to.wait_for(|cut| *cut) => {}
+                () = from_cut => {}
             }
         });
     }
+}
+
+/// The head of the first request on `inbound`, and the server that signed
+/// it, if it is signed. The connection's later requests come from the same
+/// server, so one signed request names it for all of them. An unsigned
+/// request (a key fetch) gets `connection: close`, so that it is the only
+/// request on its connection.
+async fn request_head(inbound: &mut tokio::net::TcpStream) -> Option<(Vec<u8>, Option<String>)> {
+    let mut head = Vec::new();
+    let mut chunk = [0; 4096];
+    let end = loop {
+        let read = inbound
+            .read(&mut chunk)
+            .await
+            .ok()
+            .filter(|read| *read > 0)?;
+        head.extend_from_slice(&chunk[..read]);
+        if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end;
+        }
+        if head.len() > 64 * 1024 {
+            return None;
+        }
+    };
+    let origin = String::from_utf8_lossy(&head[..end])
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let (_, origin) = value.split_once("origin=")?;
+            origin
+                .trim_start_matches('"')
+                .split(['"', ','])
+                .next()
+                .map(str::to_owned)
+        });
+    if origin.is_none() {
+        let body = head.split_off(end + 2);
+        head.extend_from_slice(b"connection: close\r\n");
+        head.extend_from_slice(&body);
+    }
+    Some((head, origin))
 }
 
 fn txn() -> String {

@@ -18,6 +18,12 @@ name = "example.org"
 # deliberately.
 bind = "127.0.0.1:8008"
 
+# Reverse proxies whose X-Forwarded-For header is believed, as addresses or
+# CIDR networks. Behind a proxy, set this: otherwise every client has the
+# proxy's address and shares one login and registration limit. The header is
+# ignored from any other peer. The proxy must append the address it sees.
+# trusted_proxies = ["127.0.0.1", "::1"]
+
 # What `.well-known` tells clients to connect to, when that differs from
 # `name`. Delegation is the ordinary case — it exists so the server name need
 # not be the hostname.
@@ -36,13 +42,61 @@ bind = "127.0.0.1:8008"
 path = "./data"
 # Rooms loaded in the background after startup, at once, so the first
 # requests after a restart do not each pay for a cold load. Readiness does
-# not wait for it. 0 turns the warm-up off.
+# not wait for it. Rooms of 10,000 entries or more load first, largest
+# first, so the slowest load starts early; the rest follow newest activity
+# first. 0 turns the warm-up off.
 # warm_concurrency = 2
+# Most rooms held open in memory at once. Each open room keeps an index of
+# every event in it, so this bounds memory. Past it, the rooms untouched for
+# longest are dropped and load again from disk when asked for. A room in use
+# is never dropped. 0 means no limit.
+# max_resident_rooms = 4096
+# How hard a commit is made durable before it is acknowledged.
+#   "strict"  fsync data and metadata for every commit.
+#   "group"   one fsync shared by concurrent commits. The default.
+#   "relaxed" room commits wait for the OS page cache only; a timer fsyncs.
+# Security writes (access tokens, accounts, devices, one-time keys, the
+# signing key) are never weaker than "group", even under "relaxed". Under
+# "strict" they are strict too.
+# durability = "group"
+# Under "relaxed", how often the journal is fsynced in the background, in
+# milliseconds. A crash loses at most about this much. Ignored otherwise.
+# Must be above zero.
+# relaxed_sync_interval_ms = 1000
+
+# Directory for online backups taken with POST /_spindle/admin/v1/backup.
+# Unset turns the endpoint off. Each backup is a new file in this directory.
+# backup_dir = "./backups"
 
 # Upload allowance in bytes, enforced on POST and reserved-media PUT and
 # advertised by both media config endpoints. Match the old server on migration.
 # [media]
 # max_upload_bytes = 52428800 # 50 MiB default; 104857600 for 100 MiB
+# Total bytes one account's uploads may hold. Unset (the default) is no
+# quota. Over it, an upload is refused 403 M_RESOURCE_LIMIT_EXCEEDED before
+# any byte is stored, with `admin_contact` from [server.support] when set;
+# deleting media gives the bytes back. Appservice users and server admins
+# are exempt, as from the write rates below. Zero is refused at startup.
+# max_bytes_per_user = 10737418240 # 10 GiB
+# Most pixels (width times height) a source image may declare and still be
+# thumbnailed. The header is read first; an image over this is refused with
+# 413 M_TOO_LARGE before any pixel is decoded. Zero is refused at startup.
+# max_thumbnail_pixels = 40000000
+# Days to keep media cached from other servers. Unset (the default) keeps
+# the cache until an admin calls POST /_synapse/admin/v1/purge_media_cache.
+# A background job removes older entries hourly. It never removes this
+# server's uploads or quarantined items. Zero is refused at startup.
+# remote_retention_days = 30
+# Total bytes the URL preview cache may hold: stored previews plus the images
+# re-hosted for them. Past it the oldest previews go first, row and image
+# bytes together. Previews are never charged to an account's quota above.
+# Below 16 MiB is refused at startup: one preview can hold a 10 MiB image.
+# preview_cache_max_bytes = 268435456 # 256 MiB
+# Total bytes of other servers' media this server may cache. Past it the
+# oldest cached items go first. This server's own uploads and quarantined
+# items are never touched.
+# Zero is refused at startup.
+# remote_cache_max_bytes = 2147483648 # 2 GiB
 
 # Media blobs in an S3-compatible bucket instead of on local disk. The
 # metadata store stays local either way: it is the index, and an index a
@@ -72,6 +126,37 @@ enabled = true
 # at high priority, so it has a budget of its own (#39). Zero is refused at
 # startup. Off with `enabled = false`.
 rings_per_minute = 10
+# Per-account budgets for ordinary writes (#741): `burst` requests at once,
+# refilled at `per_second`. Synapse's names map across (`rc_message`,
+# `rc_joins.local`/`.remote`, `rc_invites.per_issuer`/`.per_user`,
+# `rc_room_creation`, `rc_media_create`) and so do its defaults, which these
+# are. Over budget is 429 M_LIMIT_EXCEEDED with `retry_after_ms` and a
+# Retry-After header. Exempt: each appservice's own sender, the users in the
+# namespaces of a registration with `rate_limited: false`, and server admins.
+# Burst 0 or a rate that is not positive is refused at startup; for no limit
+# at all, `enabled = false`.
+#
+# Room events: PUT /send (a ring spends this too), PUT /state, PUT /redact.
+messages = { per_second = 0.2, burst = 10 }
+# Joins and knocks on rooms this server is in, and ones it must ask another
+# server for (a federation handshake each, hence the tighter refill).
+joins_local = { per_second = 0.1, burst = 10 }
+joins_remote = { per_second = 0.01, burst = 10 }
+# POST /invite, against the sender and against the invitee; invites from
+# other servers spend the invitee's budget too. A createRoom's own `invite`
+# list is covered by room_creation instead.
+invites_per_issuer = { per_second = 0.3, burst = 10 }
+invites_per_target = { per_second = 0.003, burst = 5 }
+room_creation = { per_second = 0.016, burst = 10 }
+# New media IDs: POST /upload and POST /media/v1/create (filling a created
+# ID is not counted again).
+media_uploads = { per_second = 10.0, burst = 50 }
+# GET /preview_url: every request spends one, cached answer or not. Each new
+# URL makes the server fetch a page and maybe an image.
+url_previews = { per_second = 0.5, burst = 20 }
+# Authenticated downloads and thumbnails of remote media not yet cached: one
+# per fetch. Media already cached is free to read.
+remote_media = { per_second = 2.0, burst = 100 }
 
 [previews]
 # URL previews make the server fetch attacker-chosen URLs, which is the
@@ -90,9 +175,30 @@ allow_private = []
 # account needs a token an admin minted at `/_spindle/admin/v1/registration_tokens`.
 # [registration]
 # require_token = false
+# A policy new accounts must accept before they register (`m.login.terms`,
+# the legacy registration flow). The client shows the link and sends the
+# acceptance. Change `terms_version` when the policy changes.
+# terms_url = "https://example.org/terms"
+# terms_version = "1"
+# terms_name = "Terms of Service"
 # Synapse-compatible `/_synapse/admin/v1/register`. Leave unset unless an
 # integration explicitly needs it: this secret can create administrator users.
 # shared_secret = "replace-with-a-long-random-secret"
+
+# A CAPTCHA every new account solves (`m.login.recaptcha`, the legacy
+# registration flow). `provider` is "recaptcha", "hcaptcha" or "turnstile".
+# Prefer `secret_key_file` to `secret_key`: set exactly one. The secret is
+# never logged. `verify_url` replaces the provider's endpoint, and
+# `allow_internal` lists CIDR ranges that URL may sit in if they are not
+# routable (for a test stub). A provider that does not answer refuses the
+# registration.
+# [registration.captcha]
+# provider = "turnstile"
+# site_key = "0x4AAAAAAA-example"
+# secret_key_file = "/run/secrets/captcha_secret"
+# secret_key = "inline-secret"   # instead of secret_key_file
+# verify_url = "https://captcha.example.org/siteverify"
+# allow_internal = []
 
 # Notices from the operator to a user (`POST /_spindle/admin/v1/send_server_notice`).
 # Absent, the endpoint refuses and says so. The account is created on first use.
@@ -100,6 +206,16 @@ allow_private = []
 # localpart = "server"
 # display_name = "Server Notices"
 # room_name = "Server Notices"
+
+[presence]
+# Track who is online: `PUT /presence`, a client's `/sync` (online unless
+# it says otherwise), idle after five minutes, offline thirty seconds after
+# its last sync -- Synapse's timings. Changes reach room-mates' `/sync` and,
+# as `m.presence` EDUs, every server sharing a room with the user. Off,
+# `PUT /presence` is answered and ignored, `/sync` has no `presence`
+# section, and no `m.presence` is sent or applied: presence is the largest
+# EDU volume on the network, and some operators would rather not carry it.
+enabled = true
 
 [push]
 # Deliver notifications to the push gateways clients register (`POST
@@ -142,8 +258,11 @@ insecure_http = false
 allow_internal = []
 
 # Base retry delay for outbound delivery, in milliseconds. Doubles per
-# consecutive failure per destination, capped at 64×. Tests shrink it;
-# operators should not need to touch it.
+# consecutive failure per destination, capped at 64×. A destination failing
+# for 600× this (ten minutes at the default) then waits as long as it has
+# been down, up to a day, or until it sends this server a request; when it
+# returns it gets each room's newest events, not the whole backlog. Tests
+# shrink it; operators should not need to touch it.
 retry_base_ms = 1000
 
 # Peers reached by configuration rather than by resolving their name: a
@@ -151,7 +270,7 @@ retry_base_ms = 1000
 # (docs/mesh-federation.md). `url` is scheme, host and port, no path; http is
 # allowed here without `insecure_http`. `max_backoff_ms` is the longest wait
 # between delivery attempts while the peer is unreachable -- hours for a peer
-# that is expected to be dark -- and nothing queued is dropped either way.
+# that is expected to be dark -- and nothing queued for such a peer is dropped.
 # peers = { "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" = { url = "http://10.20.0.5:8008", max_backoff_ms = 3600000 } }
 
 # Notaries asked for a peer's signing keys when the peer cannot answer for
@@ -184,7 +303,9 @@ retry_base_ms = 1000
 # a gap in the room's history; this fetches that history with /backfill
 # (one /state_ids per chunk), verifies every event, and stores it so
 # /messages and /context serve it. Backfilled events never notify, never
-# change the room's current state and are never sent on.
+# change the room's current state and are never sent on. The same loop
+# retries events refused for missing dependencies, so a room's newest event
+# is not lost when no later event names it.
 gap_backfill = true
 # Events per /backfill request, and so per chunk.
 gap_backfill_chunk = 100
@@ -206,6 +327,22 @@ gap_backfill_max_events = 100000
 gap_acceptances_per_room = 10
 gap_acceptances_per_origin = 30
 gap_acceptance_window_secs = 600
+
+# A dependency that failed verification (a forged body, or a signature
+# whose key cannot be found) is not fetched again for this many seconds.
+# In that time, a pushed event that names it is refused at once, without
+# a new recovery or gap acceptance. This server keeps the event and
+# judges it again from the gap backfill loop.
+# 0 turns this off.
+dependency_failure_ttl_secs = 300
+
+# Servers this server federates with, as globs (`*`, `?`) like a room's
+# m.room.server_acl. Empty allows every server that `deny` does not name.
+# Set, only these servers are reached or answered. A change needs a restart.
+allow = []
+
+# Servers refused in every room, in both directions, whatever `allow` says.
+deny = []
 
 # MSC3995 hub mode (#22, SPEC section 12.6), between Spindle servers that
 # both turn it on. Only a build with the `hub-mode` Cargo feature can enable
@@ -248,12 +385,38 @@ registrations = []
 #
 # The built-in provider's issuer, when it should not be the client base URL
 # (#609) -- e.g. the issuer a retired MAS used, so clients that stored it
-# keep working. An origin only (scheme, host, optional port, optional
-# trailing slash): discovery, `auth_metadata` and every endpoint URL are
-# built on it, and the endpoints are served at the root of whichever host
-# reaches Spindle, so point that host's proxy at Spindle too. Requires
+# keep working. Discovery, `auth_metadata` and every endpoint URL are built
+# on it, so point that host's proxy at Spindle too. It may have a path
+# ("https://example.org/auth/") for a proxy that publishes the provider
+# under one: the provider answers with the path or without it (a proxy that
+# strips it), and its pages' links and redirects keep the path. No query,
+# fragment or credentials; the path's first segment may not be one of the
+# server's own routes (account, oauth2, upstream, _matrix, ...). Requires
 # builtin_oidc = true.
 # oidc_issuer = "https://auth.example.org/"
+
+# Upstream OIDC identity providers (#610): sign-in through Authelia,
+# Keycloak, Kanidm, ... with each upstream identity linked to one account
+# here, as MAS's upstream_oauth2. The sign-in pages show a button per
+# provider and the client API offers them as m.login.sso. Register the
+# redirect URI {issuer}/upstream/callback/{id} at the provider. Not with
+# [auth.delegated]. A first sign-in creates an account from
+# localpart_claim and refuses a name that is taken.
+# upstream_oidc = []    # empty by default; one table like this per provider:
+# [[auth.upstream_oidc]]
+# id = "keycloak"                    # stable: in the callback URL and links
+# name = "Keycloak"                  # the button label (default: id)
+# issuer = "https://sso.example.org/realms/main"
+# client_id = "spindle"
+# client_secret_file = "/run/secrets/keycloak"   # or client_secret = "..."
+# token_endpoint_auth_method = "client_secret_basic"  # or client_secret_post, none
+# scopes = ["openid", "profile", "email"]
+# localpart_claim = "preferred_username"
+# displayname_claim = "name"
+# link_existing_by_email = false     # link a first sign-in by its verified
+#                                    # `email` claim (email_verified = true)
+# fetch_userinfo = false             # read claims from userinfo too (Authelia)
+# insecure_http = false              # allow a plain-http issuer off loopback
 
 # MSC3861 delegation: an external OIDC provider (typically the Matrix
 # Authentication Service) owns identity, and this server validates its
@@ -278,6 +441,14 @@ registrations = []
 # `matrix_authentication_service` section does — so a MAS set up for that
 # (no client of its own for the homeserver) needs no change.
 # homeserver_secret = "..."
+#
+# How many seconds one introspection verdict is trusted before the provider
+# is asked again (default 120, Synapse's fixed window; 0 asks on every
+# request). It bounds only a revocation the provider makes without telling
+# this server: a logout, device deletion or deactivation served here, or
+# reported through /_synapse/mas/*, ends the token at once, and no verdict
+# outlives the token's own expires_in.
+# introspection_cache_ttl_secs = 120
 
 # Outgoing mail for the built-in provider (#608; needs builtin_oidc = true).
 # Entirely optional: without it, users recover a forgotten password with the
@@ -364,9 +535,10 @@ registrations = []
 # ]
 
 # The built-in LiveKit JWT service (#38, MSC4195) — off unless the
-# `[rtc.livekit]` section below is set, with all three of url, key and
-# secret. The header is commented out with the rest for that reason: a
-# section that is present but empty is a misconfiguration, not "off".
+# `[rtc.livekit]` section below is set, with url, key, and one of secret
+# and secret_file. The header is commented out with the rest for that
+# reason: a section that is present but empty is a misconfiguration, not
+# "off".
 # See docs/matrix-rtc.md for the deployment end to end.
 # [rtc.livekit]
 #
@@ -382,7 +554,14 @@ registrations = []
 # holds their token until it expires — which is why the window below is
 # short, and why it is the whole of the guarantee.
 #
+# Users of other servers in a call are confirmed with their own server
+# (its federation openid/userinfo, as lk-jwt-service does) and get a token
+# that joins and subscribes but does not publish. The call's room is made
+# on the SFU through its API for this server's users, so the SFU can keep
+# `auto_create: false`, and this server must be able to reach `url` below.
+#
 # The SFU's own websocket address, as handed to clients with their token.
+# Its http(s) twin is where rooms are created.
 # url = "wss://livekit.example.org"
 #
 # LiveKit's API key and secret — the same pair the SFU was started with
@@ -390,7 +569,17 @@ registrations = []
 # shared with the SFU and nothing else: it is not this server's signing
 # key, and it is never logged.
 # key = "APIxxxxxxxx"
-# secret = "..."
+# secret_file = "/run/secrets/livekit-secret"   # or secret = "..."
+#
+# Set exactly one of secret and secret_file. The file is read once at
+# startup and its trailing newline is ignored; a missing or empty file
+# stops the server. Restart to use a rotated secret.
+#
+# Other servers whose users may publish on this SFU, as if they were this
+# server's own (lk-jwt-service's LIVEKIT_FULL_ACCESS_HOMESERVERS). Named
+# one by one: there is no wildcard, because publishing spends this SFU's
+# bandwidth. Empty by default: other servers' users subscribe only.
+# full_access_servers = ["friend.example.net"]
 #
 # How long a minted token admits its holder, in seconds. Fifteen minutes by
 # default: enough to join and ride out a reconnect, short enough that a
@@ -465,6 +654,35 @@ registrations = []
 # The fewest seconds between two dummy events in one room.
 # dummy_event_interval_secs = 300
 
+[retention]
+# History retention (#817, MSC1763). Off by default, because it deletes
+# history. When on, a background job truncates each room's log below the
+# newest event that is older than the room's maximum lifetime. The log, the
+# event bodies and the old state of those events go, and `spindle gc` then
+# frees the state nodes that only they used. A room sets its own lifetime
+# with an m.room.retention event; the limits below clamp it. The job skips
+# rooms in hub mode, in a partial-state join and with a fork.
+#
+# enabled = false
+# Days any room keeps events. This is the default for a room without an
+# m.room.retention event and the most a room may ask for. Absent, a room
+# without a policy keeps everything.
+# max_lifetime_days = 365
+# The fewest days any room keeps events. A room's lifetime is raised to this.
+# min_lifetime_days = 7
+# Minutes between two runs of the job.
+# interval_minutes = 60
+
+[search]
+# A word index for `POST /search` (#830). Without it, a search reads every
+# message of each room it covers. With it, a search reads only the messages
+# that may contain the words, and the answer is the same. The index covers
+# `content.body`, the default search key. Searches on other keys still scan.
+# The index adds a few rows to each message that the server stores. Rooms
+# that existed before you turned it on are searched by scanning until you
+# stop the server and run `spindle reindex-search <config>`.
+# index = false
+
 [limits]
 # Ceilings on what one account may make this server hold. Each of these
 # stores grew without bound under an ordinary registered account before the
@@ -488,9 +706,21 @@ registrations = []
 #
 # Pushers one account may register. A client registers one per device.
 # pushers_per_user = 100
+#
+# The next two bound the whole process, not one account (#571). Every
+# password login, registration and password change runs one Argon2 hash,
+# and each hash needs a 19 MiB workspace. The process keeps at most
+# `password_hashes_at_once` workspaces and reuses them; at most
+# `password_hashes_waiting` callers wait for one, and the next is refused
+# with 429 `M_LIMIT_EXCEEDED`. A zero queue is allowed and means "refuse
+# rather than wait"; zero workspaces is not.
+# password_hashes_at_once = 2
+# password_hashes_waiting = 32
 
 [logging]
-# A `tracing-subscriber` filter directive.
+# A `tracing-subscriber` filter directive. The default is
+# "info,ruma_state_res=warn": the state resolution library logs two INFO
+# lines for every event it authorizes. Name its target to see them again.
 # filter = "spindle=debug,warn"
 # Export spans as traces. Off unless named; the only value is "otlp", which
 # sends OTLP/HTTP to the endpoint OTEL_EXPORTER_OTLP_ENDPOINT names (its

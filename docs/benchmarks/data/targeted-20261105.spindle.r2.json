@@ -1,0 +1,81 @@
+{
+  "benchmarks": {
+    "federated_join/1000": {
+      "join_returned_ns": 124916282.0,
+      "joined_members": 1002,
+      "lower_ns": 130779614.0,
+      "mean_ns": 130779614.0,
+      "samples": 1,
+      "upper_ns": 130779614.0
+    },
+    "federated_join/10000": {
+      "join_returned_ns": 1021214418.0,
+      "joined_members": 10002,
+      "lower_ns": 1103532452.0,
+      "mean_ns": 1103532452.0,
+      "samples": 1,
+      "upper_ns": 1103532452.0
+    },
+    "partition_catchup/200": {
+      "events_per_second": 374.254042567882,
+      "heal_to_served_ns": 1612134447.0,
+      "lower_ns": 537068347.0,
+      "mean_ns": 537068347.0,
+      "resident_retry_ns": 1075066100.0,
+      "samples": 1,
+      "upper_ns": 537068347.0
+    },
+    "send_throughput/2": {
+      "clients": 2,
+      "latency_lower_ns": 557603.0,
+      "latency_median_ns": 843078.5,
+      "latency_p99_ns": 1351595.0,
+      "latency_samples": 96,
+      "lower_ns": 441022.4479166667,
+      "mean_ns": 441022.4479166667,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 2267.458277291488,
+      "upper_ns": 441022.4479166667
+    },
+    "send_throughput/4": {
+      "clients": 4,
+      "latency_lower_ns": 851822.0,
+      "latency_median_ns": 1472305.0,
+      "latency_p99_ns": 2828133.0,
+      "latency_samples": 96,
+      "lower_ns": 385164.40625,
+      "mean_ns": 385164.40625,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 2596.2939040398414,
+      "upper_ns": 385164.40625
+    },
+    "send_throughput/8": {
+      "clients": 8,
+      "latency_lower_ns": 693924.0,
+      "latency_median_ns": 2948513.0,
+      "latency_p99_ns": 5065400.0,
+      "latency_samples": 96,
+      "lower_ns": 401850.15625,
+      "mean_ns": 401850.15625,
+      "room_events": 200,
+      "samples": 1,
+      "sends_per_second": 2488.489762780825,
+      "upper_ns": 401850.15625
+    }
+  },
+  "clients": [
+    2,
+    4,
+    8
+  ],
+  "dimension": "targeted",
+  "members": [
+    1000,
+    10000
+  ],
+  "missed": 200,
+  "round": 2,
+  "server": "spindle"
+}

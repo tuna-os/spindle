@@ -13,9 +13,22 @@ use spindle_core::keys;
 use spindle_store::{ReadView, Store};
 
 use crate::AppState;
-use crate::accounts::{Accounts, unguessable_password};
+use crate::accounts::Accounts;
 use crate::errors::MatrixError;
 use crate::routes::room_error;
+
+/// Whether `localpart` belongs to a service identity that ordinary account
+/// creation must not hand out: an appservice's sender, or the server-notices
+/// account while `[server_notices]` is configured.
+#[must_use]
+pub fn is_reserved_localpart(state: &AppState, localpart: &str) -> bool {
+    state.appservices.reserves_localpart(localpart)
+        || state
+            .config
+            .server_notices
+            .as_ref()
+            .is_some_and(|config| config.localpart.eq_ignore_ascii_case(localpart))
+}
 
 /// What an admin asked to send.
 pub struct Notice<'a> {
@@ -61,14 +74,29 @@ pub async fn send(state: &AppState, notice: &Notice<'_>) -> Result<String, Matri
 
     // The notices account, born on first use with a password nobody holds.
     let sender = accounts.user_id(&config.localpart);
-    if accounts
+    let existing = accounts
         .account(&config.localpart)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .is_none()
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    // An account somebody else registered under this name is not ours to
+    // speak as: its owner may hold a password for it.
+    if existing
+        .as_ref()
+        .is_some_and(|account| !account.service_owned)
     {
+        return Err(MatrixError::new(
+            axum::http::StatusCode::CONFLICT,
+            "M_USER_IN_USE",
+            format!(
+                "the server-notices localpart {:?} belongs to an account this server did not \
+                 create for that purpose; choose another [server_notices] localpart",
+                config.localpart
+            ),
+        ));
+    }
+    if existing.is_none() {
         accounts
-            .register(&config.localpart, &unguessable_password())
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            .register_service(&config.localpart)
+            .map_err(|error| crate::routes::internal(&error))?;
         state
             .profiles
             .set(&sender, Some(Some(config.display_name.clone())), None)

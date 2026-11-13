@@ -38,6 +38,13 @@ The extension adds a predicate to decide whether to admit a candidate.
 The usual `resolve` function uses an always-true predicate.
 The patch preserves the event order and the rules for auth dependencies.
 
+The exception has no end date, so we keep it small and watch it. The
+vendored tree's `SPINDLE-PATCH.md` lists every hunk with its reason, and
+`scripts/ruma-drift.py --check` fails CI on any hunk it does not list.
+The weekly upkeep report compares upstream's newest release with the base.
+It marks a change to state resolution as drift; docs/maintenance.md gives
+the rebase procedure.
+
 ADR 0002 asks for an upstream PR before a fork.
 We read the upstream repository and prepared a patch.
 Under its [rules for contributions](https://github.com/ruma/ruma/blob/main/CONTRIBUTING.md#llm-contributions), an LLM cannot write content for the project.

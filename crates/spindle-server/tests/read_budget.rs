@@ -137,8 +137,10 @@ impl Harness {
     }
 
     /// A room with `members` joined users besides the creator, plus an
-    /// observer whose requests are the ones measured.
-    async fn room_with(&self, members: usize, tag: &str) -> (String, String) {
+    /// observer whose requests are the ones measured. Returns the room, the
+    /// observer's token and the creator's, for a test that needs someone
+    /// else to speak.
+    async fn room_with(&self, members: usize, tag: &str) -> (String, String, String) {
         let alice = self.register(&format!("alice{tag}")).await;
         let room = self
             .request(
@@ -184,7 +186,29 @@ impl Harness {
             &json!({}),
         )
         .await;
-        (room, observer)
+        (room, observer, alice)
+    }
+
+    /// `token`'s sync from `since`, or an initial one; its `next_batch`.
+    async fn sync(&self, token: &str, since: Option<&str>) -> String {
+        let uri = since.map_or_else(
+            || "/_matrix/client/v3/sync".to_owned(),
+            |since| format!("/_matrix/client/v3/sync?since={since}&timeout=0"),
+        );
+        self.request("GET", &uri, Some(token), &json!({})).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// One message in `room` from `token`.
+    async fn say(&self, room: &str, token: &str, txn: &str) {
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{txn}",
+            urlencode(room)
+        );
+        let body = json!({ "msgtype": "m.text", "body": "tick" });
+        self.request("PUT", &path, Some(token), &body).await;
     }
 
     fn reads(&self) -> u64 {
@@ -212,7 +236,7 @@ async fn assert_flat_in_membership(name: &str, path: impl Fn(&str) -> String) {
     let mut counts = Vec::new();
     for (members, tag) in [(SMALL, "s"), (LARGE, "l")] {
         let harness = Harness::new();
-        let (room, observer) = harness.room_with(members, tag).await;
+        let (room, observer, _) = harness.room_with(members, tag).await;
         counts.push(reads_for(&harness, "GET", &path(&room), &observer, &json!({})).await);
     }
     let (small, large) = (counts[0], counts[1]);
@@ -234,7 +258,7 @@ async fn a_sliding_window_naming_its_state_does_not_read_the_room() {
     let mut counts = Vec::new();
     for (members, tag) in [(SMALL, "ws"), (LARGE, "wl")] {
         let harness = Harness::new();
-        let (_room, observer) = harness.room_with(members, tag).await;
+        let (_room, observer, _) = harness.room_with(members, tag).await;
         let body = json!({
             "lists": { "main": {
                 "ranges": [[0, 10]],
@@ -288,7 +312,7 @@ async fn an_incremental_sync_does_not_read_the_room_per_poll() {
     let mut counts = Vec::new();
     for (members, tag) in [(SMALL, "is"), (LARGE, "il")] {
         let harness = Harness::new();
-        let (_room, observer) = harness.room_with(members, tag).await;
+        let (_room, observer, _) = harness.room_with(members, tag).await;
         let since = harness
             .request(
                 "GET",
@@ -315,6 +339,38 @@ async fn an_incremental_sync_does_not_read_the_room_per_poll() {
 
 #[tokio::test]
 #[ignore = "release-mode CI performance gate"]
+async fn an_incremental_sync_with_one_new_event_does_not_read_the_room() {
+    // #701, the benchmark's `sync_delta`: someone else says one thing, and
+    // the observer's next sync carries it. The badge puts the new event to
+    // the observer's push rules, whose `room_member_count` condition read
+    // and parsed every member's event to count them -- a read per member on
+    // every sync that carried a message. Measured before the fix at 41
+    // reads with 25 members and 116 with 100.
+    let mut counts = Vec::new();
+    for (members, tag) in [(SMALL, "ds"), (LARGE, "dl")] {
+        let harness = Harness::new();
+        let (room, observer, alice) = harness.room_with(members, tag).await;
+        let mut since = harness.sync(&observer, None).await;
+        // One delta to warm what a delta warms, then the one measured.
+        harness.say(&room, &alice, "warm").await;
+        since = harness.sync(&observer, Some(&since)).await;
+        harness.say(&room, &alice, "measured").await;
+        let before = harness.reads();
+        harness.sync(&observer, Some(&since)).await;
+        counts.push(harness.reads() - before);
+    }
+    assert!(
+        counts[1] <= counts[0] + FLAT_SLACK,
+        "an incremental sync carrying one message reads {} rows at {SMALL} \
+         members and {} at {LARGE}. One new event must not cost a walk of \
+         the room.",
+        counts[0],
+        counts[1]
+    );
+}
+
+#[tokio::test]
+#[ignore = "release-mode CI performance gate"]
 async fn the_operations_that_do_read_every_member_are_named_and_bounded() {
     // The other half of an honest gate. These three legitimately return
     // something per member, so their reads *must* grow -- asserting they are
@@ -327,7 +383,7 @@ async fn the_operations_that_do_read_every_member_are_named_and_bounded() {
     //   /sync with no filter    the whole state block, because the client
     //                           did not ask for less
     let harness = Harness::new();
-    let (room, observer) = harness.room_with(LARGE, "lin").await;
+    let (room, observer, _) = harness.room_with(LARGE, "lin").await;
     let members = LARGE as u64 + 2; // the joiners, alice, and the observer
 
     for (name, uri) in [

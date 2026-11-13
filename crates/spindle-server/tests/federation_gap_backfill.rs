@@ -310,6 +310,7 @@ impl Peer {
 struct Setup {
     backfill: bool,
     per_room: usize,
+    per_origin: usize,
     idle_ms: u64,
 }
 
@@ -318,6 +319,7 @@ impl Default for Setup {
         Self {
             backfill: true,
             per_room: 10,
+            per_origin: 30,
             idle_ms: 50,
         }
     }
@@ -334,8 +336,9 @@ async fn serve(
         "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n\
          [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n\
          gap_backfill = {}\ngap_backfill_interval_ms = 5\ngap_backfill_idle_ms = {}\n\
-         gap_backfill_retry_ms = 50\ngap_acceptances_per_room = {}\n",
-        setup.backfill, setup.idle_ms, setup.per_room
+         gap_backfill_retry_ms = 50\ngap_acceptances_per_room = {}\n\
+         gap_acceptances_per_origin = {}\n",
+        setup.backfill, setup.idle_ms, setup.per_room, setup.per_origin
     ))
     .unwrap();
     let app =
@@ -1302,33 +1305,203 @@ async fn participating_servers_are_ranked_by_joined_members() {
     assert_eq!(ranked, vec!["z.example", "m.example", "a.example"]);
 }
 
-/// The amplification guard: a room gets only so many gap acceptances per
-/// window, and the rest are refused as they were before gap acceptance.
+/// #620: recovery, gap acceptance and backfill ask for the ranking per
+/// received PDU or chunk, so it is read from the membership index -- one
+/// point read per member, no event body parsed -- once per state: ten
+/// asks of an unchanged room cost at most one read per member between
+/// them, where each used to read every member event. And it is never
+/// stale: a kick that changes which server has the most members joined
+/// changes the next answer.
 #[tokio::test]
-async fn gap_acceptances_are_capped_per_room() {
-    let harness = Harness::new(Setup {
+async fn participating_servers_are_read_once_per_state_and_never_stale() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = ServerKey::load_or_create(store.as_ref()).unwrap();
+    let room = Rooms::new(Arc::clone(&store), "example.org")
+        .create(
+            ALICE,
+            key.pair(),
+            None,
+            None,
+            Some("public_chat"),
+            &[],
+            &[],
+            Some("10"),
+            None,
+            None,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+    // many.example: three joined. few.example: two joined. gone.example:
+    // two joined, both left.
+    let mut members = 0_u64;
+    for (domain, joined, leave) in [
+        ("many.example", 3, false),
+        ("few.example", 2, false),
+        ("gone.example", 2, true),
+    ] {
+        let remote = Rooms::new(Arc::clone(&store), domain);
+        let document = ruma::signatures::Ed25519KeyPair::generate();
+        let pair = ruma::signatures::Ed25519KeyPair::from_der(&document, "0".to_owned()).unwrap();
+        for index in 0..joined {
+            let user = format!("@user{index}:{domain}");
+            remote
+                .set_membership(&room, &user, &user, "join", None, &pair)
+                .unwrap();
+            if leave {
+                remote
+                    .set_membership(&room, &user, &user, "leave", None, &pair)
+                    .unwrap();
+            }
+            members += 1;
+        }
+    }
+    let rooms = Rooms::new(Arc::clone(&store), "example.org");
+    // Load the room first, so the count is the ranking and not the room's
+    // first read from disk.
+    rooms.state(&room).unwrap();
+    let before = store.reads();
+    for _ in 0..10 {
+        assert_eq!(
+            rooms.participating_servers(&room).unwrap(),
+            vec!["many.example", "few.example"]
+        );
+    }
+    let reads = store.reads() - before;
+    assert!(
+        reads <= members,
+        "ten rankings of an unchanged room cost {reads} reads; the budget is one per \
+         remote member ({members}) between them"
+    );
+    for index in 0..2 {
+        rooms
+            .set_membership(
+                &room,
+                ALICE,
+                &format!("@user{index}:many.example"),
+                "leave",
+                None,
+                key.pair(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        rooms.participating_servers(&room).unwrap(),
+        vec!["few.example", "many.example"]
+    );
+}
+
+/// The amplification guard (#620): a room, and an origin, get only so many
+/// gap acceptances per window, and the rest are refused as they were
+/// before gap acceptance, counted under the cap that refused them.
+#[tokio::test]
+async fn gap_acceptances_are_capped_per_room_and_per_origin() {
+    for (per_room, per_origin, capped) in [
+        (2, 30, GapResult::CappedRoom),
+        (10, 2, GapResult::CappedOrigin),
+    ] {
+        let harness = Harness::new(Setup {
+            backfill: false,
+            per_room,
+            per_origin,
+            ..Setup::default()
+        })
+        .await;
+        let bob = harness.user("bob");
+        let bob_join = harness.head.clone();
+        harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[]));
+        let pushed: Vec<(String, Value)> = (0..4)
+            .map(|index| {
+                let hidden =
+                    harness.message(&bob, &bob_join, &harness.head, &format!("hidden {index}"));
+                harness.message(&bob, &bob_join, &hidden, &format!("pushed {index}"))
+            })
+            .collect();
+        for event in &pushed {
+            harness.push(&[event]).await;
+        }
+        assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 2);
+        assert_eq!(harness.metrics.gap_count(capped), 2, "{capped:?}");
+        assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 2);
+        assert_eq!(harness.gaps().len(), 2);
+    }
+}
+
+/// #620: a gap's backfill asks only servers in the room right now. The
+/// server that sent the gap event and served its state is the first one
+/// asked -- unless every user of it has left since, when it would answer
+/// 403 "Host not in room". With no server left in the room the gap waits
+/// for one rather than asking a departed server.
+#[tokio::test]
+async fn a_gap_is_not_backfilled_from_a_server_that_left_the_room() {
+    let mut harness = Harness::new(Setup {
         backfill: false,
-        per_room: 2,
         ..Setup::default()
     })
     .await;
+    let history = harness.history(20);
     let bob = harness.user("bob");
-    let bob_join = harness.head.clone();
-    harness.peer.served.lock().unwrap().state_ids = Some(harness.state_ids(&[]));
-    let pushed: Vec<(String, Value)> = (0..4)
-        .map(|index| {
-            let hidden =
-                harness.message(&bob, &bob_join, &harness.head, &format!("hidden {index}"));
-            harness.message(&bob, &bob_join, &hidden, &format!("pushed {index}"))
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    accept_gap(&harness, &latest).await;
+    let leave = |user: &str, member: &(String, Value), parent: &(String, Value)| {
+        harness.event(
+            user,
+            "m.room.member",
+            Some(user),
+            &json!({"membership":"leave"}),
+            parent.1["depth"].as_u64().unwrap() + 1,
+            &[harness.edge(parent)],
+            &[
+                &harness.held_state("m.room.create", ""),
+                &harness.held_state("m.room.power_levels", ""),
+                member,
+            ],
+        )
+    };
+    let carol_leaves = leave(&carol, &history.carol_join, &latest);
+    let bob_leaves = leave(&bob, &history.bob_join, &carol_leaves);
+    let response = harness.push(&[&carol_leaves, &bob_leaves]).await;
+    assert_eq!(
+        response["pdus"],
+        json!({carol_leaves.0.clone(): {}, bob_leaves.0.clone(): {}}),
+        "{response}"
+    );
+    assert!(
+        harness
+            .rooms()
+            .participating_servers(&harness.room)
+            .unwrap()
+            .is_empty()
+    );
+
+    harness.restart(Setup::default()).await;
+    // With nobody to ask, the loop backs the gap off as it does when every
+    // peer is cooling down: counted as rate-limited, not as a failure.
+    harness
+        .until(30, "the loop tries the gap", |harness| {
+            harness
+                .metrics
+                .backfill_chunk_count(BackfillChunk::RateLimited)
+                >= 1
+                || harness.peer.calls("backfill") > 0
         })
-        .collect();
-    for event in &pushed {
-        harness.push(&[event]).await;
-    }
-    assert_eq!(harness.metrics.pdu_count(PduOutcome::GapAccepted), 2);
-    assert_eq!(harness.metrics.gap_count(GapResult::CappedRoom), 2);
-    assert_eq!(harness.metrics.pdu_count(PduOutcome::RefusedMissingDeps), 2);
-    assert_eq!(harness.gaps().len(), 2);
+        .await;
+    assert_eq!(
+        harness.peer.calls("backfill"),
+        0,
+        "a departed server was asked"
+    );
+    assert_eq!(
+        harness.gaps().len(),
+        1,
+        "the gap waits for a server in the room"
+    );
 }
 
 /// A client paging back into a room with an open gap wakes an idle
@@ -1533,4 +1706,285 @@ async fn a_peer_with_nothing_for_the_frontier_is_not_asked_again() {
     let backfills = calls_of(&harness, "backfill:");
     let distinct: HashSet<&String> = backfills.iter().collect();
     assert_eq!(distinct.len(), backfills.len(), "{backfills:?}");
+}
+
+/// The root every backfilled gap event of `room` names, from its row.
+fn gap_roots(store: &FjallStore, room: &str) -> Vec<spindle_core::StateRoot> {
+    let prefix =
+        spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::FederationGapEvent, room);
+    spindle_store::ReadView::scan_prefix(store, &prefix)
+        .unwrap()
+        .into_iter()
+        .map(|(_, value)| spindle_core::StateRoot::from_bytes(value[..32].try_into().unwrap()))
+        .collect()
+}
+
+/// Fork the room at its head: bob renames himself on one branch while
+/// carol joins on the other, so the room's current state is a resolution
+/// that neither branch's entry holds. Returns `(renamed, carol_join)`.
+async fn fork_at_head(harness: &Harness) -> ((String, Value), (String, Value)) {
+    let bob = harness.user("bob");
+    let head = harness.head.clone();
+    let renamed = harness.event(
+        &bob,
+        "m.room.member",
+        Some(&bob),
+        &json!({"membership":"join","displayname":"Bob on one branch"}),
+        head.1["depth"].as_u64().unwrap() + 1,
+        &[harness.edge(&head)],
+        &[
+            &harness.held_state("m.room.create", ""),
+            &harness.held_state("m.room.join_rules", ""),
+            &harness.held_state("m.room.power_levels", ""),
+            &head,
+        ],
+    );
+    let carol_join = harness.carol_joins(&head);
+    for event in [&renamed, &carol_join] {
+        harness.peer.serve(event);
+        let response = harness.push(&[event]).await;
+        assert_eq!(response["pdus"][&event.0], json!({}), "{response}");
+    }
+    (renamed, carol_join)
+}
+
+/// The room's current state as event IDs, and as a snapshot against the
+/// store's table.
+fn current_state(harness: &Harness) -> (Vec<String>, spindle_core::StateSnapshot) {
+    let current = harness.rooms().state(&harness.room).unwrap();
+    let table = spindle_store::ReadView::key_table(harness.store.as_ref());
+    let mut snapshot = spindle_core::StateSnapshot::new(table);
+    let mut ids = Vec::new();
+    for event in &current {
+        let id = event["event_id"].as_str().unwrap();
+        snapshot = snapshot.apply(
+            &spindle_core::StateKey::new(
+                event["type"].as_str().unwrap(),
+                event["state_key"].as_str().unwrap(),
+            ),
+            id,
+        );
+        ids.push(id.to_owned());
+    }
+    (ids, snapshot)
+}
+
+/// A gap filled into a forked room stores every node its state names.
+///
+/// A forked room's current state is the resolution of its tips, computed
+/// in memory and stored only as a cache record (#724) that the next
+/// resolution replaces. The chunk's nodes used to be written as a diff
+/// against it, so a chunk whose state *is* that resolution wrote no nodes
+/// at all and its rows named a root nothing had stored. Here the fork is
+/// bob renaming himself beside carol's join, the gap is carol's messages on
+/// the resolved state, and the record is dropped and `spindle gc` run
+/// between the fork and the fill, so the resolution's own nodes are gone.
+/// Afterwards every gap event's state reads back from the store alone,
+/// `/context` serves it, and a second collection finds every node it needs.
+#[tokio::test]
+async fn a_gap_filled_into_a_forked_room_stores_every_node_its_state_names() {
+    use spindle_store::gc::collect_state_nodes;
+
+    let mut harness = Harness::new(Setup {
+        backfill: false,
+        ..Setup::default()
+    })
+    .await;
+    let carol = harness.user("carol");
+    let (renamed, carol_join) = fork_at_head(&harness).await;
+    let mut parent = carol_join.clone();
+    let mut messages = Vec::new();
+    for index in 0..5 {
+        let message = harness.message(&carol, &carol_join, &parent, &format!("gap {index}"));
+        harness.peer.serve(&message);
+        messages.push(message.clone());
+        parent = message;
+    }
+    let latest = harness.message(&carol, &carol_join, &parent, "after the gap");
+    {
+        let mut served = harness.peer.served.lock().unwrap();
+        served.limit_missing = true;
+        served.state_ids = Some(harness.state_ids(&[&carol_join]));
+    }
+    accept_gap(&harness, &latest).await;
+
+    // The precondition: the room's current state is the resolution of the
+    // branches, and once its cache record is dropped and collected, no node
+    // of it is stored.
+    let (ids, resolved) = current_state(&harness);
+    assert!(
+        ids.contains(&renamed.0) && ids.contains(&carol_join.0),
+        "{ids:?}"
+    );
+    let table = Arc::clone(resolved.table());
+    let store = Arc::clone(&harness.store);
+    let node = |root: &spindle_core::StateRoot| {
+        spindle_store::ReadView::get(
+            store.as_ref(),
+            &spindle_core::keys::content_addressed(
+                spindle_core::keys::Keyspace::StateNode,
+                root.as_bytes(),
+            ),
+        )
+        .unwrap()
+    };
+    harness.peer.served.lock().unwrap().state_ids_at.insert(
+        messages[0].0.clone(),
+        json!({"pdu_ids":ids,"auth_chain_ids":ids}),
+    );
+
+    spindle_store::Store::delete(
+        harness.store.as_ref(),
+        &spindle_core::keys::room_prefix(spindle_core::keys::Keyspace::CurrentState, &harness.room),
+    )
+    .unwrap();
+    collect_state_nodes(harness.store.as_ref(), false).unwrap();
+    assert!(
+        node(&resolved.root()).is_none(),
+        "the fixture needs a current state that is not stored"
+    );
+    harness.restart(Setup::default()).await;
+    harness
+        .until(30, "the gap is backfilled", Harness::filled)
+        .await;
+
+    let roots = gap_roots(harness.store.as_ref(), &harness.room);
+    assert_eq!(roots.len(), messages.len(), "every gap event is placed");
+    for root in &roots {
+        assert_eq!(*root, resolved.root(), "the gap sits on the resolved state");
+        spindle_core::StateSnapshot::rehydrate(
+            *root,
+            &mut |address| node(address),
+            Arc::clone(&table),
+        )
+        .expect("the gap event's state reads back from the store");
+    }
+    let report = collect_state_nodes(harness.store.as_ref(), true)
+        .expect("every node a gap row names is stored");
+    assert_eq!(report.swept, 0, "{report:?}");
+
+    let token = harness.login_alice().await;
+    let context = harness
+        .client(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{}/context/{}?limit=2",
+                harness.room, messages[2].0
+            ),
+            &token,
+            None,
+        )
+        .await;
+    assert!(
+        context["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_id"] == renamed.0.as_str()),
+        "{context}"
+    );
+}
+
+/// `type/state_key -> event_id` of a list of state events.
+fn keyed(events: &[Value]) -> BTreeMap<String, String> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                format!(
+                    "{}/{}",
+                    event["type"].as_str().unwrap(),
+                    event["state_key"].as_str().unwrap()
+                ),
+                event["event_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A client's state after one sync of `room`: classic clients fold the
+/// state block and then the timeline, MSC4222 ones take the block after.
+fn fold_sync(held: &mut BTreeMap<String, String>, room: &Value, state_after: bool) {
+    let events = |block: &Value| block["events"].as_array().cloned().unwrap_or_default();
+    if state_after {
+        held.extend(keyed(&events(&room["state_after"])));
+    } else {
+        let mut seen = events(&room["state"]);
+        seen.extend(events(&room["timeline"]));
+        seen.retain(|event| event.get("state_key").is_some());
+        for event in &seen {
+            held.extend(keyed(std::slice::from_ref(event)));
+        }
+    }
+}
+
+/// A member who joined inside a gap reaches a client's incremental sync
+/// (#819). The join has no stream row, so only the change of the room's
+/// current state can carry it: a client that never hears of carol would not
+/// share keys with her in an encrypted room.
+///
+/// Both kinds of client fold what they are sent over what they held and
+/// must end with the room's own state.
+#[tokio::test]
+async fn a_member_who_joined_inside_a_gap_reaches_an_incremental_sync() {
+    let harness = Harness::new(Setup::default()).await;
+    let history = harness.history(3);
+    let carol = harness.user("carol");
+    let latest = harness.message(
+        &carol,
+        &history.carol_join,
+        history.messages.last().unwrap(),
+        "after the outage",
+    );
+    let token = harness.login_alice().await;
+    let path = |since: Option<&str>, state_after: bool| {
+        format!(
+            "/_matrix/client/v3/sync?timeout=0&use_state_after={state_after}{}",
+            since.map_or_else(String::new, |since| format!("&since={since}"))
+        )
+    };
+    let mut views = Vec::new();
+    for state_after in [false, true] {
+        let body = harness
+            .client("GET", &path(None, state_after), &token, None)
+            .await;
+        let mut held = BTreeMap::new();
+        fold_sync(
+            &mut held,
+            &body["rooms"]["join"][&harness.room],
+            state_after,
+        );
+        let since = body["next_batch"].as_str().unwrap().to_owned();
+        views.push((state_after, since, held));
+    }
+
+    accept_gap(&harness, &latest).await;
+
+    let state = harness
+        .client(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{}/state", harness.room),
+            &token,
+            None,
+        )
+        .await;
+    let room_state = keyed(state.as_array().unwrap());
+    assert!(
+        room_state.contains_key(&format!("m.room.member/{carol}")),
+        "the gap's join is in the room's state: {room_state:?}"
+    );
+    for (state_after, since, mut held) in views {
+        let body = harness
+            .client("GET", &path(Some(&since), state_after), &token, None)
+            .await;
+        fold_sync(
+            &mut held,
+            &body["rooms"]["join"][&harness.room],
+            state_after,
+        );
+        assert_eq!(
+            held, room_state,
+            "a client with state_after = {state_after} does not hold the room's state"
+        );
+    }
 }

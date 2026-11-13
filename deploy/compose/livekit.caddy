@@ -1,0 +1,3 @@
+lk.{$SPINDLE_DOMAIN} {
+	reverse_proxy livekit:7880
+}

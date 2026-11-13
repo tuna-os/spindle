@@ -11,8 +11,10 @@
 //! not become an addressing one. The ID is random and opaque, and the mapping
 //! from ID to hash lives in the store.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use spindle_core::keys;
@@ -38,7 +40,7 @@ pub struct Reservation {
     pub expires_at: u64,
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
@@ -84,9 +86,31 @@ pub struct MediaRecord {
     pub filename: Option<String>,
     pub size: usize,
     pub uploaded_by: String,
+    /// When the bytes arrived, in milliseconds. Absent on records written
+    /// before this was kept; the cache purge and the size cap read those as
+    /// the oldest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ts: Option<u64>,
+    /// The admin who quarantined it. A quarantined record is kept as
+    /// evidence and never served; see [`Media::set_quarantine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_by: Option<String>,
+    /// The admin who protected it. A protected record is still served, but
+    /// purge, the retention job and cache caps never remove it; see
+    /// [`Media::set_protected`]. Records written before this existed decode
+    /// as unprotected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_by: Option<String>,
 }
 
 impl MediaRecord {
+    /// Whether automatic cleanup must leave this record and its bytes alone:
+    /// quarantined media is evidence, protected media is kept on purpose.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.quarantined_by.is_some() || self.protected_by.is_some()
+    }
+
     /// Whether a browser may render this inline, or must be made to download it.
     #[must_use]
     pub fn inline_safe(&self) -> bool {
@@ -158,12 +182,78 @@ pub struct MissingBlob {
     pub media_ids: Vec<String>,
 }
 
+/// Whether an upload is held to the uploader's byte quota. The caller
+/// decides, because who is exempt (appservice users, admins) is a question
+/// about accounts and registrations this module does not hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quota {
+    Enforced,
+    Exempt,
+}
+
 /// Blobs in the configured backend, metadata in the store.
 pub struct Media {
     store: Arc<FjallStore>,
     blobs: crate::blobs::Blobs,
     server_name: String,
     max_upload_bytes: usize,
+    /// `[media] max_bytes_per_user`; `None` is no quota.
+    quota_bytes: Option<u64>,
+    /// Bytes each local account's uploads hold, built from the media
+    /// records the first time a quota is checked and kept in step by every
+    /// upload and delete after that.
+    ///
+    /// Derived rather than persisted: the records are the truth, so a
+    /// count rebuilt from them at each start cannot drift from them across
+    /// a crash, an import or a restore, and there is no second keyspace to
+    /// back up. One scan per process, and only on a server with a quota.
+    usage: Mutex<Option<HashMap<String, u64>>>,
+    /// `[media] max_thumbnail_pixels`: the most pixels a source image may
+    /// declare before it is refused rather than decoded.
+    max_thumbnail_pixels: u64,
+    /// Bounds how many image decodes run at once. A decode holds a blocking
+    /// thread and a pixel buffer, so unbounded concurrency lets a burst of
+    /// requests for large images exhaust memory even under the pixel budget.
+    decode_slots: Arc<tokio::sync::Semaphore>,
+    /// Source hashes that failed to thumbnail, and when, so a bad image is
+    /// refused from memory instead of being fetched and decoded again on
+    /// every request. Only successes were cached before.
+    decode_failures: Mutex<HashMap<String, (Instant, DecodeFailure)>>,
+    /// Decodes that got as far as reading pixel data. Counted so a test can
+    /// show an over-budget image never reached the decoder.
+    decodes_started: Arc<AtomicU64>,
+    /// `[media] remote_cache_max_bytes`; `None` is no cap.
+    remote_cache_cap: Option<u64>,
+    /// Bytes other servers' cached media holds, built from the records the
+    /// first time a remote item is cached and kept in step after. Derived
+    /// for the same reason as `usage`.
+    remote_bytes: Mutex<Option<u64>>,
+    /// Serialises remote caching, so two fetches cannot each see room that
+    /// only one of them can have. Held across blob writes, hence async.
+    remote_write: tokio::sync::Mutex<()>,
+}
+
+/// Most image decodes in flight at once.
+const DECODE_CONCURRENCY: usize = 4;
+/// How long a failed decode is remembered.
+const DECODE_FAILURE_TTL: Duration = Duration::from_secs(300);
+/// Most failures remembered; past it the map is pruned, then cleared.
+const DECODE_FAILURE_CAP: usize = 1024;
+
+/// Why a source image could not be thumbnailed, kept for the failure cache.
+#[derive(Clone, Debug)]
+enum DecodeFailure {
+    TooManyPixels { pixels: u64, limit: u64 },
+    Unreadable(String),
+}
+
+impl DecodeFailure {
+    fn into_error(self) -> MediaError {
+        match self {
+            Self::TooManyPixels { pixels, limit } => MediaError::ImageTooLarge { pixels, limit },
+            Self::Unreadable(message) => MediaError::Unreadable(message),
+        }
+    }
 }
 
 impl Media {
@@ -178,7 +268,62 @@ impl Media {
             blobs,
             server_name: server_name.into(),
             max_upload_bytes: MAX_UPLOAD,
+            quota_bytes: None,
+            usage: Mutex::new(None),
+            max_thumbnail_pixels: DEFAULT_MAX_THUMBNAIL_PIXELS,
+            decode_slots: Arc::new(tokio::sync::Semaphore::new(DECODE_CONCURRENCY)),
+            decode_failures: Mutex::new(HashMap::new()),
+            decodes_started: Arc::new(AtomicU64::new(0)),
+            remote_cache_cap: None,
+            remote_bytes: Mutex::new(None),
+            remote_write: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Refuse to thumbnail sources declaring more than `pixels` pixels.
+    #[must_use]
+    pub fn with_max_thumbnail_pixels(mut self, pixels: u64) -> Self {
+        self.max_thumbnail_pixels = pixels;
+        self
+    }
+
+    /// How many thumbnail decodes have started reading pixel data.
+    #[must_use]
+    pub fn decodes_started(&self) -> u64 {
+        self.decodes_started.load(Ordering::Relaxed)
+    }
+
+    fn remembered_failure(&self, hash: &str) -> Option<DecodeFailure> {
+        let failures = self
+            .decode_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        failures
+            .get(hash)
+            .filter(|(at, _)| at.elapsed() < DECODE_FAILURE_TTL)
+            .map(|(_, failure)| failure.clone())
+    }
+
+    fn remember_failure(&self, hash: &str, failure: DecodeFailure) {
+        let mut failures = self
+            .decode_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failures.len() >= DECODE_FAILURE_CAP {
+            failures.retain(|_, (at, _)| at.elapsed() < DECODE_FAILURE_TTL);
+            if failures.len() >= DECODE_FAILURE_CAP {
+                failures.clear();
+            }
+        }
+        failures.insert(hash.to_owned(), (Instant::now(), failure));
+    }
+
+    /// Hold other servers' cached media to `cap` bytes in total, removing
+    /// the oldest items first; `None` is no cap.
+    #[must_use]
+    pub const fn with_remote_cache_cap(mut self, cap: Option<u64>) -> Self {
+        self.remote_cache_cap = cap;
+        self
     }
 
     /// Use the configured cap for uploads and remote media caching.
@@ -186,6 +331,20 @@ impl Media {
     pub fn with_max_upload_bytes(mut self, max_upload_bytes: usize) -> Self {
         self.max_upload_bytes = max_upload_bytes;
         self
+    }
+
+    /// Hold each account's uploads to `quota_bytes` in total; `None` is
+    /// no quota.
+    #[must_use]
+    pub fn with_quota_bytes(mut self, quota_bytes: Option<u64>) -> Self {
+        self.quota_bytes = quota_bytes;
+        self
+    }
+
+    /// The configured per-account quota, if there is one.
+    #[must_use]
+    pub const fn quota_bytes(&self) -> Option<u64> {
+        self.quota_bytes
     }
 
     /// The same limit advertised by the media configuration endpoints.
@@ -198,7 +357,8 @@ impl Media {
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or
+    /// Returns [`MediaError::TooLarge`] past [`Self::max_upload_bytes`],
+    /// [`MediaError::QuotaExceeded`] past the uploader's quota, or
     /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put(
         &self,
@@ -206,6 +366,7 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
         uploaded_by: &str,
+        quota: Quota,
     ) -> Result<String, MediaError> {
         if bytes.len() > self.max_upload_bytes {
             return Err(MediaError::TooLarge {
@@ -213,25 +374,117 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        // Identical bytes are one blob: the backend skips or overwrites with
-        // the same content, whichever it finds cheaper.
-        self.blobs.put(&hash, bytes).await?;
-
         let media_id = random_media_id();
         let record = MediaRecord {
-            hash,
+            hash: blake3::hash(bytes).to_hex().to_string(),
             content_type: content_type.to_owned(),
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
+        self.store_upload(&media_id, bytes, &record, quota).await?;
+        Ok(media_id)
+    }
+
+    /// Charge an upload to its uploader's quota, then write its blob and
+    /// its record, giving the charge back if either write fails.
+    ///
+    /// The quota is checked before a byte is written, not after: a check
+    /// that ran once the blob was stored would refuse the upload and keep
+    /// the bytes, which is a quota that fills the disk it exists to guard.
+    async fn store_upload(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        record: &MediaRecord,
+        quota: Quota,
+    ) -> Result<(), MediaError> {
+        let charged = self.charge(&record.uploaded_by, record.size, quota)?;
+        let written = self.write_upload(media_id, bytes, record).await;
+        if written.is_err() && charged {
+            self.refund(&record.uploaded_by, record.size);
+        }
+        written
+    }
+
+    async fn write_upload(
+        &self,
+        media_id: &str,
+        bytes: &[u8],
+        record: &MediaRecord,
+    ) -> Result<(), MediaError> {
+        // Identical bytes are one blob: the backend skips or overwrites with
+        // the same content, whichever it finds cheaper.
+        self.blobs.put(&record.hash, bytes).await?;
         Store::put(
             self.store.as_ref(),
-            &keys::media(&media_id),
-            &serde_json::to_vec(&record)?,
+            &keys::media(media_id),
+            &serde_json::to_vec(record)?,
         )?;
-        Ok(media_id)
+        Ok(())
+    }
+
+    /// Count `size` bytes to `user_id`, refusing them under
+    /// [`Quota::Enforced`] when they would take the account past its
+    /// quota. Returns whether anything was counted.
+    ///
+    /// An exempt upload is still counted, so an account that stops being
+    /// exempt is held to what it actually stores.
+    fn charge(&self, user_id: &str, size: usize, quota: Quota) -> Result<bool, MediaError> {
+        let Some(limit) = self.quota_bytes else {
+            return Ok(false);
+        };
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        // Built under the lock, so two first uploads cannot both scan, and
+        // an upload finishing meanwhile cannot land between the scan and
+        // the map it should have been counted in.
+        let totals = match usage.take() {
+            Some(totals) => totals,
+            None => self.usage_by_uploader()?,
+        };
+        let totals = usage.insert(totals);
+        let used = totals.get(user_id).copied().unwrap_or(0);
+        if quota == Quota::Enforced && used.saturating_add(size) > limit {
+            return Err(MediaError::QuotaExceeded {
+                used,
+                size,
+                quota: limit,
+            });
+        }
+        if let Some(total) = totals.get_mut(user_id) {
+            *total = total.saturating_add(size);
+        } else {
+            totals.insert(user_id.to_owned(), size);
+        }
+        Ok(true)
+    }
+
+    /// Give `size` bytes back to `user_id`: a failed write, or a delete.
+    fn refund(&self, user_id: &str, size: usize) {
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(total) = usage.as_mut().and_then(|totals| totals.get_mut(user_id)) {
+            *total = total.saturating_sub(size);
+        }
+    }
+
+    /// Bytes held by each local uploader, from the records.
+    fn usage_by_uploader(&self) -> Result<HashMap<String, u64>, MediaError> {
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for (media_id, record) in self.records()? {
+            // A cached copy of remote media is nobody's upload here.
+            if media_id.contains('/') {
+                continue;
+            }
+            let size = u64::try_from(record.size).unwrap_or(u64::MAX);
+            let total = totals.entry(record.uploaded_by).or_insert(0);
+            *total = total.saturating_add(size);
+        }
+        Ok(totals)
     }
 
     /// Store `bytes` under a media ID another server already handed out.
@@ -262,6 +515,9 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
         Store::put(
             self.store.as_ref(),
@@ -332,8 +588,9 @@ impl Media {
     /// [`MediaError::AlreadyUploaded`] when the ID already has bytes,
     /// [`MediaError::Unknown`] when no live reservation stands,
     /// [`MediaError::NotReserver`] when someone else reserved it,
-    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`], or [`MediaError`] if
-    /// the blob or its record cannot be written.
+    /// [`MediaError::TooLarge`] past [`Self::max_upload_bytes`],
+    /// [`MediaError::QuotaExceeded`] past the uploader's quota, or
+    /// [`MediaError`] if the blob or its record cannot be written.
     pub async fn put_reserved(
         &self,
         media_id: &str,
@@ -341,6 +598,7 @@ impl Media {
         content_type: &str,
         filename: Option<&str>,
         uploaded_by: &str,
+        quota: Quota,
     ) -> Result<(), MediaError> {
         if self.record(media_id)?.is_some() {
             return Err(MediaError::AlreadyUploaded(media_id.to_owned()));
@@ -357,20 +615,17 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        self.blobs.put(&hash, bytes).await?;
         let record = MediaRecord {
-            hash,
+            hash: blake3::hash(bytes).to_hex().to_string(),
             content_type: content_type.to_owned(),
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: uploaded_by.to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
-        Store::put(
-            self.store.as_ref(),
-            &keys::media(media_id),
-            &serde_json::to_vec(&record)?,
-        )?;
+        self.store_upload(media_id, bytes, &record, quota).await?;
         Store::delete(self.store.as_ref(), &keys::media_reservation(media_id))?;
         Ok(())
     }
@@ -407,6 +662,25 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // An item bigger than the whole cache could only be stored by
+        // evicting everything, itself included.
+        if let Some(cap) = self.remote_cache_cap
+            && size > cap
+        {
+            return Err(MediaError::TooLarge {
+                size: bytes.len(),
+                limit: usize::try_from(cap).unwrap_or(usize::MAX),
+            });
+        }
+        let _serial = self.remote_write.lock().await;
+        let cache_id = Self::remote_id(server_name, media_id);
+        // Read before the write: the first read scans the records, and a scan
+        // after the write would already count the item being added.
+        let held = self.remote_held()?;
+        let prior = self
+            .record(&cache_id)?
+            .map_or(0, |record| u64::try_from(record.size).unwrap_or(u64::MAX));
         let hash = blake3::hash(bytes).to_hex().to_string();
         self.blobs.put(&hash, bytes).await?;
         let record = MediaRecord {
@@ -415,12 +689,74 @@ impl Media {
             filename: filename.map(str::to_owned),
             size: bytes.len(),
             uploaded_by: format!("federation:{server_name}"),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
         Store::put(
             self.store.as_ref(),
-            &keys::media(&Self::remote_id(server_name, media_id)),
+            &keys::media(&cache_id),
             &serde_json::to_vec(&record)?,
         )?;
+        self.set_remote_held(held.saturating_sub(prior).saturating_add(size));
+        self.evict_remote(&cache_id).await
+    }
+
+    fn set_remote_held(&self, held: u64) {
+        *self
+            .remote_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(held);
+    }
+
+    /// Bytes of remote media held, scanning the records the first time.
+    fn remote_held(&self) -> Result<u64, MediaError> {
+        let mut total = self
+            .remote_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = *total {
+            return Ok(held);
+        }
+        let held = self
+            .records()?
+            .iter()
+            .filter(|(id, _)| id.contains('/'))
+            .map(|(_, record)| u64::try_from(record.size).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        *total = Some(held);
+        Ok(held)
+    }
+
+    /// Remove the oldest remote items until the cache fits its cap,
+    /// sparing `keep`, the item just written.
+    ///
+    /// Oldest by when the bytes arrived, so a purge by age elsewhere and
+    /// this cap remove from the same end and cannot disagree about order.
+    async fn evict_remote(&self, keep: &str) -> Result<(), MediaError> {
+        let Some(cap) = self.remote_cache_cap else {
+            return Ok(());
+        };
+        if self.remote_held()? <= cap {
+            return Ok(());
+        }
+        let mut cached: Vec<_> = self
+            .records()?
+            .into_iter()
+            // A quarantined item is evidence, so the cap spares it as the
+            // age purge does, and may be left over the cap by it.
+            .filter(|(id, record)| {
+                id.contains('/') && id != keep && record.quarantined_by.is_none()
+            })
+            .collect();
+        cached.sort_by_key(|(id, record)| (record.created_ts.unwrap_or(0), id.clone()));
+        for (id, _) in cached {
+            if self.remote_held()? <= cap {
+                break;
+            }
+            // `delete` takes the bytes off the running total itself.
+            self.delete(&id).await?;
+        }
         Ok(())
     }
 
@@ -451,6 +787,10 @@ impl Media {
         let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (key, value) in ReadView::scan_prefix(self.store.as_ref(), &keys::media_all())? {
             let record: MediaRecord = serde_json::from_slice(&value)?;
+            // A tombstone holds no bytes to be missing.
+            if record.hash.is_empty() {
+                continue;
+            }
             let id = keys::media_id(&key).unwrap_or_else(|| "<unreadable key>".to_owned());
             wanted.entry(record.hash).or_default().push(id);
         }
@@ -486,6 +826,13 @@ impl Media {
     /// a client can retry once the uploader finishes.
     fn record_or_pending(&self, media_id: &str) -> Result<MediaRecord, MediaError> {
         if let Some(record) = self.record(media_id)? {
+            // Every read path -- download, thumbnail, and the federation
+            // twins -- goes through here, so one check covers them all and
+            // a new route cannot forget it. Not-found, not forbidden: a
+            // 403 would tell the requester the item exists.
+            if record.quarantined_by.is_some() {
+                return Err(MediaError::Unknown(media_id.to_owned()));
+            }
             return Ok(record);
         }
         if self.reservation(media_id)?.is_some() {
@@ -571,26 +918,50 @@ impl Media {
                 media_id: media_id.to_owned(),
                 hash: record.hash.clone(),
             })?;
-        let decoded = image::load_from_memory(&source)
-            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
-        let resized = if crop {
-            decoded.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
-        } else {
-            decoded.resize(width, height, image::imageops::FilterType::Triangle)
-        };
-        let mut bytes = Vec::new();
-        resized
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .map_err(|error| MediaError::Unreadable(error.to_string()))?;
+        let bytes = self
+            .decode_thumbnail(&record.hash, source, width, height, crop)
+            .await?;
 
         // Cached exactly like an upload — the backend's atomicity story
         // (rename locally, atomic object PUT on S3) means a concurrent
         // request never reads a half-written thumbnail.
         self.blobs.put(&cache_hash, &bytes).await?;
         Ok(("image/png".to_owned(), bytes))
+    }
+
+    /// Decode `source` and render the thumbnail, off the async workers and
+    /// behind [`DECODE_CONCURRENCY`] slots. A failure is remembered by source
+    /// hash for [`DECODE_FAILURE_TTL`].
+    async fn decode_thumbnail(
+        &self,
+        hash: &str,
+        source: Vec<u8>,
+        width: u32,
+        height: u32,
+        crop: bool,
+    ) -> Result<Vec<u8>, MediaError> {
+        if let Some(failure) = self.remembered_failure(hash) {
+            return Err(failure.into_error());
+        }
+        let permit = Arc::clone(&self.decode_slots)
+            .acquire_owned()
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        let limit = self.max_thumbnail_pixels;
+        let started = Arc::clone(&self.decodes_started);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            render_thumbnail(&source, width, height, crop, limit, &started)
+        })
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+        match outcome {
+            Ok(bytes) => Ok(bytes),
+            Err(failure) => {
+                self.remember_failure(hash, failure.clone());
+                Err(failure.into_error())
+            }
+        }
     }
 
     /// Every media record, with its ID: what the admin API lists a user's
@@ -627,6 +998,23 @@ impl Media {
             return Ok(false);
         };
         Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+        // The bytes stop counting with the record, whatever happens to the
+        // blob: from here the upload is not the account's to serve.
+        if media_id.contains('/') {
+            let size = u64::try_from(record.size).unwrap_or(u64::MAX);
+            let mut total = self
+                .remote_bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(held) = total.as_mut() {
+                *held = held.saturating_sub(size);
+            }
+        } else {
+            self.refund(&record.uploaded_by, record.size);
+        }
+        if record.hash.is_empty() {
+            return Ok(true);
+        }
         let shared = self
             .records()?
             .iter()
@@ -644,6 +1032,152 @@ impl Media {
         Ok(true)
     }
 
+    /// Quarantine (`Some(admin)`) or release (`None`) the record under
+    /// `media_id`. Returns whether the record exists.
+    ///
+    /// A quarantined item stays in the store and keeps its bytes, as
+    /// evidence, and is not served or sent to a peer. Releasing an item
+    /// that [`Self::quarantine_remote`] wrote as a tombstone removes the
+    /// tombstone, so the next request fetches it afresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn set_quarantine(&self, media_id: &str, by: Option<&str>) -> Result<bool, MediaError> {
+        let Some(mut record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        if by.is_none() && record.hash.is_empty() {
+            Store::delete(self.store.as_ref(), &keys::media(media_id))?;
+            return Ok(true);
+        }
+        record.quarantined_by = by.map(str::to_owned);
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Protect (`Some(admin)`) or unprotect (`None`) the record under
+    /// `media_id`. Returns whether the record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn set_protected(&self, media_id: &str, by: Option<&str>) -> Result<bool, MediaError> {
+        let Some(mut record) = self.record(media_id)? else {
+            return Ok(false);
+        };
+        record.protected_by = by.map(str::to_owned);
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(media_id),
+            &serde_json::to_vec(&record)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Delete `media_id` unless it is quarantined or protected. Every
+    /// automatic path that removes media (the cache purge, the retention
+    /// job, a cap, a replaced preview image) must use this, never
+    /// [`Self::delete`]: a quarantined item is evidence and a protected one
+    /// was kept on purpose. Returns whether anything was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn delete_unheld(&self, media_id: &str) -> Result<bool, MediaError> {
+        match self.record(media_id)? {
+            Some(record) if !record.held() => self.delete(media_id).await,
+            _ => Ok(false),
+        }
+    }
+
+    /// Quarantine a remote server's media, cached here or not.
+    ///
+    /// An uncached item gets a record with no bytes, so the cache's "do I
+    /// hold it" check finds it and the item is never fetched: a ban that
+    /// only covered what happened to be cached would be undone by the next
+    /// client that asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or written.
+    pub fn quarantine_remote(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        by: &str,
+    ) -> Result<(), MediaError> {
+        let id = Self::remote_id(server_name, media_id);
+        if self.set_quarantine(&id, Some(by))? {
+            return Ok(());
+        }
+        let tombstone = MediaRecord {
+            hash: String::new(),
+            content_type: "application/octet-stream".to_owned(),
+            filename: None,
+            size: 0,
+            uploaded_by: format!("federation:{server_name}"),
+            created_ts: Some(now_millis()),
+            quarantined_by: Some(by.to_owned()),
+            protected_by: None,
+        };
+        Store::put(
+            self.store.as_ref(),
+            &keys::media(&id),
+            &serde_json::to_vec(&tombstone)?,
+        )?;
+        Ok(())
+    }
+
+    /// Delete cached remote media last cached before `before_ts`
+    /// (milliseconds), and return the IDs removed. This server's own
+    /// uploads are never touched, and neither is a quarantined or protected
+    /// item: purging it would release what the operator meant to hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the store or the blob backend fails.
+    pub async fn purge_remote(&self, before_ts: u64) -> Result<Vec<String>, MediaError> {
+        let mut purged = Vec::new();
+        for (media_id, record) in self.records()? {
+            let old = record.created_ts.is_none_or(|ts| ts < before_ts);
+            if media_id.contains('/')
+                && !record.held()
+                && old
+                && self.delete_unheld(&media_id).await?
+            {
+                purged.push(media_id);
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Whether `media_id` is quarantined. Anything that removes media to
+    /// save space must spare these: the operator holds them as evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn is_quarantined(&self, media_id: &str) -> Result<bool, MediaError> {
+        Ok(self
+            .record(media_id)?
+            .is_some_and(|record| record.quarantined_by.is_some()))
+    }
+
+    /// Whether `media_id` is quarantined or protected, so that no automatic
+    /// path may remove it (see [`Self::delete_unheld`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn is_held(&self, media_id: &str) -> Result<bool, MediaError> {
+        Ok(self.record(media_id)?.is_some_and(|record| record.held()))
+    }
+
     /// The `mxc://` URI for one of this server's media IDs.
     #[must_use]
     pub fn mxc(&self, media_id: &str) -> String {
@@ -654,6 +1188,31 @@ impl Media {
     #[must_use]
     pub fn is_ours(&self, server_name: &str) -> bool {
         server_name == self.server_name
+    }
+}
+
+/// Remove cached remote media older than `days`, every `interval`.
+///
+/// Holds the media store weakly, like the other delivery loops, so the
+/// last owner of the store is never this task.
+pub async fn retention_loop(media: std::sync::Weak<Media>, days: u32, interval: Duration) {
+    let max_age = u64::from(days).saturating_mul(24 * 60 * 60 * 1000);
+    loop {
+        let Some(live) = media.upgrade() else {
+            return;
+        };
+        match live
+            .purge_remote(now_millis().saturating_sub(max_age))
+            .await
+        {
+            Ok(purged) if !purged.is_empty() => {
+                tracing::info!(removed = purged.len(), "purged old cached remote media");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("remote media retention failed: {error}"),
+        }
+        drop(live);
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -673,6 +1232,67 @@ fn normalize_dimensions(width: u32, height: u32) -> (u32, u32) {
 
 /// The thumbnail sizes this server makes; every cached thumbnail is one.
 const THUMBNAIL_LADDER: [(u32, u32); 5] = [(32, 32), (96, 96), (320, 240), (640, 480), (800, 600)];
+
+/// Pixels a source image may declare unless `[media] max_thumbnail_pixels`
+/// says otherwise: about 6000x6000, above any photo a phone takes.
+pub const DEFAULT_MAX_THUMBNAIL_PIXELS: u64 = 40_000_000;
+
+/// Read the declared size first and refuse past `max_pixels`, then decode
+/// under limits that cap the allocation too.
+///
+/// The header is read before anything else because a small, highly
+/// compressible file can declare a huge canvas; decoding it first would
+/// allocate the canvas before any error. The decoder limits back that up for
+/// formats whose header can lie about the allocation it needs.
+fn render_thumbnail(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    crop: bool,
+    max_pixels: u64,
+    started: &AtomicU64,
+) -> Result<Vec<u8>, DecodeFailure> {
+    let unreadable = |error: &dyn std::fmt::Display| DecodeFailure::Unreadable(error.to_string());
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(source))
+            .with_guessed_format()
+            .map_err(|error| unreadable(&error))
+    };
+    let (declared_width, declared_height) = reader()?
+        .into_dimensions()
+        .map_err(|error| unreadable(&error))?;
+    let pixels = u64::from(declared_width) * u64::from(declared_height);
+    if pixels > max_pixels {
+        return Err(DecodeFailure::TooManyPixels {
+            pixels,
+            limit: max_pixels,
+        });
+    }
+
+    let mut limits = image::Limits::default();
+    let side = u32::try_from(max_pixels).unwrap_or(u32::MAX);
+    limits.max_image_width = Some(side);
+    limits.max_image_height = Some(side);
+    // Eight bytes a pixel covers the widest sample layout the decoders emit.
+    limits.max_alloc = Some(max_pixels.saturating_mul(8));
+    let mut reader = reader()?;
+    reader.limits(limits);
+    started.fetch_add(1, Ordering::Relaxed);
+    let decoded = reader.decode().map_err(|error| unreadable(&error))?;
+    let resized = if crop {
+        decoded.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
+    } else {
+        decoded.resize(width, height, image::imageops::FilterType::Triangle)
+    };
+    let mut bytes = Vec::new();
+    resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| unreadable(&error))?;
+    Ok(bytes)
+}
 
 /// An opaque, unguessable media ID.
 ///
@@ -713,10 +1333,21 @@ pub enum MediaError {
         size: usize,
         limit: usize,
     },
+    /// The upload would take its account past `[media] max_bytes_per_user`.
+    QuotaExceeded {
+        used: u64,
+        size: u64,
+        quota: u64,
+    },
     /// A type this server does not thumbnail.
     Unsupported(String),
     /// Bytes that do not decode as the format they were declared to be.
     Unreadable(String),
+    /// An image declaring more pixels than `[media] max_thumbnail_pixels`.
+    ImageTooLarge {
+        pixels: u64,
+        limit: u64,
+    },
     Storage(StoreError),
     Io(String),
     Codec(String),
@@ -763,6 +1394,11 @@ impl std::fmt::Display for MediaError {
             Self::TooLarge { size, limit } => {
                 write!(formatter, "{size} bytes exceeds the {limit}-byte limit")
             }
+            Self::QuotaExceeded { used, size, quota } => write!(
+                formatter,
+                "{size} more bytes would take this account past its {quota}-byte media \
+                 quota; its uploads already hold {used}"
+            ),
             Self::Unsupported(content_type) => {
                 write!(formatter, "no thumbnails for {content_type}")
             }
@@ -772,6 +1408,10 @@ impl std::fmt::Display for MediaError {
                     "the bytes do not decode as their declared type: {message}"
                 )
             }
+            Self::ImageTooLarge { pixels, limit } => write!(
+                formatter,
+                "the image declares {pixels} pixels, over the {limit}-pixel thumbnail limit"
+            ),
             Self::Storage(error) => write!(formatter, "storage: {error}"),
             Self::Io(message) => write!(formatter, "filesystem: {message}"),
             Self::Codec(message) => write!(formatter, "unreadable: {message}"),
@@ -785,6 +1425,211 @@ impl std::error::Error for MediaError {}
 mod tests {
     use super::*;
 
+    /// Declares 5000x5000 with junk where the pixels should be.
+    fn oversize_png() -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            let mut crc = !0_u32;
+            for byte in &body {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&(!crc).to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::new();
+        header.extend_from_slice(&5000_u32.to_be_bytes());
+        header.extend_from_slice(&5000_u32.to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &header);
+        chunk(&mut out, b"IDAT", &[0x78, 0x9c, 0x01, 0x02, 0x03]);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_image_never_reaches_the_decoder_and_is_remembered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Media::new(store, blobs, "example.org").with_max_thumbnail_pixels(1_000_000);
+        let id = media
+            .put(
+                &oversize_png(),
+                "image/png",
+                None,
+                "@a:example.org",
+                Quota::Exempt,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let error = media.thumbnail(&id, 32, 32, false).await.unwrap_err();
+            assert!(matches!(
+                error,
+                MediaError::ImageTooLarge {
+                    pixels: 25_000_000,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(media.decodes_started(), 0, "no pixel data was decoded");
+        assert_eq!(
+            media.decode_failures.lock().unwrap().len(),
+            1,
+            "one hash remembered"
+        );
+    }
+
+    /// The hourly retention job removes old cached copies and keeps a
+    /// quarantined one: the operator holds it as evidence.
+    #[tokio::test]
+    async fn the_retention_job_never_removes_quarantined_media() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Arc::new(Media::new(store, blobs, "example.org"));
+        for id in ["plain", "held"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        media
+            .quarantine_remote("remote.example", "held", "@admin:example.org")
+            .unwrap();
+        let held = Media::remote_id("remote.example", "held");
+        let plain = Media::remote_id("remote.example", "plain");
+        // Zero days makes every cached copy old enough.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job = tokio::spawn(retention_loop(
+            Arc::downgrade(&media),
+            0,
+            Duration::from_secs(3600),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while media.record(&plain).unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job removes the unquarantined copy");
+        job.abort();
+        let kept = media
+            .record(&held)
+            .unwrap()
+            .expect("quarantined record kept");
+        assert!(kept.quarantined_by.is_some());
+        assert!(
+            media.blobs.get(&kept.hash).await.unwrap().is_some(),
+            "its bytes are kept"
+        );
+    }
+
+    fn scratch() -> (tempfile::TempDir, Media) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let blobs = crate::blobs::Blobs::Local {
+            root: dir.path().join("media"),
+        };
+        let media = Media::new(store, blobs, "example.org");
+        (dir, media)
+    }
+
+    /// Replacing or capping cached media goes through `delete_unheld`, which
+    /// must leave a quarantined record and its bytes, and a protected one.
+    #[tokio::test]
+    async fn delete_unheld_keeps_quarantined_and_protected_media() {
+        let (_dir, media) = scratch();
+        for id in ["plain", "evidence", "kept"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        let id = |name: &str| Media::remote_id("remote.example", name);
+        media
+            .set_quarantine(&id("evidence"), Some("@admin:example.org"))
+            .unwrap();
+        media
+            .set_protected(&id("kept"), Some("@admin:example.org"))
+            .unwrap();
+
+        assert!(!media.delete_unheld(&id("evidence")).await.unwrap());
+        assert!(!media.delete_unheld(&id("kept")).await.unwrap());
+        assert!(media.delete_unheld(&id("plain")).await.unwrap());
+        for held in ["evidence", "kept"] {
+            let record = media.record(&id(held)).unwrap().expect("record kept");
+            assert!(
+                media.blobs.get(&record.hash).await.unwrap().is_some(),
+                "{held} keeps its bytes"
+            );
+        }
+        assert!(media.record(&id("plain")).unwrap().is_none());
+
+        // Unprotecting makes it removable again.
+        media.set_protected(&id("kept"), None).unwrap();
+        assert!(media.delete_unheld(&id("kept")).await.unwrap());
+    }
+
+    /// The purge spares a protected item and takes it once unprotected; a
+    /// record written before `protected_by` existed still decodes.
+    #[tokio::test]
+    async fn purge_remote_spares_protected_media_until_it_is_released() {
+        let (_dir, media) = scratch();
+        for id in ["plain", "kept"] {
+            media
+                .put_remote("remote.example", id, id.as_bytes(), "text/plain", None)
+                .await
+                .unwrap();
+        }
+        let kept = Media::remote_id("remote.example", "kept");
+        assert!(
+            media
+                .set_protected(&kept, Some("@admin:example.org"))
+                .unwrap()
+        );
+        assert!(
+            !media
+                .set_protected("remote.example/missing", Some("@a:b"))
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let purged = media.purge_remote(now_millis()).await.unwrap();
+        assert_eq!(purged, vec![Media::remote_id("remote.example", "plain")]);
+        assert!(media.record(&kept).unwrap().is_some(), "protected survives");
+        // Protected media is still served; only quarantine hides it.
+        media.bytes(&kept).await.unwrap();
+        media
+            .set_quarantine(&kept, Some("@admin:example.org"))
+            .unwrap();
+        assert!(media.bytes(&kept).await.is_err(), "quarantine wins");
+
+        media.set_quarantine(&kept, None).unwrap();
+        media.set_protected(&kept, None).unwrap();
+        let purged = media.purge_remote(now_millis() + 1).await.unwrap();
+        assert_eq!(purged, vec![kept]);
+
+        let old: MediaRecord = serde_json::from_str(
+            r#"{"hash":"h","content_type":"text/plain","filename":null,"size":1,"uploaded_by":"@a:b"}"#,
+        )
+        .unwrap();
+        assert!(old.protected_by.is_none() && !old.held());
+    }
+
     #[test]
     fn a_filename_cannot_inject_a_header() {
         // The uploader chooses the name, so it is attacker-controlled input
@@ -795,6 +1640,9 @@ mod tests {
             filename: Some(name.to_owned()),
             size: 1,
             uploaded_by: "@a:b".to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
 
         let injected = record("evil\r\nX-Evil: yes").content_disposition();
@@ -828,6 +1676,9 @@ mod tests {
                 filename: None,
                 size: 1,
                 uploaded_by: "@a:b".to_owned(),
+                created_ts: Some(now_millis()),
+                quarantined_by: None,
+                protected_by: None,
             };
             assert!(!record.inline_safe(), "{dangerous} must not render inline");
             assert_eq!(record.content_disposition(), "attachment");
@@ -842,6 +1693,9 @@ mod tests {
             filename: Some("cat.png".to_owned()),
             size: 1,
             uploaded_by: "@a:b".to_owned(),
+            created_ts: Some(now_millis()),
+            quarantined_by: None,
+            protected_by: None,
         };
         assert!(record.inline_safe());
         assert_eq!(

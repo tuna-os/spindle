@@ -24,6 +24,10 @@ struct Instance {
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with("[ratelimit]\nenabled = false\n").await
+    }
+
+    async fn start_with(ratelimit: &str) -> Instance {
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
@@ -35,7 +39,7 @@ impl Instance {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
         let config = spindle_server::Config::parse(&format!(
-            "[server]\nname = \"{name}\"\n[ratelimit]\nenabled = false\n\
+            "[server]\nname = \"{name}\"\n{ratelimit}\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
         ))
         .unwrap();
@@ -497,4 +501,288 @@ async fn a_leave_template_for_a_stranger_is_refused() {
         )
         .await;
     assert_ne!(status, 200, "leaving nothing is refused: {body}");
+}
+
+/// An invite from another server spends the invitee's budget like a local
+/// one (#741): past it, this server refuses to co-sign, so the invite never
+/// reaches the user or the room, while someone else here can still be
+/// invited.
+#[tokio::test]
+async fn invites_from_another_server_spend_the_invitees_budget() {
+    let remote = Instance::start().await;
+    let local = Instance::start_with(
+        "[ratelimit]\ninvites_per_target = { per_second = 0.001, burst = 1 }\n",
+    )
+    .await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    local.register("carol").await;
+    let first = remote.named_room(&alice, "first").await;
+    let second = remote.named_room(&alice, "second").await;
+    let invite = async |room: &str, user: &str| {
+        remote
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/rooms/{room}/invite"),
+                Some(&alice),
+                Some(&json!({ "user_id": format!("@{user}:{}", local.name) })),
+            )
+            .await
+    };
+
+    let (status, body) = invite(&first, "bob").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = invite(&second, "bob").await;
+    assert_eq!(status, 502, "the peer refused to co-sign: {body}");
+    let (status, body) = invite(&second, "carol").await;
+    assert_eq!(status, 200, "the budget is bob's alone: {body}");
+
+    let sync = local.sync(&bob).await;
+    assert!(!sync["rooms"]["invite"][&first].is_null(), "{sync}");
+    assert!(sync["rooms"]["invite"][&second].is_null(), "{sync}");
+}
+
+/// An inviting server that is not a Spindle: it serves its key and signs
+/// what it sends, and nothing else.
+struct ForeignInviter {
+    _dir: TempDir,
+    name: String,
+    key: spindle_server::signing::ServerKey,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ForeignInviter {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn canonical(value: &Value) -> ruma::CanonicalJsonObject {
+    let Ok(ruma::CanonicalJsonValue::Object(object)) =
+        ruma::CanonicalJsonValue::try_from(value.clone())
+    else {
+        unreachable!("the tests build objects")
+    };
+    object
+}
+
+impl ForeignInviter {
+    async fn start() -> Self {
+        let dir = TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        let key = spindle_server::signing::ServerKey::load_or_create(&store).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name = listener.local_addr().unwrap().to_string();
+        let mut document = canonical(&json!({
+            "server_name": name,
+            "valid_until_ts": 4_000_000_000_000_u64,
+            "verify_keys": { key.key_id(): { "key": key.public_key_base64() } },
+        }));
+        ruma::signatures::sign_json(&name, key.pair(), &mut document).unwrap();
+        let document = serde_json::to_value(document).unwrap();
+        let app = axum::Router::new().route(
+            "/_matrix/key/v2/server",
+            axum::routing::get(move || {
+                let document = document.clone();
+                async move { axum::Json(document) }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            _dir: dir,
+            name,
+            key,
+            task,
+        }
+    }
+
+    /// PUT `body` to `uri` on `destination`, signed as this server.
+    async fn put(&self, destination: &str, uri: &str, body: &Value) -> (u16, Value) {
+        let mut request = canonical(&json!({
+            "method": "PUT",
+            "uri": uri,
+            "origin": self.name,
+            "destination": destination,
+            "content": body,
+        }));
+        ruma::signatures::sign_json(&self.name, self.key.pair(), &mut request).unwrap();
+        let signature = request["signatures"].as_object().unwrap()[&self.name]
+            .as_object()
+            .unwrap()[&self.key.key_id()]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = reqwest::Client::new()
+            .put(format!("http://{destination}{uri}"))
+            .header(
+                "authorization",
+                format!(
+                    "X-Matrix origin=\"{}\",destination=\"{destination}\",key=\"{}\",sig=\"{signature}\"",
+                    self.name,
+                    self.key.key_id()
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        (status, body)
+    }
+}
+
+/// Synapse's `invite_room_state` names the room and the inviter but not
+/// the invite itself: Synapse adds the invitee's own membership when its
+/// own `/sync` serves the invite. A Spindle that served the inviter's list
+/// as it came gave its user an invite with no `invite` in it, which Element
+/// Web does not list at all, so an invite from a Synapse user never showed
+/// (#795, found by Element Call's rig with Synapse in the second seat).
+#[tokio::test]
+async fn an_invite_whose_stripped_state_leaves_out_the_invite_still_renders() {
+    let inviter = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+    let alice_id = format!("@alice:{}", inviter.name);
+    let room = format!("!synapse-room:{}", inviter.name);
+
+    let event = spindle_core::Pdu::sign(
+        ruma::RoomVersionId::V10,
+        canonical(&json!({
+            "type": "m.room.member",
+            "room_id": room,
+            "sender": alice_id,
+            "state_key": bob_id,
+            "content": { "membership": "invite", "is_direct": true },
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "depth": 4,
+            "auth_events": [],
+            "prev_events": [],
+        })),
+        &inviter.name,
+        inviter.key.pair(),
+    )
+    .unwrap();
+    let event_id = event.event_id().as_str().to_owned();
+    let body = json!({
+        "room_version": "10",
+        "event": serde_json::to_value(event.canonical()).unwrap(),
+        // What Synapse sends: the room and the inviter's own membership.
+        "invite_room_state": [
+            {
+                "type": "m.room.create", "state_key": "", "sender": alice_id,
+                "content": { "creator": alice_id, "room_version": "10" },
+            },
+            {
+                "type": "m.room.join_rules", "state_key": "", "sender": alice_id,
+                "content": { "join_rule": "invite" },
+            },
+            {
+                "type": "m.room.member", "state_key": alice_id, "sender": alice_id,
+                "content": { "membership": "join", "displayname": "alice" },
+            },
+        ],
+    });
+    let (status, answer) = inviter
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(status, 200, "the invite is co-signed: {answer}");
+
+    let sync = local.sync(&bob).await;
+    let events = sync["rooms"]["invite"][&room]["invite_state"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the invite is in bob's sync: {sync}"))
+        .clone();
+    let asks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "m.room.member" && event["state_key"] == json!(bob_id))
+        .collect();
+    assert_eq!(asks.len(), 1, "one membership for bob: {events:?}");
+    assert_eq!(asks[0]["content"]["membership"], json!("invite"));
+    assert_eq!(asks[0]["content"]["is_direct"], json!(true));
+    assert_eq!(asks[0]["sender"], json!(alice_id));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "m.room.member" && event["state_key"] == json!(alice_id)),
+        "the inviter's own membership is kept: {events:?}"
+    );
+}
+
+/// matrix-js-sdk learns that a room is a DM from the invite the user
+/// accepted: its `is_direct` and sender, read off the join's
+/// `unsigned.prev_content` and `prev_sender`. A join made over federation
+/// was stored as it was signed, with no `unsigned`, so a DM from another
+/// server was not a DM to the invitee's client and its ring showed as a
+/// group call (#795, found by Element Call's rig with Synapse in the second
+/// seat).
+#[tokio::test]
+async fn a_federated_join_carries_the_invite_it_accepts() {
+    let remote = Instance::start().await;
+    let local = Instance::start().await;
+    let alice = remote.register("alice").await;
+    let bob = local.register("bob").await;
+    let alice_id = format!("@alice:{}", remote.name);
+    let bob_id = format!("@bob:{}", local.name);
+
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(&json!({
+                "preset": "trusted_private_chat",
+                "is_direct": true,
+                "invite": [bob_id],
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = local
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&bob),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let sync = local.sync(&bob).await;
+    let joined = &sync["rooms"]["join"][&room];
+    let join = ["state", "timeline"]
+        .iter()
+        .filter_map(|section| joined[section]["events"].as_array())
+        .flatten()
+        .find(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] == json!(bob_id)
+                && event["content"]["membership"] == "join"
+        })
+        .unwrap_or_else(|| panic!("bob's join is in his sync: {joined}"));
+    assert_eq!(
+        join["unsigned"]["prev_content"]["membership"],
+        json!("invite"),
+        "{join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_content"]["is_direct"],
+        json!(true),
+        "{join}"
+    );
+    assert_eq!(join["unsigned"]["prev_sender"], json!(alice_id), "{join}");
 }

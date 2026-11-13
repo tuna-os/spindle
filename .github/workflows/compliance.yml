@@ -22,6 +22,16 @@ on:
           Empty runs the default subset in contrib/element-call/run.sh.
         required: false
         default: ""
+      element_call_rtc:
+        description: >-
+          Who mints SFU tokens for Spindle in the element-call-e2e and
+          element-call-synapse-peer jobs: both runs each once with
+          upstream's lk-jwt-service and once with Spindle's built-in
+          minter (contrib/element-call/run.sh, SPINDLE_RTC).
+        required: false
+        type: choice
+        options: [both, lk-jwt-service, builtin]
+        default: both
 
 permissions:
   contents: read
@@ -52,9 +62,11 @@ jobs:
     outputs:
       code: ${{ steps.plan.outputs.code }}
       rotation: ${{ steps.plan.outputs.rotation }}
+      federation_rtc: ${{ steps.plan.outputs.federation_rtc }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: scripts/compliance-plan.sh
           sparse-checkout-cone-mode: false
       - name: Decide what runs
@@ -109,15 +121,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         if: github.event_name != 'pull_request'
         with:
           go-version-file: evidence/mautrix-echo/go.mod
@@ -130,9 +144,37 @@ jobs:
       # This builds and runs it. No Synapse checkout is cloned: the one test
       # that needs real DDL skips itself, and the rest carry the shapes that
       # actually bite (a legacy is_state edge, an edge with a NULL room_id).
+      #
+      # Built with `mas-import` as well, so the MAS step below reuses this
+      # build rather than compiling the crate a third time.
       - name: Check the Synapse reader still builds and passes
         if: ${{ !cancelled() }}
-        run: cargo test --features synapse-import --test synapse_reader
+        run: cargo test --features synapse-import,mas-import --test synapse_reader
+
+      # The MAS importer (#797) against the schema of MAS 1.23.0, the
+      # release production runs. MAS's own `database migrate`, from the
+      # image the rehearsal rig pins, writes it into an empty PostgreSQL:
+      # column names are what a schema written by hand cannot check.
+      - name: Check the MAS importer against MAS 1.23.0's schema
+        if: ${{ !cancelled() }}
+        run: |
+          docker run -d --name mas-pg -e POSTGRES_PASSWORD=mas -e POSTGRES_DB=mas \
+            -p 127.0.0.1:5434:5432 postgres:16-alpine@sha256:e0e53cfa0884f3cc216a621033e4f38dceb49e52218ac77facc8e48f02973093
+          # Over TCP: the entrypoint's first, socket-only server answers a
+          # socket check before the real one is up (see bench-sitting.yml).
+          for _ in $(seq 1 60); do
+            docker exec mas-pg pg_isready -U postgres -h 127.0.0.1 -q && break
+            sleep 1
+          done
+          docker exec mas-pg pg_isready -U postgres -h 127.0.0.1
+          printf 'database:\n  uri: postgresql://postgres:mas@127.0.0.1:5434/mas\n' \
+            > "$RUNNER_TEMP/mas.yaml"
+          docker run --rm --network host -e MAS_CONFIG=/conf/config.yaml \
+            -v "$RUNNER_TEMP/mas.yaml:/conf/config.yaml:ro" \
+            ghcr.io/element-hq/matrix-authentication-service:1.23.0@sha256:e82b2e4a5f9c7ca74096743349160795f5b5a792556fb85c6b5166a9180a5985 \
+            database migrate
+          SPINDLE_MAS_TEST_POSTGRES="host=127.0.0.1 port=5434 user=postgres password=mas dbname=mas" \
+            cargo test --features synapse-import,mas-import --test mas_reader -- --nocapture
 
       - name: Build the server
         id: build
@@ -179,7 +221,7 @@ jobs:
 
       - name: Keep the screenshots and logs
         if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: debug-rigs
           path: |
@@ -209,9 +251,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: 'stable'
           # setup-go's own cache keys off a go.sum, and this repository has
@@ -226,7 +270,7 @@ jobs:
       # complement.sh because that is where COMPLEMENT_REV lives: bump the
       # pin and the key changes with it, so a stale build is never reused.
       - name: Cache the Complement checkout and Go build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
         with:
           path: |
             tmp/complement-src
@@ -235,7 +279,7 @@ jobs:
           key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
           restore-keys: complement-${{ runner.os }}-
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/setup-buildx-action@v4.4.1
 
       # Built here rather than inside complement.sh so the layer cache
       # applies; the script skips its own build when COMPLEMENT_IMAGE is
@@ -250,7 +294,7 @@ jobs:
       # jobs below import it.
       - name: Build the Complement image
         id: image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: complement/Dockerfile
@@ -389,7 +433,7 @@ jobs:
 
       - name: Keep the ledger
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: complement-results
           path: tmp/complement-results.jsonl
@@ -433,7 +477,7 @@ jobs:
 
       - name: Keep the ledgers
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: state-resolution-interop
           path: tmp/state-res-*.jsonl
@@ -450,15 +494,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: 'stable'
           cache: false
 
       - name: Cache the Complement checkout and Go build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
         with:
           path: |
             tmp/complement-src
@@ -467,10 +513,10 @@ jobs:
           key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
           restore-keys: complement-${{ runner.os }}-
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build the hub-mode Complement image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: complement/Dockerfile
@@ -518,10 +564,71 @@ jobs:
 
       - name: Keep the ledgers
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: hub-mode-interop
           path: tmp/hub-mode-*.jsonl
+          if-no-files-found: ignore
+
+  # E2EE through real client SDKs (docs/conformance-testing.md §4.2, #744):
+  # complement-crypto's matrix-js-sdk clients, in headless Chrome, against
+  # two Spindles behind its mitmproxy -- key claims, to-device, device
+  # lists over federation, backup, verification. Nightly and on demand,
+  # because it builds the SDK's browser bundle and takes a quarter of an
+  # hour.
+  #
+  # Report-only: a failing test leaves the job green and names itself in
+  # the log and the ledger. One recorded run (the probe for #744, 35 of 41
+  # tests that ran passed) is not a baseline, so a failure cannot yet be
+  # told from a regression, and gating on it would make the nightly red for
+  # a known reason every night, which teaches everyone to stop reading it.
+  # Tests that pass twice in a row go into an allowlist and this becomes a
+  # ratchet like complement-suite's. What does fail the job is a run in
+  # which nothing passed: the rig broke, which is worth a red run.
+  complement-crypto:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # The Go upstream's own workflow uses, not `stable`: the pinned
+      # suite's go-json-experiment dependency does not build on newer Go,
+      # where it aliases encoding/json/v2 and finds names that are not there.
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: actions/setup-node@v7.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
+        with:
+          node-version: 22
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build the Spindle image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+      # Ubuntu 24.04's AppArmor refuses unprivileged user namespaces, which
+      # is Chrome's sandbox: a probe run of this job had every JS client abort
+      # with "No usable sandbox!" before a request was made. Lifted for
+      # this runner only, rather than running Chrome with --no-sandbox.
+      - name: Let headless Chrome start its sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Run complement-crypto against Spindle
+        env:
+          GOPROXY: https://proxy.golang.org|direct
+          COMPLEMENT_IMAGE: complement-spindle:latest
+        run: contrib/complement-crypto/run.sh tmp/complement-crypto/results.jsonl
+      - name: Keep the ledger and the logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: complement-crypto
+          path: tmp/complement-crypto/
           if-no-files-found: ignore
 
   # Heterogeneous federation against a real Synapse (docs/conformance-testing.md
@@ -551,15 +658,17 @@ jobs:
     timeout-minutes: 90
     continue-on-error: true
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: 'stable'
           cache: false
 
       - name: Cache the Complement checkout and Go build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
         with:
           path: |
             tmp/complement-src
@@ -568,11 +677,11 @@ jobs:
           key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
           restore-keys: complement-${{ runner.os }}-
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/setup-buildx-action@v4.4.1
 
       # Import only, from the layer cache the suite job exported.
       - name: Build the Complement image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: complement/Dockerfile
@@ -581,7 +690,7 @@ jobs:
           cache-from: type=gha,scope=complement-image
 
       - name: Fetch the homogeneous baseline
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           name: complement-results
           path: tmp/baseline
@@ -605,7 +714,7 @@ jobs:
 
       - name: Keep the ledger and the report
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: compliance-interop
           path: |
@@ -627,15 +736,17 @@ jobs:
     timeout-minutes: 90
     continue-on-error: true
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: 'stable'
           cache: false
 
       - name: Cache the Complement checkout and Go build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
         with:
           path: |
             tmp/complement-src
@@ -644,11 +755,11 @@ jobs:
           key: complement-${{ runner.os }}-${{ hashFiles('scripts/complement.sh') }}
           restore-keys: complement-${{ runner.os }}-
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/setup-buildx-action@v4.4.1
 
       # Import only, from the layer cache the suite job exported.
       - name: Build the Complement image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: complement/Dockerfile
@@ -657,7 +768,7 @@ jobs:
           cache-from: type=gha,scope=complement-image
 
       - name: Fetch the homogeneous baseline
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           name: complement-results
           path: tmp/baseline
@@ -681,7 +792,7 @@ jobs:
 
       - name: Keep the ledger and the report
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: compliance-interop-inverse
           path: |
@@ -700,16 +811,27 @@ jobs:
   # recorded run is what fills it in. Until an entry is protected the check
   # cannot fail on a spec, only on the stack not coming up -- which is a
   # finding worth a red run, so it is not continue-on-error.
+  #
+  # Twice, by who mints the SFU tokens: upstream's lk-jwt-service, as in
+  # Element Call's own rig, and Spindle's built-in minter in its place
+  # (#796), each against its own allowlist. A push to main, where this
+  # job is one rig of a rotation, runs the first only.
   element-call-e2e:
     needs: plan
     if: contains(fromJSON(needs.plan.outputs.rotation), 'element-call-e2e')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        rtc: ${{ fromJSON((inputs.element_call_rtc == 'builtin' && '["builtin"]') || (inputs.element_call_rtc == 'lk-jwt-service' && '["lk-jwt-service"]') || (github.event_name == 'push' && '["lk-jwt-service"]') || '["lk-jwt-service","builtin"]') }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4.4.1
       - name: Build the Spindle image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: complement/Dockerfile
@@ -722,7 +844,7 @@ jobs:
           rev=$(sed -n 's/^ELEMENT_CALL_REV=//p' contrib/element-call/run.sh)
           git clone --quiet https://github.com/element-hq/element-call.git tmp/element-call
           git -C tmp/element-call checkout --quiet "$rev"
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
         with:
           node-version-file: tmp/element-call/.node-version
       - name: Run the suite against Spindle
@@ -730,15 +852,75 @@ jobs:
           SPINDLE_IMAGE: complement-spindle:latest
           ELEMENT_CALL_SRC: tmp/element-call
           ELEMENT_CALL_SPECS: ${{ inputs.element_call_specs }}
+          SPINDLE_RTC: ${{ matrix.rtc }}
         run: contrib/element-call/run.sh tmp/element-call-results/results.json
       - name: Keep the report and the server logs
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: element-call-e2e
+          name: element-call-e2e-${{ matrix.rtc }}
           path: |
             tmp/element-call-results/
             tmp/element-call/playwright-report/
+          if-no-files-found: ignore
+
+  # The same rig with upstream's real Synapse in the second seat (#795):
+  # calls between a Spindle user and a Synapse user in both directions and
+  # both membership modes, DM rings across federation within a bound, and
+  # a ring while the room also holds users of three servers that stopped
+  # answering -- the call reilly.asia could not ring on 2026-11-06. On pull
+  # requests that touch federation or MatrixRTC code (the plan job decides),
+  # nightly and on demand. Its ratchet is
+  # contrib/element-call/allowlist-synapse-peer.txt. Nightly and on demand
+  # it runs a second time with Spindle's built-in minter in the first seat
+  # (#796), against allowlist-builtin-rtc-synapse-peer.txt.
+  element-call-synapse-peer:
+    needs: plan
+    if: needs.plan.outputs.federation_rtc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rtc: ${{ fromJSON((inputs.element_call_rtc == 'builtin' && '["builtin"]') || (inputs.element_call_rtc == 'lk-jwt-service' && '["lk-jwt-service"]') || (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && '["lk-jwt-service"]') || '["lk-jwt-service","builtin"]') }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build the Spindle image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: complement/Dockerfile
+          tags: complement-spindle:latest
+          load: true
+          cache-from: type=gha,scope=complement-image
+      - name: Check out Element Call at the pin
+        run: |
+          set -euo pipefail
+          rev=$(sed -n 's/^ELEMENT_CALL_REV=//p' contrib/element-call/run.sh)
+          git clone --quiet https://github.com/element-hq/element-call.git tmp/element-call
+          git -C tmp/element-call checkout --quiet "$rev"
+      - uses: actions/setup-node@v7.1.0  # zizmor: ignore[cache-poisoning] test-only workflow; build-push-action only loads local images, nothing is published
+        with:
+          node-version-file: tmp/element-call/.node-version
+      - name: Run the Spindle-to-Synapse specs
+        env:
+          SPINDLE_IMAGE: complement-spindle:latest
+          SPINDLE_PEER: synapse
+          SPINDLE_RTC: ${{ matrix.rtc }}
+          ELEMENT_CALL_SRC: tmp/element-call
+        run: contrib/element-call/run.sh tmp/element-call-results/results.json
+      - name: Keep the report and the server logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: element-call-synapse-peer-${{ matrix.rtc }}
+          path: |
+            tmp/element-call-results/
+            tmp/element-call/playwright-report/
+            tmp/element-call/test-results/
           if-no-files-found: ignore
 
   # The mesh seam, nightly and in its turn on main: a Neutrino node built
@@ -755,16 +937,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: |
             . -> target
             tmp/neutrino-iroh -> target
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Check out the fork at the pin and apply the patches
@@ -810,7 +994,7 @@ jobs:
         run: contrib/element-call-full-mesh/run.sh
       - name: Keep the screenshots and logs
         if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: mesh-seam
           path: |
@@ -831,11 +1015,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: |
             . -> target
@@ -851,7 +1037,7 @@ jobs:
         run: cargo build --release -p spindle-server --bin spindle
       # The SDK's floor is above this repository's pin; a second toolchain
       # for its build alone, named to the rig rather than changing the pin.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.96.0
       - name: Run the suite against Spindle
@@ -862,7 +1048,7 @@ jobs:
         run: contrib/rust-sdk/run.sh tmp/rust-sdk/results.log
       - name: Keep the log
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: rust-sdk-suite
           path: tmp/rust-sdk/

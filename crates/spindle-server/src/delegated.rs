@@ -21,15 +21,6 @@ use crate::accounts::{Accounts, Identity};
 use crate::config::DelegatedAuthConfig;
 use crate::errors::MatrixError;
 
-/// How long one introspection verdict is trusted before the provider is
-/// asked again. This is the revocation lag only for a revocation this
-/// server is never told about: a logout it serves, and a device the
-/// provider deletes through `/_synapse/mas/delete_device`, evict the
-/// verdicts they end at once (#615), and a cached verdict whose device
-/// has gone is refused on sight, the check Synapse's `MasDelegatedAuth`
-/// makes for the same reason. Synapse ships the same two minutes.
-const INTROSPECTION_TTL: Duration = Duration::from_secs(120);
-
 /// The scope prefix MSC2967 uses to bind a token to one device.
 const DEVICE_SCOPE: &str = "urn:matrix:org.matrix.msc2967.client:device:";
 
@@ -39,21 +30,44 @@ const STABLE_API_SCOPE: &str = "urn:matrix:client:api:*";
 const STABLE_DEVICE_SCOPE: &str = "urn:matrix:client:device:";
 const ADMIN_SCOPE: &str = "urn:synapse:admin:*";
 
+/// How long a refusal is remembered, at most.
+const UNKNOWN_TOKEN_TTL: Duration = Duration::from_secs(30);
+/// How many refused tokens are remembered at once.
+const MAX_UNKNOWN_TOKENS: usize = 4096;
+
 #[derive(Clone)]
 struct Verdict {
     user_id: String,
     device_id: Option<String>,
     admin: bool,
+    /// The provider's `expires_in`: how long the token lives from the
+    /// moment it answered. A verdict is not cached past it, as Synapse's
+    /// `IntrospectionResponse::is_active` refuses a cached one past it.
+    expires_in: Option<Duration>,
 }
 
 /// The delegated provider, plus the caches that keep it off the hot path.
 pub struct Delegated {
     config: DelegatedAuthConfig,
+    /// How long one verdict is trusted before the provider is asked again
+    /// (`introspection_cache_ttl_secs`). This is the revocation lag only
+    /// for a revocation this server is never told about: a logout it
+    /// serves, a device or account it ends, and a device the provider
+    /// deletes through `/_synapse/mas/delete_device` evict the verdicts
+    /// they end at once (#615), and a cached verdict whose device has gone
+    /// is refused on sight, the check Synapse's `MasDelegatedAuth` makes
+    /// for the same reason. Synapse's cache is a fixed two minutes, the
+    /// default here.
+    ttl: Duration,
     client: reqwest::Client,
     /// Token-hash → verdict. Introspecting on every request would put
     /// the provider in every API call's latency; the hash keeps usable
     /// tokens out of process memory dumps, same as the token store.
     verdicts: Mutex<HashMap<[u8; 32], (Verdict, Instant)>>,
+    /// Token-hash → when to ask the provider again, for tokens it said are
+    /// not active. Brief, so a token issued just after a first attempt is
+    /// not refused for long.
+    unknown: Mutex<HashMap<[u8; 32], Instant>>,
     /// Bumped by every eviction. An introspection that was in flight
     /// while one happened may be carrying the very verdict the eviction
     /// ended -- the provider answered before the session was revoked --
@@ -69,9 +83,11 @@ impl Delegated {
     #[must_use]
     pub fn new(config: DelegatedAuthConfig) -> Self {
         Self {
+            ttl: Duration::from_secs(config.introspection_cache_ttl_secs),
             config,
             client: reqwest::Client::new(),
             verdicts: Mutex::new(HashMap::new()),
+            unknown: Mutex::new(HashMap::new()),
             evictions: AtomicU64::new(0),
             metadata: Mutex::new(None),
         }
@@ -272,18 +288,57 @@ impl Delegated {
             }
             return Ok(verdict);
         }
+        if self.recently_unknown(&key) {
+            return Err(MatrixError::unknown_token());
+        }
         let generation = self.evictions.load(Ordering::SeqCst);
         let verdict = self
             .introspect(store, server_name, token, generation)
             .await?;
+        // Trusted for the configured window, and never past the token's
+        // own lifetime; a window of zero is not cached at all.
+        let lifetime = verdict
+            .expires_in
+            .map_or(self.ttl, |expires_in| expires_in.min(self.ttl));
         let mut verdicts = self
             .verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.evictions.load(Ordering::SeqCst) == generation {
-            verdicts.insert(key, (verdict.clone(), Instant::now() + INTROSPECTION_TTL));
+        if !lifetime.is_zero() && self.evictions.load(Ordering::SeqCst) == generation {
+            verdicts.insert(key, (verdict.clone(), Instant::now() + lifetime));
         }
         Ok(verdict)
+    }
+
+    /// Whether the provider refused this token a moment ago.
+    fn recently_unknown(&self, key: &[u8; 32]) -> bool {
+        self.unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Remember that the provider refused `token`, so a caller repeating a
+    /// bad token does not cost the provider a request each time (#833).
+    fn remember_unknown(&self, token: &str) {
+        let lifetime = self.ttl.min(UNKNOWN_TOKEN_TTL);
+        if lifetime.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut unknown = self
+            .unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if unknown.len() >= MAX_UNKNOWN_TOKENS {
+            unknown.retain(|_, until| *until > now);
+        }
+        // Full of live entries: skip rather than evict. The cache only saves
+        // requests, so a token that is not remembered costs one, as before.
+        if unknown.len() < MAX_UNKNOWN_TOKENS {
+            unknown.insert(*blake3::hash(token.as_bytes()).as_bytes(), now + lifetime);
+        }
     }
 
     async fn introspect(
@@ -318,9 +373,26 @@ impl Delegated {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(Value::Null);
+        // Only the provider calling the token inactive is remembered. A
+        // timeout or a 5xx above says nothing about the token, and a refusal
+        // from local state (a deleted device, a deactivated account) can
+        // lift the moment an admin acts, so those are asked again.
         if verdict["active"] != Value::Bool(true) {
+            self.remember_unknown(token);
             return Err(MatrixError::unknown_token());
         }
+        self.judge(store, server_name, &verdict, generation)
+    }
+
+    /// Turn the provider's introspection answer into a verdict, provisioning
+    /// the account and device it names.
+    fn judge(
+        &self,
+        store: &spindle_store::FjallStore,
+        server_name: &str,
+        verdict: &Value,
+        generation: u64,
+    ) -> Result<Verdict, MatrixError> {
         let scope = verdict["scope"].as_str().unwrap_or_default();
         let scopes: std::collections::HashSet<_> = scope.split_ascii_whitespace().collect();
         if !scopes.contains(API_SCOPE) && !scopes.contains(STABLE_API_SCOPE) {
@@ -356,33 +428,50 @@ impl Delegated {
             .to_lowercase();
 
         let accounts = Accounts::new(store, server_name);
-        let known = accounts
+        match accounts
             .account(&localpart)
             .map_err(|error| MatrixError::internal(&error.to_string()))?
-            .is_some();
-        if !known {
-            accounts
-                .register(&localpart, &crate::accounts::unguessable_password())
-                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        {
+            // A deactivated account is refused whoever deactivated it: the
+            // admin API and `/account/deactivate` do not tell the provider,
+            // which may go on vouching for the user's sessions (#615).
+            Some(account) if account.deactivated => return Err(MatrixError::unknown_token()),
+            Some(_) => {}
+            None => {
+                accounts
+                    .register(&localpart, &crate::accounts::unguessable_password())
+                    .map_err(|error| crate::routes::internal(&error))?;
+            }
         }
         // The device row exists because the provider bound the token to
         // it — MSC3861's account/device mapping, written down so device
-        // lists and E2EE key uploads have something to hang off.
+        // lists and E2EE key uploads have something to hang off. Unless
+        // this server ended that device: then the provider vouches for a
+        // session that is over here, and the token is refused, as Synapse
+        // refuses a token whose device is gone (#615).
         if let Some(device_id) = &device_id
-            && self.evictions.load(Ordering::SeqCst) == generation
             && accounts
                 .device(&localpart, device_id)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
                 .is_none()
         {
-            accounts
-                .put_device(&localpart, device_id, None)
-                .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            if accounts
+                .device_revoked(&localpart, device_id)
+                .map_err(|error| MatrixError::internal(&error.to_string()))?
+            {
+                return Err(MatrixError::unknown_token());
+            }
+            if self.evictions.load(Ordering::SeqCst) == generation {
+                accounts
+                    .put_device(&localpart, device_id, None)
+                    .map_err(|error| MatrixError::internal(&error.to_string()))?;
+            }
         }
         Ok(Verdict {
             user_id: accounts.user_id(&localpart),
             device_id,
             admin,
+            expires_in: verdict["expires_in"].as_u64().map(Duration::from_secs),
         })
     }
 }

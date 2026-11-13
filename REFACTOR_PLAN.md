@@ -3,7 +3,32 @@
 ## Objective
 Split `crates/spindle-server/src/routes.rs` (10.8k LOC, 308 handlers) into domain-specific modules following the established pattern of `admin.rs`, `oidc.rs`, `mas.rs`, `openid.rs`, `livekit.rs`, and `dehydrated.rs`.
 
-## Current State
+## Status (#689): complete
+
+The extraction is done. `routes.rs` went from 12,764 lines to 1,209. It now
+holds the route table (`MOUNTED`), the router assembly, the middleware, and
+the helpers that more than one domain uses. Each domain module exports
+`pub fn routes()`, and `router()` merges it.
+
+| Phase | Module |
+|-------|--------|
+| 1 | `moderation_routes.rs`, `presence_routes.rs` (earlier PRs) |
+| 2 | `profile_routes.rs`, `device_routes.rs` |
+| 3 | `account_routes.rs`, `account_data_routes.rs`, `keys_routes.rs` |
+| 4 | `sync_routes.rs` |
+| 5 | `room_routes.rs` |
+| 6 | `timeline_routes.rs` |
+| 7 | `media_routes.rs` |
+| 8 | `federation_routes.rs` |
+| 9 | `discovery_routes.rs` |
+| 10 | `delayed_routes.rs` |
+| 11 | `push_routes.rs` |
+| 12 | `directory_routes.rs`, `voip_routes.rs`, `appservice_routes.rs` |
+
+The room-authorization semgrep rule covers `routes.rs` and every
+`*_routes.rs` module.
+
+## Starting State (before #689)
 - **routes.rs**: 10,822 lines, 11 builder functions, 308 async handlers
 - Router assembly: Already split into named builders (`account_routes()`, `push_routes()`, etc.)
 - Handler bodies: Monolithic in same file

@@ -246,6 +246,7 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::GET, format!("{prefix}/event_reports")),
             (reqwest::Method::GET, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/audit")),
+            (reqwest::Method::POST, format!("{prefix}/backup")),
             (
                 reqwest::Method::GET,
                 format!("{prefix}/users/{user}/devices/DEV"),
@@ -287,6 +288,33 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             ),
             (reqwest::Method::GET, format!("{prefix}/media/x/y")),
             (reqwest::Method::DELETE, format!("{prefix}/media/x/y")),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/quarantine/x/y"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/unquarantine/x/y"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/user/{user}/media/quarantine"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/room/!r:x/media/quarantine"),
+            ),
+            (reqwest::Method::POST, format!("{prefix}/media/protect/x")),
+            (reqwest::Method::POST, format!("{prefix}/media/unprotect/x")),
+            (reqwest::Method::POST, format!("{prefix}/media/protect/x/y")),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/media/unprotect/x/y"),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{prefix}/purge_media_cache?before_ts=1"),
+            ),
         ]);
     }
     routes
@@ -1107,6 +1135,57 @@ async fn purge_keeps_the_spine_and_the_chain_still_verifies() {
     assert_chain_verifies(&timeline().await);
 }
 
+/// The opt-in `truncate` flag removes the log below the cutoff, where the
+/// plain purge keeps it (#817). The default is covered by the test above.
+#[tokio::test]
+async fn purge_with_truncate_removes_the_log_and_the_room_still_works() {
+    let server = Instance::start().await;
+    let (admin_token, ops, _) = rooms_fixture(&server).await;
+    let timeline = || {
+        let server = &server;
+        let token = admin_token.clone();
+        let ops = ops.clone();
+        async move {
+            let (status, body) = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/_spindle/admin/v1/rooms/{ops}/timeline"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            body["chunk"].as_array().unwrap().len()
+        }
+    };
+    let before = timeline().await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/purge_history"),
+            Some(&admin_token),
+            Some(&json!({ "before_li": i64::MAX, "truncate": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["truncated"]["refused"].is_null(), "{body}");
+    assert!(
+        body["truncated"]["entries_removed"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+    assert!(timeline().await < before);
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{ops}/send/m.room.message/after-truncate"),
+            Some(&admin_token),
+            Some(&json!({ "msgtype": "m.text", "body": "life goes on" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test]
 async fn purge_resolves_time_and_refuses_ambiguity() {
     let server = Instance::start().await;
@@ -1136,9 +1215,21 @@ async fn purge_resolves_time_and_refuses_ambiguity() {
     let newest_ts = body["chunk"][0]["event"]["origin_server_ts"]
         .as_u64()
         .unwrap();
+    let (batches, barriers) = (server.store.journalled(), server.store.barriers());
     let (status, body) = purge(&ops, json!({ "before_ts": newest_ts })).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["events_purged"], 3, "all three messages: {body}");
+    // The three body deletes are one atomic batch, not three tombstones that
+    // a crash can separate (#810). The watermark and the audit row are puts.
+    assert_eq!(
+        server.store.journalled() - batches,
+        1,
+        "the body deletes are a single journalled batch"
+    );
+    assert!(
+        server.store.barriers() > barriers,
+        "the purge is synced before it reports success"
+    );
     let (status, body) = server
         .request(
             reqwest::Method::GET,
@@ -1339,6 +1430,89 @@ async fn deleting_with_purge_keeps_the_verifiable_spine() {
         chunk.iter().any(|entry| entry["purged"] == true),
         "message bodies are gone: {body}"
     );
+}
+
+/// #742: a history purge and a room deletion keep every log entry, so
+/// neither leaves a state node unreachable. The collector run after them
+/// sweeps only the stray nodes planted beside a live server's store, every
+/// stored root of every room still reads back, and a rerun finds nothing.
+#[tokio::test]
+async fn state_gc_after_purge_and_deletion_keeps_every_room_readable() {
+    use spindle_store::gc::collect_state_nodes;
+
+    let server = Instance::start().await;
+    let (admin_token, ops, unnamed) = rooms_fixture(&server).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/rooms/{ops}/purge_history"),
+            Some(&admin_token),
+            Some(&json!({ "before_li": 9 })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/_spindle/admin/v1/rooms/{unnamed}"),
+            Some(&admin_token),
+            Some(&json!({ "purge": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let store = server.store.as_ref();
+    let table = spindle_store::ReadView::key_table(store);
+    let mut stray = spindle_core::StateSnapshot::new(Arc::clone(&table));
+    for number in 0..20 {
+        stray = stray.apply(
+            &spindle_core::StateKey::new("org.example.stray", number.to_string()),
+            format!("$stray-{number}"),
+        );
+    }
+    let writes: Vec<_> = stray
+        .delta_nodes(None)
+        .into_iter()
+        .map(|(address, bytes)| {
+            (
+                spindle_core::keys::content_addressed(
+                    spindle_core::keys::Keyspace::StateNode,
+                    address.as_bytes(),
+                ),
+                bytes,
+            )
+        })
+        .collect();
+    spindle_store::Store::commit_state_deferred(store, &writes, &table).unwrap();
+
+    let dry = collect_state_nodes(store, true).unwrap();
+    assert_eq!(dry.swept, writes.len() as u64, "only the strays: {dry:?}");
+    let swept = collect_state_nodes(store, false).unwrap();
+    assert_eq!(swept, dry);
+
+    for room in [&ops, &unnamed] {
+        let restored = spindle_store::RoomStore::new(store, room)
+            .load_exhaustive()
+            .unwrap()
+            .expect("the room is still stored");
+        assert!(restored.unverified.is_empty(), "{room}");
+        assert!(restored.log.entries().len() > 3, "{room}");
+    }
+    for li in 1..=8 {
+        let (status, body) = server
+            .request(
+                reqwest::Method::GET,
+                &format!("/_spindle/admin/v1/rooms/{ops}/state_at?li={li}"),
+                Some(&admin_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "li {li}: {body}");
+    }
+
+    let again = collect_state_nodes(store, false).unwrap();
+    assert_eq!(again.swept, 0, "a rerun is a no-op: {again:?}");
+    assert_eq!(again.marked, swept.marked);
 }
 
 #[tokio::test]
@@ -2237,6 +2411,300 @@ async fn user_media_lists_and_deletes() {
         .await;
     assert_eq!(status, 200, "{deleted}");
     assert_eq!(deleted["total"], 1, "{deleted}");
+}
+
+/// Quarantine by user and by room, under both prefixes: what is held is
+/// answered 404 on the client routes and listed as quarantined.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn quarantine_by_user_and_room_hides_media_and_lists_it() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let bob_token = server.register("bob").await;
+    let alice = server.user("alice");
+    let upload = |token: String, name: &'static str| {
+        let client = server.client.clone();
+        let host = server.name.clone();
+        async move {
+            let response = client
+                .post(format!(
+                    "http://{host}/_matrix/media/v3/upload?filename={name}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "text/plain")
+                .body(format!("contents of {name}"))
+                .send()
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            body["content_uri"].as_str().unwrap().to_owned()
+        }
+    };
+    let alice_one = upload(alice_token.clone(), "a1.txt").await;
+    let alice_two = upload(alice_token.clone(), "a2.txt").await;
+    let bob_in_room = upload(bob_token.clone(), "b1.txt").await;
+    let bob_elsewhere = upload(bob_token.clone(), "b2.txt").await;
+    let id = |mxc: &str| mxc.rsplit('/').next().unwrap().to_owned();
+    let status_of = |token: String, mxc: String| {
+        let client = server.client.clone();
+        let host = server.name.clone();
+        async move {
+            let (server_name, media_id) =
+                mxc.strip_prefix("mxc://").unwrap().split_once('/').unwrap();
+            let response = client
+                .get(format!(
+                    "http://{host}/_matrix/client/v1/media/download/{server_name}/{media_id}"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap();
+            response.status().as_u16()
+        }
+    };
+
+    // Alice's uploads, by user, under the Spindle prefix.
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_spindle/admin/v1/user/{alice}/media/quarantine"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!((status, &body), (200, &json!({ "num_quarantined": 2 })));
+    for mxc in [&alice_one, &alice_two] {
+        assert_eq!(status_of(bob_token.clone(), mxc.clone()).await, 404);
+    }
+    assert_eq!(status_of(bob_token.clone(), bob_in_room.clone()).await, 200);
+    let (_, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        listing["media"][0]["quarantined_by"],
+        server.user("root").as_str(),
+        "{listing}"
+    );
+
+    // A room's media: the attachment, its thumbnail and a remote item.
+    let (status, room) = server
+        .request(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{room}");
+    let room = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/t1"),
+            Some(&admin_token),
+            Some(&json!({
+                "msgtype": "m.image", "body": "x", "url": bob_in_room,
+                "info": { "thumbnail_url": "mxc://elsewhere.example/remote1" },
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            &format!("/_synapse/admin/v1/room/{room}/media/quarantine"),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "num_quarantined": 2 }), "{body}");
+    assert_eq!(
+        status_of(alice_token.clone(), bob_in_room.clone()).await,
+        404
+    );
+    assert_eq!(
+        status_of(alice_token.clone(), bob_elsewhere.clone()).await,
+        200,
+        "media the room never mentioned is left alone"
+    );
+    let (_, info) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/admin/v1/media/elsewhere.example/remote1",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        info["media_info"]["quarantined_by"],
+        server.user("root").as_str(),
+        "{info}"
+    );
+
+    // Releasing one item serves it again.
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_synapse/admin/v1/media/unquarantine/{}/{}",
+                server.name,
+                id(&alice_one)
+            ),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(bob_token.clone(), alice_one).await, 200);
+    let (status, _) = server
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/nosuchmedia",
+                server.name
+            ),
+            Some(&admin_token),
+            Some(&json!({})),
+        )
+        .await;
+    assert_eq!(status, 404, "an unknown local item is not reported as held");
+}
+
+/// Protection is reported as `safe_from_quarantine`, spares an item from a
+/// user's bulk quarantine, is audited, and releases on unprotect. Naming the
+/// item still quarantines it, and quarantine wins over serving.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one walk through the group")]
+async fn protecting_media_spares_it_from_bulk_quarantine_and_is_reported() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let alice_token = server.register("alice").await;
+    let alice = server.user("alice");
+    let mut ids = Vec::new();
+    for name in ["a1.txt", "a2.txt"] {
+        let response = server
+            .client
+            .post(format!(
+                "http://{}/_matrix/media/v3/upload?filename={name}",
+                server.name
+            ))
+            .header("authorization", format!("Bearer {alice_token}"))
+            .header("content-type", "text/plain")
+            .body(name)
+            .send()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        ids.push(
+            body["content_uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let post = |path: String| {
+        let (server, token) = (&server, admin_token.clone());
+        async move {
+            server
+                .request(reqwest::Method::POST, &path, Some(&token), Some(&json!({})))
+                .await
+        }
+    };
+    let status_of = |id: String| {
+        let (server, token) = (&server, alice_token.clone());
+        async move {
+            server
+                .client
+                .get(format!(
+                    "http://{}/_matrix/client/v1/media/download/{}/{id}",
+                    server.name, server.name
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    let (status, body) = post(format!("/_synapse/admin/v1/media/protect/{}", ids[0])).await;
+    assert_eq!((status, &body), (200, &json!({})));
+    let (status, _) = post("/_synapse/admin/v1/media/protect/nosuchmedia".to_owned()).await;
+    assert_eq!(status, 404, "an unknown item is not reported as protected");
+    let (_, listing) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/users/{alice}/media?order_by=media_id"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    let flags = |listing: &Value| -> std::collections::BTreeMap<String, bool> {
+        listing["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["media_id"].as_str().unwrap().to_owned(),
+                    m["safe_from_quarantine"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+    assert!(flags(&listing)[&ids[0]], "{listing}");
+    assert!(!flags(&listing)[&ids[1]], "{listing}");
+
+    let (_, body) = post(format!("/_spindle/admin/v1/user/{alice}/media/quarantine")).await;
+    assert_eq!(
+        body,
+        json!({ "num_quarantined": 1 }),
+        "protected is skipped"
+    );
+    assert_eq!(status_of(ids[0].clone()).await, 200, "protected is served");
+    assert_eq!(status_of(ids[1].clone()).await, 404);
+
+    // Naming the protected item quarantines it: quarantine wins.
+    let (status, _) = post(format!(
+        "/_spindle/admin/v1/media/quarantine/{}/{}",
+        server.name, ids[0]
+    ))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(ids[0].clone()).await, 404);
+
+    let (status, _) = post(format!(
+        "/_spindle/admin/v1/media/unprotect/{}/{}",
+        server.name, ids[0]
+    ))
+    .await;
+    assert_eq!(status, 200);
+    let (_, info) = server
+        .request(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/media/{}/{}", server.name, ids[0]),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(info["media_info"]["safe_from_quarantine"], false, "{info}");
+    assert_eq!(
+        info["media_info"]["quarantined_by"],
+        server.user("root").as_str()
+    );
 }
 
 /// Event reports filter, page by integer token, and can be dismissed;

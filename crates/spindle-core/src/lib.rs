@@ -31,16 +31,16 @@ pub mod state_table;
 pub mod version;
 
 pub use log::{
-    AppendError, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput, ForkWindow,
-    ForkWindowError, LinearIndex, LogEntry, LogRestore, MAX_AUTHORED_PREV_EVENTS, NodeLoader,
-    RestoreError, RestoredEntry, RestoredLog, RoomLog, RuntimeRestoredLog, Sideline,
-    SidelinedEntry, StateResolver, Strict,
+    AppendError, ChainCheckpoint, ChainHash, DEFAULT_RESIDENT_WINDOW, EventId, EventInput,
+    FilledEntry, FilledSidelined, FilledStates, ForkWindow, ForkWindowError, LinearIndex, LogEntry,
+    LogRestore, MAX_AUTHORED_PREV_EVENTS, NodeLoader, RestoreError, RestoredEntry, RestoredLog,
+    RoomLog, RuntimeRestoredLog, Sideline, SidelinedEntry, StateResolver, Strict, Truncation,
 };
 pub use pdu::{Pdu, PduError};
 pub use state::{
     CONTENT_DIGEST_VERSION, EventType, MigrationStateVerifier, RehydrateError, StateKey, StateRoot,
     StateSnapshot, VerifiedNodeCache, rehydrate_v2, rehydrate_v2_incremental,
-    rehydrate_v2_with_addresses, v2_node_addresses,
+    rehydrate_v2_with_addresses, stored_node_children, v2_node_addresses,
 };
 pub use state_table::{AllocRecord, MemStateKeyTable, StateKeyTable};
 pub use version::{STATE_DAG_V12, VersionError, is_state_dag, rules_of};

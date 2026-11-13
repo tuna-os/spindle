@@ -1,0 +1,23 @@
+# Caddy in front of Spindle on the same host. Replace matrix.example.org
+# with your public host name (server.name in spindle.toml, here the same
+# host). Spindle listens on 127.0.0.1:8008.
+matrix.example.org {
+	# Federation peers read this to find the port. Spindle itself does not
+	# publish a port, so name 443.
+	handle /.well-known/matrix/server {
+		header Content-Type application/json
+		respond `{"m.server": "matrix.example.org:443"}`
+	}
+
+	handle {
+		# Keep this at or above [media] max_upload_bytes.
+		request_body {
+			max_size 100MB
+		}
+		reverse_proxy 127.0.0.1:8008 {
+			flush_interval -1
+			# No response timeout. /sync holds the request open as a long
+			# poll. Caddy sets none by default; do not add a short one.
+		}
+	}
+}

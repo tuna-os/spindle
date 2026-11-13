@@ -32,7 +32,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 SPINDLE_BIN="${SPINDLE_BIN:-target/release/spindle}"
-HOOKSHOT_IMAGE="${HOOKSHOT_IMAGE:-ghcr.io/matrix-org/matrix-hookshot:7.4.4}"
+HOOKSHOT_IMAGE="${HOOKSHOT_IMAGE:-ghcr.io/matrix-org/matrix-hookshot:7.4.4@sha256:4110ffaf4b11433c72e7a168078dac5d1f86bd58593e2412c61156742741a23d}"
 OUT_DIR="${OUT_DIR:-tmp/hookshot}"
 SERVER_NAME="hookshot.test"
 S="http://127.0.0.1:8008"

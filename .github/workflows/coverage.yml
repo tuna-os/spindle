@@ -3,12 +3,10 @@ name: Coverage
 # What the test suite reaches, measured rather than assumed. Not a gate
 # yet: the first runs establish the number, and a floor belongs in this
 # file once there is one to hold (ROADMAP.md, the v0.1.0 table, says
-# evidence before promises). On main and weekly, because instrumented
-# builds cost a full rebuild and a pull request already runs the suite.
+# evidence before promises). Weekly, because instrumented builds cost a full
+# rebuild and a pull request already runs the suite.
 
 on:
-  push:
-    branches: [main]
   schedule:
     - cron: '41 4 * * 1'
   workflow_dispatch:
@@ -29,12 +27,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.90.0
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: coverage
       - name: Install cargo-llvm-cov
@@ -53,7 +53,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Keep the report
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: coverage
           path: |

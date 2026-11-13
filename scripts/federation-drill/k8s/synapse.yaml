@@ -54,7 +54,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: front
-        image: nginxinc/nginx-unprivileged:1.27-alpine
+        image: nginxinc/nginx-unprivileged:1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
         env:
         - {name: SERVER_NAME, value: "__SERVER_NAME__"}
         - {name: FED_HOST, value: "__FED_HOST__"}
@@ -74,7 +74,7 @@ spec:
         - {name: front, mountPath: /etc/nginx/templates, readOnly: true}
         - {name: tls, mountPath: /tls, readOnly: true}
       - name: synapse
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -m, synapse.app.homeserver, -c, /conf/homeserver.yaml, -c, /secrets/secrets.yaml]
         env:
         - name: PGPASSWORD
@@ -97,7 +97,7 @@ spec:
         - {name: tls, mountPath: /tls, readOnly: true}
         - {name: data, mountPath: /data}
       - name: netwatch
-        image: oci.element.io/synapse:v1.156.0
+        image: oci.element.io/synapse:v1.156.0@sha256:d2215c4a0e0bbd304489af228345b31d6857c1a228175471358d3fda187c0d91
         command: [python3, -u, /netwatch/netwatch.py]
         env:
         - {name: ALLOWED, value: "database=__PG_IP__:5432,resolver=10.111.63.10:53,peer=__PEER_IP__:443"}

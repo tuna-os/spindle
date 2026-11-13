@@ -27,16 +27,24 @@ events and fails at 200 does not hold. A cell the rounds do not separate is
 not a loss on any line, because calling it one would be reading noise.
 
 **Line 3 is never reported as a pass while a targeted workload is
-unmeasured.** Two of them (the 10,000-member federated join and catch-up
-after a partition) need a fork workload that no client-server driver can
-construct, and concurrent send has no competitor beside it yet. Those are
-listed by name every time, so the gap cannot quietly drop out of the
-report. A line with a failed cell exits non-zero; an incomplete line only
-does so under `--require-complete`.
+unmeasured.** Three of them -- the 10,000-member federated join, catch-up
+after a partition, and concurrent send -- are not client-server latencies
+by room size, so the sitting does not measure them: a targeted sitting
+does (`scripts/federated-benchmark.py`, #647), with a rival on the far side
+of the federation, and its group is judged beside the sitting's by naming
+both. A targeted workload absent from every group named, or measured
+without Synapse or Tuwunel beside Spindle, is listed by name every time, so
+the gap cannot quietly drop out of the report. A line with a failed cell
+exits non-zero; an incomplete line only does so under `--require-complete`.
+
+Each cell is compared inside the group that measured it -- same host, same
+run -- and never across groups: two groups that both hold a cell are
+refused rather than merged.
 
 Usage:
     scripts/parity-gate.py docs/benchmarks/data m7-progress-2
     scripts/parity-gate.py docs/benchmarks/data ci-20260906 --markdown out.md
+    scripts/parity-gate.py docs/benchmarks/data ci-20261010 targeted-20261105
 """
 
 from __future__ import annotations
@@ -60,32 +68,30 @@ TUWUNEL_ALLOWANCE = 1.2
 # what "the architecture is earning its cost" means.
 MATERIAL = sitting.SINGLE_ROUND_REPEATABILITY
 
-# The workloads line 3 names, and the driver operation that measures each,
-# or None with the reason it is not measured. An operation listed here is
-# held out of line 2 -- it is judged by the stricter line instead.
-# #16's federated rig proves fork handling is correct; nothing yet times it.
-FORK_WORKLOAD = "needs a federated fork workload, which no client-server driver can construct"
-
+# The workloads line 3 names, and the driver operation that measures each.
+# An operation listed here is held out of line 2 -- it is judged by the
+# stricter line instead. The first two are in every sitting; the last three
+# come from a targeted sitting (scripts/federated-benchmark.py).
 TARGETED = [
-    ("back-pagination, deep room", "messages_page", None),
-    ("state at the oldest event (deep history)", "context_deep", None),
-    (
-        "join a 10,000-member federated room",
-        None,
-        FORK_WORKLOAD,
-    ),
-    (
-        "federation catch-up after a partition",
-        None,
-        FORK_WORKLOAD,
-    ),
-    (
-        "concurrent send",
-        None,
-        "throughput is measured for Spindle and Synapse only, outside the sitting",
-    ),
+    ("back-pagination, deep room", "messages_page"),
+    ("state at the oldest event (deep history)", "context_deep"),
+    ("join a 10,000-member federated room", "federated_join"),
+    ("federation catch-up after a partition", "partition_catchup"),
+    ("concurrent send", "send_throughput"),
 ]
-TARGETED_OPERATIONS = {operation for _, operation, _ in TARGETED if operation}
+TARGETED_OPERATIONS = {operation for _, operation in TARGETED}
+
+# The rivals #42 names. A targeted workload measured without one of them
+# beside Spindle is not judged complete: beating whoever happened to be in
+# the room is not the line.
+NAMED_RIVALS = ("synapse", "tuwunel")
+
+# What a result file may measure. `events` is latency by room size, the
+# sitting's axis; `targeted` is a targeted sitting's cells, each with its
+# own size axis (members joined, events missed, clients writing), and each
+# a time where lower is better. Anything else -- the members sweep, the
+# concurrency dimension's per-request latencies -- is a different question.
+DIMENSIONS = {"events", "targeted"}
 
 
 def load_group(data_dir: pathlib.Path, group: str) -> tuple[dict, dict]:
@@ -101,10 +107,11 @@ def load_group(data_dir: pathlib.Path, group: str) -> tuple[dict, dict]:
             sidecar = json.loads(path.read_text())
             continue
         document = json.loads(path.read_text())
-        if document.get("dimension", "events") != "events":
+        dimension = document.get("dimension", "events")
+        if dimension not in DIMENSIONS:
             sys.exit(
-                f"parity-gate: {path.name} measures {document['dimension']}, "
-                "not latency by room size; the parity lines read latency"
+                f"parity-gate: {path.name} measures {dimension}, which no "
+                f"parity line reads (it reads {', '.join(sorted(DIMENSIONS))})"
             )
         for key, entry in document["benchmarks"].items():
             operation, _, size = key.rpartition("/")
@@ -120,6 +127,36 @@ def load_group(data_dir: pathlib.Path, group: str) -> tuple[dict, dict]:
             f"found {len(ours)}"
         )
     return cells, sidecar
+
+
+def load_groups(data_dir: pathlib.Path, groups: list[str]) -> tuple[dict, list[dict], dict]:
+    """Every named group's cells in one table, their sidecars, and the
+    deepest round count each server reached in each group.
+
+    A cell stays the comparison its own group made: two groups that both
+    measured it would make one cell out of two hosts or two runs, which
+    is the cross-run comparison #42's guardrails rule out, so that is
+    refused rather than merged.
+    """
+    table: dict = {}
+    sidecars: list[dict] = []
+    counts: dict[str, int] = {}
+    owner: dict = {}
+    for group in groups:
+        cells, sidecar = load_group(data_dir, group)
+        if sidecar:
+            sidecars.append(sidecar)
+        for key, servers in cells.items():
+            if key in table:
+                sys.exit(
+                    f"parity-gate: {key[0]}/{key[1]} is in both {owner[key]} and "
+                    f"{group}; a cell is judged in the group that measured it"
+                )
+            table[key], owner[key] = servers, group
+            for server, values in servers.items():
+                label = f"{group}:{server}"
+                counts[label] = max(counts.get(label, 0), len(values))
+    return table, sidecars, counts
 
 
 def rival_cells(cells: dict, prefix: str, operations=None):
@@ -167,13 +204,13 @@ def line_materially_faster(cells: dict) -> dict:
         {s for servers in cells.values() for s in servers if not s.startswith("spindle")}
     )
     judged, failures, missing = [], [], []
-    for workload, operation, reason in TARGETED:
-        if operation is None:
-            missing.append(f"{workload}: {reason}")
-            continue
+    for workload, operation in TARGETED:
         if not any(op == operation for op, _ in cells):
-            missing.append(f"{workload}: `{operation}` absent from this sitting")
+            missing.append(f"{workload}: `{operation}` absent from the groups judged")
             continue
+        for named in NAMED_RIVALS:
+            if next(rival_cells(cells, named, {operation}), None) is None:
+                missing.append(f"{workload}: `{operation}` has no {named} side")
         for rival in rivals:
             for op, size, o, t in rival_cells(cells, rival, {operation}):
                 judged.append(op)
@@ -206,12 +243,13 @@ def evaluate(cells: dict) -> list[tuple[str, dict]]:
     return [(title, judge(cells)) for title, judge in LINES]
 
 
-def render(group: str, sidecar: dict, results: list[tuple[str, dict]], rounds: int) -> str:
-    lines = [f"## Parity gate (#42): `{group}`", ""]
-    if sidecar:
+def render(groups: list[str], sidecars: list[dict], results: list[tuple[str, dict]], rounds: int) -> str:
+    lines = [f"## Parity gate (#42): {' + '.join(f'`{group}`' for group in groups)}", ""]
+    for sidecar in sidecars:
         host = sidecar.get("host", {})
+        named = f"`{sidecar['group']}`: " if len(groups) > 1 and "group" in sidecar else ""
         lines.append(
-            f"Host: {host.get('runner', 'unknown')}, {host.get('cores', '?')} cores. "
+            f"{named}Host: {host.get('runner', 'unknown')}, {host.get('cores', '?')} cores. "
             f"Versions: {', '.join(sidecar.get('versions', [])) or 'unrecorded'}."
         )
         lines.append("")
@@ -235,7 +273,12 @@ def render(group: str, sidecar: dict, results: list[tuple[str, dict]], rounds: i
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("data_dir", type=pathlib.Path)
-    parser.add_argument("group")
+    parser.add_argument(
+        "groups",
+        nargs="+",
+        metavar="group",
+        help="the sitting, then any targeted sitting judged beside it",
+    )
     parser.add_argument("--markdown", type=pathlib.Path, help="also write the report here")
     parser.add_argument(
         "--require-complete",
@@ -244,13 +287,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    cells, sidecar = load_group(args.data_dir, args.group)
-    counts: dict[str, int] = {}
-    for servers in cells.values():
-        for server, values in servers.items():
-            counts[server] = max(counts.get(server, 0), len(values))
+    cells, sidecars, counts = load_groups(args.data_dir, args.groups)
     results = evaluate(cells)
-    report = render(args.group, sidecar, results, sitting.rounds_in(counts))
+    report = render(args.groups, sidecars, results, sitting.rounds_in(counts))
     print(report, end="")
     if args.markdown:
         args.markdown.write_text(report)

@@ -24,10 +24,12 @@
 
 pub mod backup;
 pub mod codec;
+pub mod gc;
 pub mod migrate;
+pub mod verify;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 // fjall 3 renamed the two levels: what was a `Keyspace` (the whole store) is
@@ -40,8 +42,9 @@ use fjall::{
     KeyspaceCreateOptions as PartitionCreateOptions, PersistMode, Readable,
 };
 use spindle_core::{
-    CONTENT_DIGEST_VERSION, EventId, LogRestore, MemStateKeyTable, RestoreError, RestoredEntry,
-    RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot, StateSnapshot,
+    CONTENT_DIGEST_VERSION, ChainCheckpoint, EventId, LogRestore, MemStateKeyTable, RestoreError,
+    RestoredEntry, RestoredLog, RoomLog, RuntimeRestoredLog, StateKeyTable, StateRoot,
+    StateSnapshot,
     keys::{
         KEY_SCHEMA_VERSION, Keyspace, content_addressed, room_li, room_prefix, state_key_intern,
         state_key_intern_prefix, store_marker,
@@ -49,8 +52,8 @@ use spindle_core::{
 };
 
 use crate::codec::{
-    CodecError, EntryRecord, RECORD_VERSION, RoomRecord, SidelinedRecord, decode_intern_pair,
-    encode_intern_pair,
+    ChainCheckpointRecord, CodecError, CurrentStateRecord, EntryRecord, RECORD_VERSION, RoomRecord,
+    SidelinedRecord, decode_intern_pair, encode_intern_pair,
 };
 
 /// How hard a commit tries to be on disk before it is acknowledged.
@@ -101,10 +104,9 @@ pub enum Durability {
     /// `group`: data is fsynced before the commit returns; file metadata is
     /// left to the OS.
     ///
-    /// Note this is not yet the batched fsync SPEC §8.3 describes — commits are
-    /// not currently coalesced across a time window, so this is "one data
-    /// fsync per commit" rather than "one fsync per batch of commits". The
-    /// coalescing needs the per-room executor and lands with it.
+    /// Concurrent commits share one fsync: `GroupCommit` below is SPEC §8.3's
+    /// batch, with no `N`/`T` constants -- the first writer syncs at once and
+    /// those who arrive meanwhile ride the next sync.
     #[default]
     Group,
     /// `relaxed`: the write reaches the OS page cache and is fsynced later.
@@ -112,6 +114,22 @@ pub enum Durability {
 }
 
 impl Durability {
+    const fn to_bits(self) -> u8 {
+        match self {
+            Self::Strict => 0,
+            Self::Group => 1,
+            Self::Relaxed => 2,
+        }
+    }
+
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Strict,
+            2 => Self::Relaxed,
+            _ => Self::Group,
+        }
+    }
+
     fn persist_mode(self) -> PersistMode {
         match self {
             Self::Strict => PersistMode::SyncAll,
@@ -158,6 +176,27 @@ mod durability_tests {
 
 /// One key and its value, as read back from a scan.
 pub type Record = (Vec<u8>, Vec<u8>);
+
+/// One operation in an atomic batch: a write or a delete.
+///
+/// [`Record`] can only put, so a path that must remove rows together with
+/// writing others (or removing several together) could not use a batch and
+/// fell back to one unsynced delete per key. A tombstone is journalled in
+/// the same batch as the puts around it, so a crash shows all of them or
+/// none (#810).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BatchOp {
+    /// Write `value` under the key.
+    Put(Vec<u8>, Vec<u8>),
+    /// Remove the key. Removing an absent key is not an error.
+    Delete(Vec<u8>),
+}
+
+impl From<Record> for BatchOp {
+    fn from((key, value): Record) -> Self {
+        Self::Put(key, value)
+    }
+}
 
 /// What [`ReadView::visit_prefix`] calls with each key and value; an error
 /// stops the scan and is returned from it.
@@ -305,6 +344,22 @@ pub trait Store: ReadView {
     /// Returns a backend error if the delete fails.
     fn delete(&self, key: &[u8]) -> Result<(), StoreError>;
 
+    /// Remove every key in one write, if they are there.
+    ///
+    /// The default deletes one by one; a backend with batches overrides it
+    /// so a sweep of a million keys is thousands of writes, not a million.
+    /// Not durable until [`Store::flush`], like [`Store::delete`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the delete fails.
+    fn delete_batch(&self, keys: &[Vec<u8>]) -> Result<(), StoreError> {
+        for key in keys {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
+
     fn snapshot(&self) -> Option<Box<dyn ReadView + '_>> {
         None
     }
@@ -413,6 +468,25 @@ pub trait Store: ReadView {
     ///
     /// Returns a backend error if the write fails.
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError>;
+
+    /// [`Store::commit_deferred`] for a batch that may delete: journal every
+    /// operation atomically, without making them durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the write fails.
+    fn commit_ops_deferred(&self, ops: &[BatchOp]) -> Result<(), StoreError>;
+
+    /// [`Store::commit`] for a batch that may delete. All operations are
+    /// visible together or not at all, and count as one write batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the commit fails.
+    fn commit_ops(&self, ops: &[BatchOp], durability: Durability) -> Result<(), StoreError> {
+        self.commit_ops_deferred(ops)?;
+        self.sync(durability)
+    }
 
     /// [`Store::commit`]'s second half: make everything journalled so far
     /// durable, to the standard `durability` asks for.
@@ -584,6 +658,22 @@ impl GroupCommit {
     }
 }
 
+/// When [`FjallStore::inject_fault`] starts to refuse writes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fault {
+    /// The next write or sync, and everything after it.
+    Now,
+    /// The next sync, and everything after it. Batches journalled before
+    /// that sync stay journalled: the send whose batch landed and whose
+    /// sync then failed.
+    AtNextSync,
+}
+
+const NO_FAULT: u8 = 0;
+const FAULT_AT_SYNC: u8 = 1;
+const FAULT_REFUSING: u8 = 2;
+
 pub struct FjallStore {
     db: FjallDatabase,
     partition: FjallPartition,
@@ -610,6 +700,10 @@ pub struct FjallStore {
     /// for a setting or a key; it is the defect for anything an event
     /// needs, which is why the append path is held to writing none (#84).
     unbatched: AtomicU64,
+    /// Ungrouped fsyncs -- `Durability::Strict` and [`Store::flush`] --
+    /// performed since open. With the group's own count, every disk
+    /// barrier this store has paid: see [`FjallStore::barriers`].
+    ungrouped_syncs: AtomicU64,
     /// Batches journalled but not necessarily synced, ever, since open.
     ///
     /// Exists so a caller can ask "did anything get written while I held
@@ -622,6 +716,14 @@ pub struct FjallStore {
     journalled: AtomicU64,
     /// Shared by every writer, which is what lets their fsyncs become one.
     group: GroupCommit,
+    /// The operator's `[storage] durability`, as [`Durability::to_bits`].
+    ///
+    /// Set once after open by [`FjallStore::set_durability`]. See
+    /// [`FjallStore::effective`] for how it combines with what a call site
+    /// asks for.
+    configured: AtomicU8,
+    /// The `journalled` reading the last periodic persist covered.
+    periodic_seen: AtomicU64,
     /// Set by the first write or sync the engine refuses, and never cleared.
     ///
     /// fjall poisons its database on a failed journal write or sync -- a
@@ -630,6 +732,9 @@ pub struct FjallStore {
     /// to ask, short of attempting a write, so the store remembers, and the
     /// server's readiness probe reads it (#21's disk-full drill).
     write_refused: AtomicBool,
+    /// What [`Self::inject_fault`] armed: [`NO_FAULT`], [`FAULT_AT_SYNC`]
+    /// or [`FAULT_REFUSING`].
+    fault: AtomicU8,
     /// The intern table every snapshot in this process shares (#79).
     ///
     /// Loaded whole from [`Keyspace::StateKeyIntern`] at open: a room's
@@ -640,6 +745,28 @@ pub struct FjallStore {
     /// Holds a drain through journal insertion so another room cannot
     /// persist nodes before the batch carrying their intern rows.
     intern_drain: Mutex<()>,
+}
+
+/// Guard for the thread [`FjallStore::spawn_periodic_sync`] starts.
+///
+/// Dropping it stops the thread and syncs once more, so a clean shutdown
+/// under `relaxed` loses nothing.
+pub struct PeriodicSync {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    store: std::sync::Weak<FjallStore>,
+}
+
+impl Drop for PeriodicSync {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(store) = self.store.upgrade() {
+            let _ = store.relaxed_tick();
+        }
+    }
 }
 
 /// Newly allocated intern-table pairs as batch rows (#79).
@@ -713,6 +840,127 @@ impl FjallStore {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// Disk barriers -- fsyncs -- this store has performed since open, of
+    /// every durability: the grouped ones counted once per sync led, not
+    /// once per commit that rode it.
+    ///
+    /// A barrier costs more than anything else a request can do, and on a
+    /// shared runner's disk it is the cost a benchmark sees. A path that
+    /// should pay none, like a `/sync`, is held to that by subtracting two
+    /// readings (#701).
+    #[must_use]
+    pub fn barriers(&self) -> u64 {
+        self.ungrouped_syncs.load(Ordering::Relaxed) + self.group.counters().0
+    }
+
+    /// Choose the durability of the operator's `[storage] durability`.
+    ///
+    /// Call once after open, before serving. Room commits ask for
+    /// [`Self::durability`]; every other call site asks for `Group` or
+    /// stronger and is held to [`Self::effective`].
+    pub fn set_durability(&self, durability: Durability) {
+        self.configured
+            .store(durability.to_bits(), Ordering::Release);
+    }
+
+    /// The configured durability: what a room commit should ask for.
+    #[must_use]
+    pub fn durability(&self) -> Durability {
+        Durability::from_bits(self.configured.load(Ordering::Acquire))
+    }
+
+    /// What a call site asking for `requested` actually gets.
+    ///
+    /// The rule: configuration can strengthen a request, never weaken it.
+    /// Under `strict` a `Group` request (tokens, accounts, the signing key,
+    /// one-time keys, purge watermarks) becomes `Strict`. Under `relaxed`
+    /// that request stays `Group`, because a lost token or key is not a
+    /// lost message suffix a client retries. Only a caller that asks for
+    /// `Relaxed` itself (room commits under `relaxed`, presence) gets none.
+    #[must_use]
+    pub fn effective(&self, requested: Durability) -> Durability {
+        match (requested, self.durability()) {
+            (Durability::Group, Durability::Strict) => Durability::Strict,
+            _ => requested,
+        }
+    }
+
+    /// Journal a finished batch of `rows` operations without syncing it.
+    fn finish_batch(&self, batch: fjall::OwnedWriteBatch, rows: usize) -> Result<(), StoreError> {
+        // Always `Buffer`: the bytes reach the journal and nothing is synced.
+        // Which sync they get -- if any -- is `sync`'s decision.
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
+        // Rows, not batches: a batch of a hundred is a hundred rows to
+        // merge and compact, and counting it as one would let a path claim
+        // it writes less by bundling the same work.
+        self.written.fetch_add(rows as u64, Ordering::Relaxed);
+        // After the write, so an observer that sees the count move knows the
+        // bytes are already journalled and a sync will cover them.
+        self.journalled.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// One tick of the periodic persist `relaxed` relies on: fsync if
+    /// anything was journalled since the last tick. Returns whether it did.
+    ///
+    /// Goes through the group, so a tick that lands beside a commit's sync
+    /// shares it. Public so a test can drive a tick without sleeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the sync fails.
+    pub fn relaxed_tick(&self) -> Result<bool, StoreError> {
+        // Read before the sync: a write landing during it is left for the
+        // next tick rather than marked covered.
+        let seen = self.journalled.load(Ordering::Acquire);
+        if seen == self.periodic_seen.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.injected(true)?;
+        self.latch(self.group.sync(&self.db, Durability::Group.persist_mode()))?;
+        self.periodic_seen.store(seen, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Run [`Self::relaxed_tick`] every `interval` on a background thread,
+    /// so a crash under `relaxed` loses at most that window.
+    ///
+    /// The thread holds the store weakly: it never keeps a store open. The
+    /// returned guard stops the thread when dropped, after one last tick.
+    #[must_use]
+    pub fn spawn_periodic_sync(self: &Arc<Self>, interval: std::time::Duration) -> PeriodicSync {
+        let (stop, wake) = std::sync::mpsc::channel::<()>();
+        let store = Arc::downgrade(self);
+        let thread = std::thread::Builder::new()
+            .name("store-periodic-sync".to_owned())
+            .spawn({
+                let store = store.clone();
+                move || {
+                    // Only a timeout means "tick"; a message or a dropped
+                    // sender both mean "stop".
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        wake.recv_timeout(interval)
+                    {
+                        let Some(store) = store.upgrade() else { break };
+                        // A failed sync has latched `accepts_writes` off, which
+                        // is where the readiness probe looks.
+                        let _ = store.relaxed_tick();
+                    }
+                }
+            })
+            .ok();
+        PeriodicSync {
+            stop: Some(stop),
+            thread,
+            store,
+        }
+    }
+
     /// Pass `result` through, and latch [`Store::accepts_writes`] off if it
     /// is an error.
     fn latch<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
@@ -720,6 +968,49 @@ impl FjallStore {
             self.write_refused.store(true, Ordering::Release);
         }
         result
+    }
+
+    /// Refuse writes from now on, or from the next sync, as a full disk does
+    /// once fjall is poisoned. For tests only.
+    ///
+    /// From the trigger on, every write and every sync fails and latches
+    /// [`Store::accepts_writes`] off. That is what fjall does after a write
+    /// or a sync fails. A real full disk refuses whichever write does not
+    /// fit, and the server tests for #779 and #780 must choose the write.
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: Fault) {
+        let state = match fault {
+            Fault::Now => FAULT_REFUSING,
+            Fault::AtNextSync => FAULT_AT_SYNC,
+        };
+        self.fault.store(state, Ordering::Release);
+    }
+
+    /// Fail, and latch, if [`Self::inject_fault`] refuses this write or
+    /// sync. `sync` says whether the caller is a sync, which is what
+    /// [`Fault::AtNextSync`] waits for.
+    fn injected(&self, sync: bool) -> Result<(), StoreError> {
+        let refused = match self.fault.load(Ordering::Acquire) {
+            NO_FAULT => false,
+            // Whichever sync swaps the state is the first refused one, and
+            // a sync that lost the swap is refused after it.
+            FAULT_AT_SYNC => {
+                sync && self
+                    .fault
+                    .compare_exchange(
+                        FAULT_AT_SYNC,
+                        FAULT_REFUSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_or_else(|now| now == FAULT_REFUSING, |_| true)
+            }
+            _ => true,
+        };
+        if refused {
+            return self.latch(Err(StoreError::Backend("injected fault".to_owned())));
+        }
+        Ok(())
     }
 
     /// Rows written outside any batch since this store was opened.
@@ -808,9 +1099,13 @@ impl FjallStore {
             scanned: AtomicU64::new(0),
             written: AtomicU64::new(0),
             unbatched: AtomicU64::new(0),
+            ungrouped_syncs: AtomicU64::new(0),
             journalled: AtomicU64::new(0),
             group: GroupCommit::default(),
+            configured: AtomicU8::new(Durability::Group.to_bits()),
+            periodic_seen: AtomicU64::new(0),
             write_refused: AtomicBool::new(false),
+            fault: AtomicU8::new(NO_FAULT),
             db,
             partition,
             state_table,
@@ -871,6 +1166,18 @@ impl FjallStore {
     /// starts serving a room whose entire history it simply cannot see. The
     /// marker turns that silence into a refusal.
     fn check_schema(&self) -> Result<(), StoreError> {
+        // Before the marker: a restore that did not finish has a valid marker
+        // and part of the rows, which is the state that must not be served.
+        if self
+            .get(&spindle_core::keys::restore_in_progress())?
+            .is_some()
+        {
+            return Err(StoreError::Backend(
+                "this store holds the remains of a restore that did not finish; move \
+                 the directory aside and restore the backup into an empty one"
+                    .to_owned(),
+            ));
+        }
         let key = store_marker();
         if let Some(raw) = self.get(&key)? {
             let found = SchemaMarker::decode(&raw)?;
@@ -1213,6 +1520,7 @@ impl Store for FjallStore {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.injected(false)?;
         self.latch(self.partition.insert(key, value).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
@@ -1224,6 +1532,7 @@ impl Store for FjallStore {
         // returns. The non-waiting variant queues the rotation, which for a
         // fixture generator means writing the directory before the segment
         // it is supposed to contain.
+        self.injected(false)?;
         self.latch(
             self.partition
                 .rotate_memtable_and_wait()
@@ -1233,9 +1542,28 @@ impl Store for FjallStore {
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.injected(false)?;
         self.latch(self.partition.remove(key).map_err(StoreError::from))?;
         self.written.fetch_add(1, Ordering::Relaxed);
         self.unbatched.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn delete_batch(&self, keys: &[Vec<u8>]) -> Result<(), StoreError> {
+        self.injected(false)?;
+        let mut batch = self.db.batch();
+        for key in keys {
+            batch.remove(&self.partition, key.as_slice());
+        }
+        self.latch(
+            batch
+                .durability(Some(PersistMode::Buffer))
+                .commit()
+                .map_err(StoreError::from),
+        )?;
+        self.written.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        // A journalled write nobody has synced: `flush` owes the barrier.
+        self.journalled.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -1259,42 +1587,46 @@ impl Store for FjallStore {
     }
 
     fn commit_deferred(&self, writes: &[Record]) -> Result<(), StoreError> {
+        self.injected(false)?;
         let mut batch = self.db.batch();
         for (key, value) in writes {
             batch.insert(&self.partition, key.as_slice(), value.as_slice());
         }
-        // Always `Buffer`: the bytes reach the journal and nothing is synced.
-        // Which sync they get -- if any -- is `sync`'s decision.
-        self.latch(
-            batch
-                .durability(Some(PersistMode::Buffer))
-                .commit()
-                .map_err(StoreError::from),
-        )?;
-        // Rows, not batches: a batch of a hundred is a hundred rows to
-        // merge and compact, and counting it as one would let a path claim
-        // it writes less by bundling the same work.
-        self.written
-            .fetch_add(writes.len() as u64, Ordering::Relaxed);
-        // After the write, so an observer that sees the count move knows the
-        // bytes are already journalled and a sync will cover them.
-        self.journalled.fetch_add(1, Ordering::Release);
-        Ok(())
+        self.finish_batch(batch, writes.len())
+    }
+
+    fn commit_ops_deferred(&self, ops: &[BatchOp]) -> Result<(), StoreError> {
+        self.injected(false)?;
+        let mut batch = self.db.batch();
+        for op in ops {
+            match op {
+                BatchOp::Put(key, value) => {
+                    batch.insert(&self.partition, key.as_slice(), value.as_slice());
+                }
+                BatchOp::Delete(key) => batch.remove(&self.partition, key.as_slice()),
+            }
+        }
+        self.finish_batch(batch, ops.len())
     }
 
     fn sync(&self, durability: Durability) -> Result<(), StoreError> {
+        let durability = self.effective(durability);
         // Every arm takes its syscall from `persist_mode`, so that mapping
         // stays the one place the modes are defined and
         // `durability_modes_map_to_distinct_syscalls` keeps pinning
         // something real.
         let mode = durability.persist_mode();
+        self.injected(true)?;
         match durability {
             // `Buffer` is the absence of a barrier, and the bytes are already
             // in the journal. A promise not to sync now, kept.
             Durability::Relaxed => Ok(()),
             // Not coalesced: `strict` exists for deployments that want the
             // barrier they asked for, not the cheapest correct one.
-            Durability::Strict => self.latch(self.db.persist(mode).map_err(StoreError::from)),
+            Durability::Strict => {
+                self.ungrouped_syncs.fetch_add(1, Ordering::Relaxed);
+                self.latch(self.db.persist(mode).map_err(StoreError::from))
+            }
             // Take the next sync going -- ours to lead if nobody else is
             // already running one. The group hands the leader's failure to
             // every follower, so each of them latches too.
@@ -1303,6 +1635,8 @@ impl Store for FjallStore {
     }
 
     fn flush(&self) -> Result<(), StoreError> {
+        self.injected(true)?;
+        self.ungrouped_syncs.fetch_add(1, Ordering::Relaxed);
         self.latch(
             self.db
                 .persist(PersistMode::SyncAll)
@@ -1541,12 +1875,71 @@ pub struct RestoreProfile {
     pub row_bytes: u64,
     /// Reading, decoding and checking every row: order, uniqueness, chain.
     pub records: std::time::Duration,
-    /// Hydrating and verifying the resident window's and every tip's state.
+    /// Hydrating and verifying the resident window's and every tip's
+    /// state, and the recorded resolution of an open fork.
     pub roots: std::time::Duration,
-    /// Restoring soft-failed and rejected events with their states.
+    /// Restoring soft-failed and rejected events' records. Their states
+    /// are read when something names one, not here.
     pub sidelined: std::time::Duration,
     /// Restoring imported historical rejection markers.
     pub rejections: std::time::Duration,
+    /// State-trie nodes read from the store. A count rather than a time,
+    /// so a test can say what a load reads without a clock.
+    pub node_reads: u64,
+}
+
+/// A state-node lookup for a restore.
+///
+/// The restore machinery asks for `Option<node>`, so a failed read has no
+/// way to say so and used to count as "node missing". That made an I/O error
+/// look like a damaged store, or worse, like a harmless gap. This keeps the
+/// first failure, and [`Self::finish`] returns it ahead of whatever the
+/// restore concluded from the `None`.
+struct NodeReader<'a, S: Store> {
+    store: &'a S,
+    reads: std::cell::Cell<u64>,
+    failure: std::cell::RefCell<Option<StoreError>>,
+}
+
+impl<'a, S: Store> NodeReader<'a, S> {
+    fn new(store: &'a S) -> Self {
+        Self {
+            store,
+            reads: std::cell::Cell::new(0),
+            failure: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn load(&self, address: &StateRoot) -> Option<Vec<u8>> {
+        self.reads.set(self.reads.get() + 1);
+        match self
+            .store
+            .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
+        {
+            Ok(node) => node,
+            Err(error) => {
+                self.failure.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    fn reads(&self) -> u64 {
+        self.reads.get()
+    }
+
+    /// The failed read, if there was one. Takes it, so call it once.
+    fn failure(&self) -> Option<StoreError> {
+        self.failure.borrow_mut().take()
+    }
+
+    /// `result`, unless a read failed: the failure is the real cause.
+    fn finish<T, E: Into<StoreError>>(&self, result: Result<T, E>) -> Result<T, StoreError> {
+        match self.failure() {
+            Some(error) => Err(error),
+            None => result.map_err(Into::into),
+        }
+    }
 }
 
 /// Persist a room's log, and read it back.
@@ -1711,16 +2104,68 @@ impl<'a, S: Store> RoomStore<'a, S> {
         self.store.commit_state_deferred(&writes, state.table())
     }
 
+    /// Persist what [`RoomLog::fill_partial_state`] changed, with the
+    /// caller's records, as one durable batch: every rewritten entry and
+    /// sidelined record, the trie nodes each filled state adds over the
+    /// state it replaced, and the room's metadata.
+    ///
+    /// One batch because a restore trusts each record's root: a crash that
+    /// kept some rewritten records and not others would leave a room whose
+    /// state jumps between full and partial along its history, with nothing
+    /// left to say which records are which.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be committed.
+    pub fn commit_filled(
+        &self,
+        filled: &spindle_core::FilledStates,
+        log: &RoomLog,
+        extra: &[Record],
+    ) -> Result<(), StoreError> {
+        let mut writes = vec![(
+            room_prefix(Keyspace::RoomMeta, &self.room_id),
+            Self::meta(log).encode(),
+        )];
+        for filled in &filled.entries {
+            self.check_state_table(&filled.state)?;
+            writes.push((
+                room_li(Keyspace::Log, &self.room_id, filled.entry.li),
+                EntryRecord::from_entry(&filled.entry).encode(),
+            ));
+            for (address, node) in filled.state.delta_nodes(Some(&filled.replaced)) {
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
+            }
+        }
+        for filled in &filled.sidelined {
+            self.check_state_table(&filled.state)?;
+            writes.push((
+                spindle_core::keys::sidelined(&self.room_id, filled.entry.event_id.as_str()),
+                SidelinedRecord::from_entry(&filled.entry).encode(),
+            ));
+            for (address, node) in filled.state.delta_nodes(Some(&filled.replaced)) {
+                writes.push((
+                    content_addressed(Keyspace::StateNode, address.as_bytes()),
+                    node,
+                ));
+            }
+        }
+        writes.extend_from_slice(extra);
+        // Every snapshot the fill made shares the log's table, so its
+        // newly interned keys ride this batch with the nodes that use them.
+        self.store.commit_state_deferred(&writes, log.table())?;
+        self.store.sync(Durability::Strict)
+    }
+
     /// Put the room's sidelined events back into a restored log, each with
     /// its state rehydrated from the stored trie.
     fn restore_sidelined(&self, log: &mut RoomLog) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
             let state = spindle_core::StateSnapshot::rehydrate(
@@ -1731,17 +2176,15 @@ impl<'a, S: Store> RoomStore<'a, S> {
             .unwrap_or_else(|_| spindle_core::StateSnapshot::new(log.table().clone()));
             log.restore_sidelined(entry, state);
         }
-        Ok(())
+        reader.finish(Ok::<(), StoreError>(()))
     }
 
+    /// [`Self::restore_sidelined`] for the exhaustive check: every
+    /// sidelined state must read back verified.
     fn restore_sidelined_checked(&self, log: &mut RoomLog) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         for (_, value) in self.store.scan_prefix(&prefix)? {
             let entry = SidelinedRecord::decode(&value)?.to_entry()?;
             let state = spindle_core::StateSnapshot::rehydrate(
@@ -1749,10 +2192,25 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 &mut load_node,
                 log.table().clone(),
             )
-            .map_err(|_| RestoreError::UnreadableSidelined(entry.event_id.clone()))?;
+            .map_err(|_| {
+                // A failed read is not a damaged state: say which.
+                reader.failure().unwrap_or_else(|| {
+                    RestoreError::UnreadableSidelined(entry.event_id.clone()).into()
+                })
+            })?;
             log.restore_sidelined(entry, state);
         }
-        Ok(())
+        reader.finish(Ok::<(), StoreError>(()))
+    }
+
+    /// The runtime form: each sidelined record, without its state (see
+    /// [`RoomLog::restore_sidelined_entry`]).
+    fn restore_sidelined_entries(&self, restore: &mut LogRestore) -> Result<(), StoreError> {
+        let prefix = room_prefix(Keyspace::Sidelined, &self.room_id);
+        self.store.visit_prefix(&prefix, &mut |_, value| {
+            restore.sideline(SidelinedRecord::decode(value)?.to_entry()?);
+            Ok(())
+        })
     }
 
     /// Commit imported historical rejection decisions and their PDU records.
@@ -1791,6 +2249,37 @@ impl<'a, S: Store> RoomStore<'a, S> {
 
     /// Restore imported rejection markers without treating them as timeline entries.
     fn restore_historical_rejections(&self, log: &mut RoomLog) -> Result<(), StoreError> {
+        self.visit_historical_rejections(|id| {
+            if log.get(&id).is_some() {
+                return Err(Self::rejection_overlaps());
+            }
+            log.preserve_historical_rejection(id);
+            Ok(())
+        })
+    }
+
+    /// [`Self::restore_historical_rejections`], into a restore in progress.
+    fn restore_historical_rejections_into(
+        &self,
+        restore: &mut LogRestore,
+    ) -> Result<(), StoreError> {
+        self.visit_historical_rejections(|id| {
+            if restore.holds_entry(&id) {
+                return Err(Self::rejection_overlaps());
+            }
+            restore.preserve_historical_rejection(id);
+            Ok(())
+        })
+    }
+
+    fn rejection_overlaps() -> StoreError {
+        StoreError::Backend("historical rejection overlaps accepted log".into())
+    }
+
+    fn visit_historical_rejections(
+        &self,
+        mut each: impl FnMut(EventId) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let prefix = room_prefix(Keyspace::HistoricalRejection, &self.room_id);
         for (key, value) in self.store.scan_prefix(&prefix)? {
             if value != [1] {
@@ -1801,15 +2290,51 @@ impl<'a, S: Store> RoomStore<'a, S> {
             if id.is_empty() {
                 return Err(CodecError::Truncated.into());
             }
-            let id = EventId::new(id);
-            if log.get(&id).is_some() {
-                return Err(StoreError::Backend(
-                    "historical rejection overlaps accepted log".into(),
-                ));
-            }
-            log.preserve_historical_rejection(id);
+            each(EventId::new(id))?;
         }
         Ok(())
+    }
+
+    /// Journal the room's recorded fork resolution, if it has one: the
+    /// digest of what it resolved, its root, and the trie nodes the
+    /// resolution created over the state of the tip it was built on. Like
+    /// [`Self::journal_entry_with`], the sync is the caller's.
+    ///
+    /// Returns whether anything was journalled: nothing is for a linear
+    /// room, or a fork nobody has resolved yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch cannot be journalled, or
+    /// [`StoreError::ForeignStateTable`] for a state of another table.
+    pub fn journal_current(&self, log: &RoomLog) -> Result<bool, StoreError> {
+        let (Some(inputs), Some(state)) = (log.current_inputs(), log.resolved_current()) else {
+            return Ok(false);
+        };
+        self.check_state_table(state)?;
+        // The resolver builds its answer on the first distinct tip state,
+        // so against any tip only the contested paths are new; nodes the
+        // store already holds are rewritten as the same bytes at worst.
+        let base = log
+            .forward_extremities()
+            .iter()
+            .find_map(|tip| log.state_after_event(tip));
+        let mut writes = vec![(
+            room_prefix(Keyspace::CurrentState, &self.room_id),
+            CurrentStateRecord {
+                inputs,
+                root: *state.root().as_bytes(),
+            }
+            .encode(),
+        )];
+        for (address, node) in state.delta_nodes(base) {
+            writes.push((
+                content_addressed(Keyspace::StateNode, address.as_bytes()),
+                node,
+            ));
+        }
+        self.store.commit_state_deferred(&writes, state.table())?;
+        Ok(true)
     }
 
     fn meta(log: &RoomLog) -> RoomRecord {
@@ -1884,6 +2409,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
             self.store.commit_state_deferred(&writes, state.table())?;
             previous = Some(state);
         }
+        if let Some(point) = log.chain_checkpoint() {
+            self.store.put(
+                &spindle_core::keys::chain_checkpoint(&self.room_id),
+                &ChainCheckpointRecord {
+                    floor: point.floor,
+                    chain: *point.chain.as_bytes(),
+                }
+                .encode(),
+            )?;
+        }
         self.store.put(
             &room_prefix(Keyspace::RoomMeta, &self.room_id),
             &Self::meta(log).encode(),
@@ -1908,23 +2443,67 @@ impl<'a, S: Store> RoomStore<'a, S> {
     ///
     /// Returns [`StoreError`] on a backend failure or an unreadable record.
     pub fn load_refolding(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        let Some((meta, entries, checkpoint)) = self.read_records()? else {
             return Ok(None);
         };
-        let mut restored = RoomLog::restore(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            self.store.key_table(),
-        )?;
+        let extremities = meta
+            .forward_extremities
+            .into_iter()
+            .map(|id| EventId::new(id.as_str()));
+        let mut restored = match checkpoint {
+            Some(checkpoint) => RoomLog::restore_from_checkpoint(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                None,
+                checkpoint,
+                self.store.key_table(),
+            )?,
+            None => RoomLog::restore(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                self.store.key_table(),
+            )?,
+        };
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 
-    fn read_records(&self) -> Result<Option<(RoomRecord, Vec<RestoredEntry>)>, StoreError> {
+    /// The room's chain restart point, if retention has truncated it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the row cannot be read or decoded. A row
+    /// that does not decode is an error, not an absence: loading without
+    /// it would break the chain at the first retained entry.
+    pub fn chain_checkpoint(&self) -> Result<Option<ChainCheckpoint>, StoreError> {
+        Self::checkpoint_in(self.store, &self.room_id)
+    }
+
+    fn checkpoint_in(
+        view: &dyn ReadView,
+        room_id: &str,
+    ) -> Result<Option<ChainCheckpoint>, StoreError> {
+        let Some(raw) = view.get(&spindle_core::keys::chain_checkpoint(room_id))? else {
+            return Ok(None);
+        };
+        let record = ChainCheckpointRecord::decode(&raw)?;
+        Ok(Some(ChainCheckpoint {
+            floor: record.floor,
+            chain: spindle_core::ChainHash::from_bytes(record.chain),
+        }))
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "the record, its rows and the chain seed"
+    )]
+    fn read_records(
+        &self,
+    ) -> Result<Option<(RoomRecord, Vec<RestoredEntry>, Option<ChainCheckpoint>)>, StoreError> {
         // Read metadata and log through one frozen view. Rebuilding a room
         // takes two reads, and a commit landing between them yields a room
         // whose counters and log disagree -- metadata trailing the log being
@@ -1940,6 +2519,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         let meta = RoomRecord::decode(&raw_meta)?;
+        let checkpoint = Self::checkpoint_in(view, &self.room_id)?;
 
         // The scan is already in `li` order because the key encoding is
         // order-preserving across the sign boundary; backfilled history sorts
@@ -1958,7 +2538,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 chain: record.chain,
             });
         }
-        Ok(Some((meta, entries)))
+        Ok(Some((meta, entries, checkpoint)))
     }
 
     /// Read the room's metadata and stream its log into a [`LogRestore`],
@@ -1976,6 +2556,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
             return Ok(None);
         };
         let meta = RoomRecord::decode(&raw_meta)?;
+        let checkpoint = Self::checkpoint_in(view, &self.room_id)?;
         // The occupied positions are contiguous, so the counters bound the
         // row count. Only a reservation hint: `LogRestore` caps it.
         let expected = usize::try_from(
@@ -1984,7 +2565,7 @@ impl<'a, S: Store> RoomStore<'a, S> {
                 .saturating_sub(1),
         )
         .unwrap_or(0);
-        let mut restore = LogRestore::new(
+        let restore = LogRestore::new(
             meta.next_forward,
             meta.next_backward,
             meta.forward_extremities
@@ -1993,6 +2574,10 @@ impl<'a, S: Store> RoomStore<'a, S> {
             expected,
             view.key_table(),
         );
+        let mut restore = match checkpoint {
+            Some(checkpoint) => restore.with_chain_checkpoint(checkpoint),
+            None => restore,
+        };
         let mut profile = RestoreProfile::default();
         let prefix = room_prefix(Keyspace::Log, &self.room_id);
         let restore = if expected >= PIPELINE_ROWS {
@@ -2005,9 +2590,37 @@ impl<'a, S: Store> RoomStore<'a, S> {
             })?;
             restore
         };
+        // An unreadable record is a stale cache, not a damaged room: the
+        // restore goes ahead without it, and the fork is resolved afresh.
+        let restore = match view.get(&room_prefix(Keyspace::CurrentState, &self.room_id))? {
+            Some(raw) => match CurrentStateRecord::decode(&raw) {
+                Ok(record) => {
+                    restore.with_current(record.inputs, StateRoot::from_bytes(record.root))
+                }
+                Err(_) => restore,
+            },
+            None => restore,
+        };
         profile.rows = restore.len();
         profile.records = started.elapsed();
         Ok(Some((restore, profile)))
+    }
+
+    /// Put the sidelined records and imported rejections into a restore
+    /// in progress: before its roots, because whether a recorded fork
+    /// resolution still holds depends on the rejections among them.
+    fn stream_outside_records(
+        &self,
+        restore: &mut LogRestore,
+        profile: &mut RestoreProfile,
+    ) -> Result<(), StoreError> {
+        let started = std::time::Instant::now();
+        self.restore_sidelined_entries(restore)?;
+        profile.sidelined = started.elapsed();
+        let started = std::time::Instant::now();
+        self.restore_historical_rejections_into(restore)?;
+        profile.rejections = started.elapsed();
+        Ok(())
     }
 
     /// Runtime restoration checks all ordered metadata/chain and selected
@@ -2026,24 +2639,17 @@ impl<'a, S: Store> RoomStore<'a, S> {
     pub fn load_runtime_profiled(
         &self,
     ) -> Result<Option<(RuntimeRestoredLog, RestoreProfile)>, StoreError> {
-        let Some((restore, mut profile)) = self.stream_records()? else {
+        let Some((mut restore, mut profile)) = self.stream_records()? else {
             return Ok(None);
         };
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        self.stream_outside_records(&mut restore, &mut profile)?;
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
         let started = std::time::Instant::now();
-        let mut restored = restore.finish_runtime(&mut load_node)?;
+        let restored = restore.finish_runtime(&mut load_node);
         profile.roots = started.elapsed();
-        let started = std::time::Instant::now();
-        self.restore_sidelined_checked(&mut restored.log)?;
-        profile.sidelined = started.elapsed();
-        let started = std::time::Instant::now();
-        self.restore_historical_rejections(&mut restored.log)?;
-        profile.rejections = started.elapsed();
+        profile.node_reads = reader.reads();
+        let restored = reader.finish(restored)?;
         Ok(Some((restored, profile)))
     }
 
@@ -2053,18 +2659,16 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// # Errors
     /// Returns an error for unreadable records, chain, tips or any state root.
     pub fn load_exhaustive(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((restore, _)) = self.stream_records()? else {
+        let Some((mut restore, mut profile)) = self.stream_records()? else {
             return Ok(None);
         };
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
-        let mut restored = restore.finish_exhaustive(&mut load_node)?;
+        self.stream_outside_records(&mut restore, &mut profile)?;
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
+        let restored = restore.finish_exhaustive(&mut load_node);
+        let mut restored = reader.finish(restored)?;
+        // The records are in already; this reads and verifies each state.
         self.restore_sidelined_checked(&mut restored.log)?;
-        self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))
     }
 
@@ -2078,27 +2682,37 @@ impl<'a, S: Store> RoomStore<'a, S> {
     /// Returns [`StoreError`] on a backend failure, an unreadable record, or
     /// records that cannot be replayed in order.
     pub fn load(&self) -> Result<Option<RestoredLog>, StoreError> {
-        let Some((meta, entries)) = self.read_records()? else {
+        let Some((meta, entries, checkpoint)) = self.read_records()? else {
             return Ok(None);
         };
 
-        let mut load_node = |address: &StateRoot| {
-            self.store
-                .get(&content_addressed(Keyspace::StateNode, address.as_bytes()))
-                .ok()
-                .flatten()
-        };
+        let reader = NodeReader::new(self.store);
+        let mut load_node = |address: &StateRoot| reader.load(address);
 
-        let mut restored = RoomLog::restore_with_state(
-            entries,
-            meta.next_forward,
-            meta.next_backward,
-            meta.forward_extremities
-                .into_iter()
-                .map(|id| EventId::new(id.as_str())),
-            &mut load_node,
-            self.store.key_table(),
-        )?;
+        let extremities = meta
+            .forward_extremities
+            .into_iter()
+            .map(|id| EventId::new(id.as_str()));
+        let restored = match checkpoint {
+            Some(checkpoint) => RoomLog::restore_from_checkpoint(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                Some(&mut load_node),
+                checkpoint,
+                self.store.key_table(),
+            ),
+            None => RoomLog::restore_with_state(
+                entries,
+                meta.next_forward,
+                meta.next_backward,
+                extremities,
+                &mut load_node,
+                self.store.key_table(),
+            ),
+        };
+        let mut restored = reader.finish(restored)?;
         self.restore_sidelined(&mut restored.log)?;
         self.restore_historical_rejections(&mut restored.log)?;
         Ok(Some(restored))

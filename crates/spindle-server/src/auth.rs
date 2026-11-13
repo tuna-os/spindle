@@ -58,7 +58,10 @@ async fn identify(
         // under MSC3861 delegation — a token only the provider can
         // vouch for. The order is cheapest-check-first.
         Ok(None) if state.appservices.by_token(&token).is_some() => {
-            appservice_identity(parts, state, &token)
+            let identity = appservice_identity(parts, state, &token)?;
+            // A ghost user can be locked or suspended like any other (#832).
+            refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
+            Ok(identity)
         }
         Ok(None) => match &state.delegated {
             Some(delegated) => {
@@ -71,10 +74,16 @@ async fn identify(
                         .identify(state.store.as_ref(), &state.config.server.name, &token)
                         .await?
                 };
-                if account_only {
-                    refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
-                }
+                // Every delegated request, not only the account-level ones:
+                // the provider vouches for the token, and the hold is this
+                // server's own flag, which the provider does not know about
+                // (#832). Checked on the device path too, so a locked user's
+                // session cannot read or write through `/sync` and `/send`.
+                refuse_if_locked_or_suspended(parts, &accounts, &identity)?;
                 Ok(identity)
+            }
+            None if accounts.is_expired(&token).unwrap_or(false) => {
+                Err(MatrixError::expired_token())
             }
             None => Err(MatrixError::unknown_token()),
         },
@@ -147,14 +156,37 @@ fn appservice_identity(
         })
         .unwrap_or_else(|| format!("appservice_{}", registration.id));
     let accounts = Accounts::new(state.store.as_ref(), server_name);
-    let known = accounts
+    let existing = accounts
         .account(localpart)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?
-        .is_some();
-    if !known {
-        accounts
-            .register(localpart, &crate::accounts::unguessable_password())
-            .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    match existing {
+        None => {
+            accounts
+                .register_service(localpart)
+                .map_err(|error| crate::routes::internal(&error))?;
+        }
+        // The sender is the service's own identity. An account already
+        // under that name that the service did not create may have a user's
+        // password on it, so the service is refused rather than handed it.
+        // Other namespace users stay adoptable: non-exclusive namespaces
+        // overlap real users on purpose.
+        Some(account)
+            if !account.service_owned
+                && registration
+                    .sender_localpart
+                    .eq_ignore_ascii_case(localpart) =>
+        {
+            return Err(MatrixError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                format!(
+                    "{user_id} already exists and was not created by the {} appservice; \
+                     it cannot be used as the service's sender",
+                    registration.id
+                ),
+            ));
+        }
+        Some(_) => {}
     }
     Ok(Identity {
         user_id,
@@ -211,7 +243,7 @@ pub(crate) fn bearer(parts: &Parts) -> Option<String> {
 }
 
 /// The two administrative holds of spec v1.18, checked on every local
-/// session. A locked account is refused everything, with `soft_logout` so
+/// session, every delegated one and every appservice identity. A locked account is refused everything, with `soft_logout` so
 /// the client keeps its session for when the lock lifts. A suspended
 /// account keeps reading -- `/sync`, `/messages`, its own profile -- and
 /// may log out, and every other write is refused: the spec's shape, so a

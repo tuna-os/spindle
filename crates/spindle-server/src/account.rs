@@ -28,7 +28,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::accounts::Accounts;
+use crate::accounts::{AccountError, Accounts};
 use crate::errors::MatrixError;
 use crate::metrics::{AccountAction, LoginMethod, LoginResult};
 use crate::routes::ClientAddr;
@@ -419,13 +419,14 @@ fn render_login(
         format!("<p class=\"error\">{}</p>", escape(text))
     });
     let forgot = crate::recovery::recovery_links(state);
+    let upstream = crate::upstream::buttons(state, next);
     let body = format!(
         "<h1>Sign in to {server}</h1>{error}\
          <form method=\"post\" action=\"/account/login\">{csrf}{next}\
          <input name=\"username\" placeholder=\"Username\" autocomplete=\"username\" required>\
          <input name=\"password\" type=\"password\" placeholder=\"Password\" \
          autocomplete=\"current-password\" required>\
-         <button type=\"submit\">Sign in</button></form>{forgot}",
+         <button type=\"submit\">Sign in</button></form>{upstream}{forgot}",
         server = escape(&state.config.server.name),
         csrf = hidden("csrf", &csrf),
         next = hidden("next", next),
@@ -482,14 +483,29 @@ async fn login(
         ));
     }
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
-    let good = accounts
-        .verify_password(&localpart, &form.password)
-        .map_err(|error| {
+    let good = match accounts.verify_password(&localpart, &form.password) {
+        Ok(good) => good,
+        // The password was never checked (#571): the same page as a spent
+        // attempt budget, since the answer to both is to wait.
+        Err(AccountError::Busy) => {
+            state
+                .metrics
+                .record_login(LoginMethod::Account, LoginResult::RateLimited);
+            return Ok(render_login(
+                &state,
+                &headers,
+                StatusCode::TOO_MANY_REQUESTS,
+                &next,
+                Some(web::HASHER_BUSY),
+            ));
+        }
+        Err(error) => {
             state
                 .metrics
                 .record_login(LoginMethod::Account, LoginResult::Error);
-            MatrixError::internal(&error.to_string())
-        })?;
+            return Err(MatrixError::internal(&error.to_string()));
+        }
+    };
     if !good {
         state
             .metrics
@@ -594,7 +610,7 @@ async fn save_profile(
         .profiles
         .set(&user_id, field(displayname), field(avatar_url))
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    crate::routes::propagate_profile(&state, &user_id).await?;
+    crate::profile_routes::propagate_profile(&state, &user_id).await?;
     state.metrics.record_account_action(AccountAction::Profile);
     Ok(web::see_other(
         "/account/?action=org.matrix.profile&notice=profile_saved",
@@ -616,9 +632,15 @@ pub(crate) fn recheck_password(
             "Too many attempts. Wait a minute and try again.",
         )));
     }
-    let good = Accounts::new(state.store.as_ref(), &state.config.server.name)
+    let good = match Accounts::new(state.store.as_ref(), &state.config.server.name)
         .verify_password(localpart, password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    {
+        Ok(good) => good,
+        Err(AccountError::Busy) => {
+            return Ok(Some((StatusCode::TOO_MANY_REQUESTS, web::HASHER_BUSY)));
+        }
+        Err(error) => return Err(MatrixError::internal(&error.to_string())),
+    };
     if !good {
         return Ok(Some((
             StatusCode::UNAUTHORIZED,
@@ -678,7 +700,7 @@ async fn change_password(
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     accounts
         .set_password(&session.localpart, &form.new_password)
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+        .map_err(|error| crate::routes::internal(&error))?;
     // The new hash ends every browser session that predates it — a
     // password change is exactly when a stolen one must stop working —
     // except this one, the user's own, which is carried over.
@@ -723,7 +745,13 @@ async fn end_session(
         .is_some();
     if exists {
         let user_id = accounts.user_id(&session.localpart);
-        crate::mas::remove_device(&state, &accounts, &session.localpart, &form.device_id)?;
+        crate::mas::remove_device(
+            &state,
+            &accounts,
+            &session.localpart,
+            &form.device_id,
+            crate::mas::EndedBy::Server,
+        )?;
         let stream_write = state.rooms.reserve_stream_id();
         let seq = stream_write.id();
         state
@@ -814,7 +842,12 @@ async fn deactivate(
             )
             .await;
     }
-    crate::mas::deactivate_user(&state, &localpart, form.erase.as_deref() == Some("yes"))?;
+    crate::mas::deactivate_user(
+        &state,
+        &localpart,
+        form.erase.as_deref() == Some("yes"),
+        crate::mas::EndedBy::Server,
+    )?;
     accounts
         .logout_everywhere(&localpart)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;

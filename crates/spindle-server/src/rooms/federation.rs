@@ -21,9 +21,17 @@ use spindle_core::{EventId, EventInput, LogEntry, Pdu, RoomLog, StateKey};
 use spindle_store::RoomStore;
 
 use super::{
-    INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
+    Before, INVITE_STR, IdentifiedEvent, JOIN_STR, PersistInput, RoomError, Rooms, auth_events_for,
     event_body_key, version_in,
 };
+
+/// A `send_join` answer with the roster left out
+/// ([`Rooms::partial_join_state`]).
+pub struct PartialJoinState {
+    pub state: Vec<IdentifiedEvent>,
+    pub auth_chain: Vec<IdentifiedEvent>,
+    pub servers_in_room: Vec<String>,
+}
 
 /// The `cause` a remote join's gap marker carries ([`Rooms::record_join_gap`]).
 pub const JOIN_GAP_CAUSE: &str = "remote_join";
@@ -44,6 +52,18 @@ impl Rooms {
     ///
     /// Returns [`RoomError`] if the room or its indexes cannot be read.
     pub fn server_in_room(&self, room_id: &str, domain: &str) -> Result<bool, RoomError> {
+        // A partial-state room (MSC3706) holds few member events, so the
+        // resident's `servers_in_room` stands in for the ones it lacks until
+        // the resync -- Synapse's approximation in the same place. Without
+        // it, an omitted member's server is a stranger whose events cannot
+        // even have their dependencies recovered.
+        if self
+            .partial_servers(room_id)
+            .iter()
+            .any(|server| server == domain)
+        {
+            return Ok(true);
+        }
         let members = self.with_room_read(room_id, |_, log| {
             let Some(state) = log.current_state() else {
                 return Ok(Vec::new());
@@ -208,6 +228,14 @@ impl Rooms {
                     .or_insert((body.clone(), candidate));
             }
             let mut accepted: BTreeMap<String, crate::authorize::StoredEvent> = BTreeMap::new();
+            // Held auth events, read and parsed once for the whole batch:
+            // ten thousand member events all cite the same create event,
+            // power levels and join rules, and nothing here writes until
+            // the commit at the end, so a held body cannot change under
+            // the cache (#766).
+            let held: std::cell::RefCell<
+                std::collections::HashMap<String, Option<crate::authorize::StoredEvent>>,
+            > = std::cell::RefCell::default();
             let mut writes = Vec::new();
             while !pending.is_empty() {
                 let ready: Vec<String> = pending
@@ -233,21 +261,13 @@ impl Rooms {
                         if let Some(event) = accepted.get(auth.as_str()) {
                             return Some(event.clone());
                         }
-                        let body = rooms
-                            .read_event(room_id, &EventId::new(auth.as_str()))
-                            .ok()?;
-                        let event = crate::authorize::StoredEvent::parse_auth_in(
-                            auth.as_str(),
-                            room_id,
-                            &body,
-                        )
-                        .ok()?;
-                        let rejected = log
-                            .sidelined(&EventId::new(auth.as_str()))
-                            .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
-                        Some(event.with_rejected(rejected).with_preserved_rejection(
-                            log.historically_rejected(&EventId::new(auth.as_str())),
-                        ))
+                        if let Some(event) = held.borrow().get(auth.as_str()) {
+                            return event.clone();
+                        }
+                        let event = read_held_auth(rooms, log, room_id, auth.as_str());
+                        held.borrow_mut()
+                            .insert(auth.as_str().to_owned(), event.clone());
+                        event
                     };
                     ruma::state_res::check_state_independent_auth_rules(
                         &rules.authorization,
@@ -303,9 +323,7 @@ impl Rooms {
                     accepted.insert(id, candidate);
                 }
             }
-            rooms
-                .store
-                .commit(&writes, spindle_store::Durability::Group)?;
+            rooms.store.commit(&writes, rooms.store.durability())?;
             Ok(())
         })
     }
@@ -507,6 +525,9 @@ impl Rooms {
                 }));
             }
             let redaction_target = rooms.redaction_target(log, room_id, json)?;
+            let redaction_power = redaction_target.is_some().then(|| {
+                rooms.redact_power_in(room_id, &state, json["sender"].as_str().unwrap_or_default())
+            });
 
             let event_type = json["type"].as_str().unwrap_or_default().to_owned();
             let state_key = json["state_key"].as_str().map(str::to_owned);
@@ -522,14 +543,14 @@ impl Rooms {
             let previous_tips = log.forward_extremities().clone();
             let entry = log
                 .append_across_gap(input, state, json["depth"].as_u64().unwrap_or(0))
-                .map_err(|error| rooms.append_error(&error))?
+                .map_err(|error| Rooms::append_error(&error))?
                 .clone();
             rooms.metrics.record_append(
                 crate::metrics::Origin::Federated,
                 super::case_of(state_key.is_some(), false),
             );
             let content = json["content"].clone();
-            rooms.persist_entry(
+            let settling = rooms.persist_entry(
                 log,
                 room_id,
                 &entry,
@@ -540,17 +561,29 @@ impl Rooms {
                     sender: &sender,
                     content: &content,
                     json,
+                    transaction: None,
+                    before: Some(Before {
+                        current: previous_current.as_ref(),
+                        tips: &previous_tips,
+                    }),
                 },
             )?;
             // Two extremities now, ours and the peer's: their resolution is
             // the room's current state, and every membership it moved is
             // re-indexed from it.
-            rooms.settle(log, room_id, Some(&entry), previous_current, &previous_tips)?;
+            rooms.settle(log, room_id, &entry, &settling)?;
+            rooms.prune_stuck_extremities(log, room_id, &entry.event_id, json);
             if let Some(target) = redaction_target {
                 if log.get(&EventId::new(target.as_str())).is_some()
                     || rooms.gap_position(room_id, &target)?.is_some()
                 {
-                    rooms.apply_redaction(room_id, &target, event_id)?;
+                    rooms.apply_received_redaction(
+                        room_id,
+                        &target,
+                        event_id,
+                        &sender,
+                        redaction_power.unwrap_or(false),
+                    )?;
                 } else {
                     rooms.note_unheld_redaction(log, room_id, &target, event_id, json)?;
                 }
@@ -1176,6 +1209,116 @@ impl Rooms {
         Ok((pdus, auth_chain))
     }
 
+    /// The `send_join` answer for a joiner that asked `omit_members`
+    /// (MSC3706, spec v1.6): the state before the join without the member
+    /// events the joiner can do without, the auth chain without what the
+    /// state already carries, and the servers with joined members.
+    ///
+    /// Kept, as Synapse keeps them (`_get_event_ids_for_partial_state_join`):
+    /// every non-member event; the joiner's own member event, an auth event
+    /// of the join it is about to receive; and, in a room with neither a
+    /// name nor a canonical alias, the heroes' member events, without which
+    /// the joiner's client cannot name the room until the resync. The rest
+    /// reach the joiner through its resync, and the auth events that cite
+    /// them through the auth chain.
+    ///
+    /// Heroes are the first five joined or invited members other than the
+    /// joiner, in the order this server placed their member events -- the
+    /// spec's "stream ordering" -- read until five are found rather than
+    /// for every member. The servers are those with a member the membership
+    /// index has as joined, one read per member of a server not yet found.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::federation_state`].
+    pub fn partial_join_state(
+        &self,
+        room_id: &str,
+        join_id: &str,
+        joiner: &str,
+    ) -> Result<PartialJoinState, RoomError> {
+        const HEROES: usize = 5;
+        let before = self.state_before_event(room_id, join_id)?;
+        let mut kept = Vec::new();
+        let mut members = Vec::new();
+        before.for_each(|key, id| {
+            if key.event_type().as_str() != "m.room.member" || key.state_key() == joiner {
+                kept.push(id.to_owned());
+            } else {
+                members.push((key.state_key().to_owned(), id.to_owned()));
+            }
+        });
+        let named = [("m.room.name", ""), ("m.room.canonical_alias", "")]
+            .iter()
+            .any(|(kind, key)| before.get(&StateKey::new(*kind, *key)).is_some());
+        if !named {
+            let mut placed = self.with_room_read(room_id, |_, log| {
+                Ok(members
+                    .iter()
+                    .map(|(_, id)| {
+                        let li = log
+                            .get(&EventId::new(id.as_str()))
+                            .map_or(i64::MAX, |entry| entry.li.get());
+                        (li, id.clone())
+                    })
+                    .collect::<Vec<_>>())
+            })?;
+            placed.sort();
+            let mut heroes = 0;
+            for (_, id) in placed {
+                if heroes == HEROES {
+                    break;
+                }
+                let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
+                if matches!(
+                    event["content"]["membership"].as_str(),
+                    Some("join" | "invite")
+                ) {
+                    kept.push(id);
+                    heroes += 1;
+                }
+            }
+        }
+
+        let mut servers = std::collections::BTreeSet::from([self.server_name.clone()]);
+        for (user, _) in &members {
+            let Some((_, domain)) = user.split_once(':') else {
+                continue;
+            };
+            if servers.contains(domain) {
+                continue;
+            }
+            if self.is_joined(user, room_id)? {
+                servers.insert(domain.to_owned());
+            }
+        }
+
+        let mut pdus = Vec::with_capacity(kept.len());
+        for id in kept {
+            let event = self.pdu(room_id, &id)?;
+            pdus.push((id, event));
+        }
+        // The auth chain of what is sent, less what is sent: the joiner
+        // holds the state events already, and a member event it lacks is
+        // here only if something sent cites it.
+        let sent: std::collections::BTreeSet<&str> =
+            pdus.iter().map(|(id, _)| id.as_str()).collect();
+        let frontier: Vec<String> = pdus
+            .iter()
+            .flat_map(|(_, event)| cited_auth_events(event))
+            .collect();
+        let auth_chain = self
+            .auth_chain_from(room_id, frontier)
+            .into_iter()
+            .filter(|(id, _)| !sent.contains(id.as_str()))
+            .collect();
+        Ok(PartialJoinState {
+            state: pdus,
+            auth_chain,
+            servers_in_room: servers.into_iter().collect(),
+        })
+    }
+
     /// The state the room was in just before `event_id`: its parents'
     /// states, resolved by the room version's algorithm when they differ
     /// (ADR 0005) -- exactly what the event was authorized against when it
@@ -1305,20 +1448,14 @@ impl Rooms {
                         .pending_knock(user_id, room_id)?
                         .and_then(|record| record["knock_state"].as_array().cloned()),
                 };
-                return self.prune_erased_stripped(stripped.unwrap_or_default());
+                return Ok(stripped.unwrap_or_default());
             }
             Err(error) => return Err(error),
         };
-        let erasure_active = self.erasure_active()?;
         let mut stripped = Vec::with_capacity(ids.len() + 1);
         let mut inviter: Option<String> = None;
         for (event_type, state_key, id) in ids {
             let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
-            let event = if erasure_active {
-                self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
-            } else {
-                event
-            };
             if event_type == "m.room.member" && state_key == user_id {
                 inviter = event["sender"].as_str().map(str::to_owned);
             }
@@ -1343,11 +1480,6 @@ impl Rooms {
             })?;
             if let Some(id) = id {
                 let event = self.read_event(room_id, &EventId::new(id.as_str()))?;
-                let event = if erasure_active {
-                    self.prune_erased_event(user_id, room_id, super::stamp(event, &id))?
-                } else {
-                    event
-                };
                 stripped.push(serde_json::json!({
                     "type": "m.room.member",
                     "state_key": inviter,
@@ -1377,6 +1509,14 @@ impl Rooms {
     /// federation-hardening pass; the hash check is what keeps the seeded
     /// room internally consistent.
     ///
+    /// A `partial` join (MSC3706: the resident answered `members_omitted`)
+    /// is recorded as such before anything is seeded (`partial`), and
+    /// seeds `state` alone: the auth chain then carries member events the
+    /// resident left out of the state -- a since-departed member's join
+    /// cited by the topic they set -- and folding those in would seat
+    /// members who are gone. They are kept as bodies, which is all their
+    /// role as auth events needs.
+    ///
     /// # Errors
     ///
     /// Returns [`RoomError`] when an event fails validation or the room is
@@ -1389,6 +1529,7 @@ impl Rooms {
         auth_chain: &[Value],
         join: &Value,
         join_id: &str,
+        partial: Option<&super::PartialState>,
     ) -> Result<(), RoomError> {
         let mut open = self
             .open
@@ -1435,9 +1576,25 @@ impl Rooms {
         // the timestamp and ID only break ties deterministically.
         let mut events: std::collections::BTreeMap<String, Value> =
             std::collections::BTreeMap::new();
-        for event in state.iter().chain(auth_chain) {
+        for event in state {
             let (id, body) = identify(event)?;
             events.insert(id, body);
+        }
+        let mut auth_only: Vec<(String, Value)> = Vec::new();
+        for event in auth_chain {
+            let (id, body) = identify(event)?;
+            // Sticky events (MSC4354) ride beside the auth chain and are
+            // timeline, not state: they are seeded either way.
+            if partial.is_some() && body.get("state_key").is_some() {
+                if !events.contains_key(&id) {
+                    auth_only.push((id, body));
+                }
+            } else {
+                events.insert(id, body);
+            }
+        }
+        if let Some(record) = partial {
+            self.record_partial_state(record)?;
         }
         if events.contains_key(join_id) {
             // A state-DAG resident answers with the DAG *after* the join,
@@ -1525,6 +1682,7 @@ impl Rooms {
                 spindle_core::keys::event_room(id),
                 room_id.as_bytes().to_vec(),
             )];
+            extra.extend(self.search_rows(&log, room_id, &entry, event)?);
             // MSC4354: a seeded sticky event is owed to this server's
             // syncing clients like any other, at a position every token
             // issued before the join precedes.
@@ -1542,6 +1700,51 @@ impl Rooms {
             room_store.journal_entry_with(&entry, &log, &extra)?;
         }
 
+        // A partial join's auth-chain-only events: bodies for the auth
+        // checks that cite them, outside the log and the state.
+        let mut outliers = Vec::with_capacity(auth_only.len().saturating_mul(2));
+        for (id, event) in &auth_only {
+            outliers.push((event_body_key(room_id, id), serde_json::to_vec(event)?));
+            outliers.push((
+                spindle_core::keys::event_room(id),
+                room_id.as_bytes().to_vec(),
+            ));
+        }
+        if !outliers.is_empty() {
+            spindle_store::Store::commit(self.store.as_ref(), &outliers, self.store.durability())?;
+        }
+
+        // The membership the join replaces -- usually the invite it accepts
+        // -- rides the join as `unsigned`, as `build_event` stamps a local one:
+        // matrix-js-sdk reads an accepted invite's `is_direct` from the
+        // join's `prev_content`, so without it a DM joined over federation
+        // is not a DM to the joiner's client, and its ring shows as a
+        // group call (#795). Found among the join's auth events, which
+        // cite the joiner's current membership whether or not a partial
+        // state left it out.
+        let mut join_body = join_body;
+        let cited = super::edge_ids(&join_body["auth_events"]);
+        let replaced = ordered
+            .iter()
+            .chain(&auth_only)
+            .find(|(id, event)| {
+                cited.contains(id)
+                    && event["type"] == "m.room.member"
+                    && event["state_key"] == join_body["state_key"]
+            })
+            .map(|(id, event)| {
+                serde_json::json!({
+                    "replaces_state": id,
+                    "prev_content": event["content"],
+                    "prev_sender": event["sender"],
+                })
+            });
+        if let Some(unsigned) = replaced
+            && let Some(object) = join_body.as_object_mut()
+        {
+            object.insert("unsigned".to_owned(), unsigned);
+        }
+
         // The join itself is new activity: it goes through the shared
         // persistence spine, so it gets a stream row (the joiner's sync must
         // surface the room), the membership index, and waiter notification.
@@ -1549,7 +1752,7 @@ impl Rooms {
         let content = join_body["content"].clone();
         let sender = join_body["sender"].as_str().unwrap_or_default().to_owned();
         let state_key_owned = join_body["state_key"].as_str().map(str::to_owned);
-        self.persist_entry(
+        let _ = self.persist_entry(
             &mut log,
             room_id,
             &join_entry,
@@ -1560,6 +1763,8 @@ impl Rooms {
                 sender: &sender,
                 content: &content,
                 json: &join_body,
+                transaction: None,
+                before: None,
             },
         )?;
 
@@ -1583,7 +1788,9 @@ impl Rooms {
             self.index_membership(room_id, Some(&user), &event["content"], li)?;
         }
 
-        open.insert(room_id.to_owned(), Arc::new(RwLock::new(log)));
+        open.insert(room_id.to_owned(), self.slot(Arc::new(RwLock::new(log))));
+        drop(open);
+        self.enforce_resident_budget();
         Ok(())
     }
 
@@ -1685,7 +1892,7 @@ impl Rooms {
         json: &Value,
     ) -> Result<(), RoomError> {
         self.with_room(room_id, |rooms, log| {
-            rooms.ingest_checked(log, room_id, event_id, json, true, true)
+            rooms.ingest_checked(log, room_id, event_id, json, true, true, None)
         })
     }
 
@@ -1789,4 +1996,24 @@ fn order_state_dag(events: Vec<(String, Value)>) -> Vec<(String, Value)> {
 /// The event ids an event's `auth_events` names.
 fn cited_auth_events(event: &Value) -> Vec<String> {
     super::edge_ids(&event["auth_events"])
+}
+
+/// A held auth event as the auth rules read it, with the rejection this
+/// log recorded for it, or `None` when it is not held or does not parse.
+fn read_held_auth(
+    rooms: &Rooms,
+    log: &RoomLog,
+    room_id: &str,
+    auth: &str,
+) -> Option<crate::authorize::StoredEvent> {
+    let body = rooms.read_event(room_id, &EventId::new(auth)).ok()?;
+    let event = crate::authorize::StoredEvent::parse_auth_in(auth, room_id, &body).ok()?;
+    let rejected = log
+        .sidelined(&EventId::new(auth))
+        .is_some_and(|entry| entry.kind == spindle_core::Sideline::Rejected);
+    Some(
+        event
+            .with_rejected(rejected)
+            .with_preserved_rejection(log.historically_rejected(&EventId::new(auth))),
+    )
 }

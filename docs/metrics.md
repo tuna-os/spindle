@@ -32,25 +32,39 @@ the incident it was supposed to explain.
 | `spindle_http_requests_total` | counter | `route`, `method`, `status` | Requests served. |
 | `spindle_http_request_duration_seconds` | histogram | `route` | Time to serve one request, in the wide buckets (0.1 ms to 120 s). A sync that was allowed to long-poll -- classic `/sync` or sliding sync with a `since`/`pos` and a non-zero `timeout` -- is timed under its route with ` (long-poll)` appended (for example `route="/_matrix/client/v3/sync (long-poll)"`), so its intentional wait does not become the route's p95. An initial sync, or one with `timeout=0`, stays under the plain template. `spindle_http_requests_total` keeps the plain template for both. |
 | `spindle_federation_queue_depth` | gauge | `destination` | Events waiting to go out, per peer. |
-| `spindle_federation_edus_received_total` | counter | `edu_type` = `m.typing`\|`m.receipt`\|`m.presence`\|`m.direct_to_device`\|`m.device_list_update`\|`m.signing_key_update`\|`other`, `result` = `accepted`\|`ignored`\|`malformed`\|`unsupported` | EDUs peers sent in transactions. `ignored` is well-formed but nothing applied (a user not on the origin, not in the room, an unknown event). `unsupported` is a type this server does not act on: presence is not federated, so its volume shows up here. For to-device, device-list and signing-key EDUs `accepted` means handed to the handler, which runs its own checks. |
+| `spindle_federation_destinations_backing_off` | gauge | `backoff` = `short`\|`long` | Destinations whose last delivery failed. `short` ones are retried at least once a minute. `long` ones have failed for ten minutes or more: each waits as long as it has been down, up to a day, or until it sends this server a request. Many `long` destinations is normal on a server in large public rooms; it is the dead servers in them. |
+| `spindle_federation_catch_up_dropped_total` | counter | — | Queued events that a destination down for ten minutes or more will not get: its queue is cut to the newest ten events of each room, and the peer fetches older ones if it wants them. To-device messages and device-list updates are never dropped. |
+| `spindle_federation_outbox_capped_total` | counter | — | Queued events dropped because the queue of a destination that has been down a long time held 5,000 events. The oldest go first, and the peer fetches what it missed when it returns. A peer with `peers.max_backoff_ms` is never capped. |
+| `spindle_federation_outbox_body_missing_total` | counter | — | Queued events dropped because an admin purge had deleted their stored body. The outbox keeps one body for each event, in the room, and each destination's row refers to it. |
+| `spindle_federation_edus_received_total` | counter | `edu_type` = `m.typing`\|`m.receipt`\|`m.presence`\|`m.direct_to_device`\|`m.device_list_update`\|`m.signing_key_update`\|`other`, `result` = `accepted`\|`ignored`\|`malformed`\|`unsupported` | EDUs peers sent in transactions. `ignored` is well-formed but nothing applied (a user not on the origin, not in the room, an origin the room's server ACL denies, an unknown event). `unsupported` is a type this server does not act on: unknown types, and `m.presence` when `[presence] enabled = false`, so its volume shows up here before anyone switches it on. For to-device, device-list and signing-key EDUs `accepted` means handed to the handler, which runs its own checks. |
 | `spindle_federation_edus_sent_total` | counter | `edu_type` (as above) | EDUs put into outbound transactions. Read receipts are coalesced per destination, so one `m.receipt` carries every waiting reader. |
-| `spindle_federation_receipts_received_total` | counter | `result` = `accepted`\|`foreign_user`\|`not_joined`\|`unknown_event`\|`unsupported_type`\|`malformed`\|`over_limit` | Read receipts inside inbound `m.receipt` EDUs. Only `m.read` federates; `unsupported_type` counts anything else, `m.read.private` included. `over_limit` is past the 500-per-EDU bound. |
+| `spindle_federation_receipts_received_total` | counter | `result` = `accepted`\|`foreign_user`\|`not_joined`\|`denied`\|`unknown_event`\|`unsupported_type`\|`malformed`\|`over_limit` | Read receipts inside inbound `m.receipt` EDUs. Only `m.read` federates; `unsupported_type` counts anything else, `m.read.private` included. `denied` is an origin the room's server ACL denies. `over_limit` is past the 500-per-EDU bound. |
 | `spindle_sync_subscribers` | gauge | — | Clients currently blocked in a long-polling `/sync`. |
 | `spindle_sync_lag_seconds` | histogram | — | Age of the newest event a `/sync` delivered. |
 | `spindle_room_registry_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of the registry that hands rooms out. |
+| `spindle_retention_runs_total` | counter | | Passes of the history retention job (#817). Zero while `[retention]` is off. |
+| `spindle_retention_rooms_total` | counter | `result` = `truncated`\|`refused`\|`failed` | Rooms the job handled. `refused` means a hub, partial-state or forked room. |
+| `spindle_retention_deleted_total` | counter | `kind` = `entries`\|`bodies` | Log rows and event bodies the job deleted. |
 | `spindle_room_lock_acquisitions_total` | counter | `mode` = `exclusive`\|`shared` | Acquisitions of a room's own lock: `exclusive` is the write path. |
+| `spindle_last_successful_backup_timestamp_seconds` | gauge | — | Unix time of the last backup that `POST /_spindle/admin/v1/backup` wrote. `0` until one succeeds after a start. |
 | `spindle_federation_gaps_remaining` | gauge | — | Recorded federation gaps whose history is not backfilled yet (SPEC §6.6). Should fall to `0` within minutes of a gap acceptance. |
+| `spindle_federation_recovery_attempts_total` | counter | `result` = `recovered`\|`budget_exceeded`\|`peer_error`\|`rate_limited`\|`timeout`\|`invalid`\|`negative_cached` | Tries to get the missing dependencies of a received event from one peer. `negative_cached` is an event that this server refused at once, with no request to a peer: it names a dependency that failed verification in the last `[federation] dependency_failure_ttl_secs`. A high rate tells you that peers send many events that depend on one event that this server cannot verify. |
+| `spindle_federation_recovery_admissions_total` | counter | `result` = `started`\|`joined`\|`busy` | Received events that need a dependency recovery, by what this server did. `started` starts a recovery. `joined` is the same event again, for example in a transaction that the peer sent again: it waits for the recovery that runs. `busy` is an event that this server refused at once, because its room already has two recoveries. `/send` waits 20 s at most for a recovery. After that, the recovery continues and the event gets an error that says that it is pending. `spindle_federation_pdus_received_total{result="recovery_pending"}` counts these events. |
+| `spindle_federation_owed_events` | gauge | — | Pushed events this server refused for missing dependencies and has not applied yet. The backfill loop retries each one. A value that stays above `0` for hours means a room may be diverged from its peers. |
 | `spindle_federation_backfill_chunks_total` | counter | `result` = `filled`\|`completed`\|`peer_error`\|`rate_limited`\|`invalid`\|`truncated` | Gap backfill chunks. `invalid` is a peer serving history that failed verification; nothing of that chunk was stored. |
 | `spindle_federation_backfill_events_total` | counter | `result` = `fetched`\|`inserted`\|`rejected`\|`skipped` | Events a gap backfill fetched, stored, kept out of the timeline for failing its auth checks, or stepped over because no participating server would serve them (a peer leaves out events it rejected). |
 | `spindle_federation_backfill_duration_seconds` | histogram | `result` | Time one backfill chunk took: the page, its auth events, its `/state_ids` and the write. |
 | `spindle_federation_key_fetches_total` | counter | `source` = `direct`\|`notary`\|`cache`, `result` = `ok`\|`error`\|`invalid`\|`throttled` (direct, notary), `hit`\|`miss` (cache) | Lookups of a peer's signing keys. `notary` `ok` climbing means peers this server cannot reach are being verified through `[federation] trusted_key_servers`; `invalid` is a document that failed its signature checks and was refused. |
 | `spindle_federation_signature_failures_total` | counter | `reason` = `no_key`\|`expired_key`\|`bad_signature`\|`missing_signature`\|`malformed` | Received events refused for their signatures. `bad_signature` means a key under the right ID did not verify the bytes judged; each one logs the redacted form it checked. |
-| `spindle_auth_logins_total` | counter | `method` = `password`\|`oidc`\|`oidc_session`\|`account`, `result` = `success`\|`bad_password`\|`rate_limited`\|`error` | Sign-in attempts: the client API's password login, the built-in provider's authorization page (with a password, or continuing a browser session), and the account pages. An unknown user counts as `bad_password`, as everywhere else. |
+| `spindle_federation_listed_refusals_total` | counter | `direction` = `inbound`\|`outbound` | Requests refused because `[federation] allow` or `deny` does not permit the server. `inbound` is a signed request from a listed-out server; `outbound` is a request this server did not make to one. |
+| `spindle_auth_logins_total` | counter | `method` = `password`\|`oidc`\|`oidc_session`\|`account`\|`upstream`, `result` = `success`\|`bad_password`\|`rate_limited`\|`error` | Sign-in attempts: the client API's password login, the built-in provider's authorization page (with a password, or continuing a browser session), and the account pages. An unknown user counts as `bad_password`, as everywhere else. `rate_limited` also counts a login that found the password-hash queue full (#571). |
 | `spindle_oauth_token_grants_total` | counter | `grant` = `authorization_code`\|`refresh_token`, `result` = `success`\|`invalid_grant`\|`invalid_request`\|`error` | Built-in provider token-endpoint grants. A climbing `invalid_grant` on `refresh_token` is clients holding rotated-away tokens. |
 | `spindle_password_resets_total` | counter | `stage` = `requested`\|`completed` | Forgot-password requests (counted per submission, whether or not the address is known) and resets completed with a valid emailed link. |
 | `spindle_emails_sent_total` | counter | `kind` = `password_reset`\|`verification`, `result` = `sent`\|`failed` | Mail handed to the SMTP transport. `failed` is the relay refusing or unreachable. |
 | `spindle_account_actions_total` | counter | `action` = `profile`\|`password_change`\|`session_end`\|`deactivate`\|`email_add`\|`email_verify`\|`email_remove`\|`cross_signing_reset`\|`recovery_codes` | Changes made through the account-management pages (`recovery_codes`: a fresh set generated). |
 | `spindle_password_recoveries_total` | counter | `method` = `reset_link`\|`recovery_code`, `result` = `success`\|`rejected`\|`rate_limited` | Forgotten-password recoveries: a reset link (mailed or administrator-issued) or a recovery code. `rejected` is a dead link or a code that did not match. |
+| `spindle_rooms_resident` | gauge | — | Rooms held open in memory. Each one keeps its whole log index until it is evicted, so this is the number that bounds resident memory. |
+| `spindle_rooms_evicted_total` | counter | — | Rooms dropped from memory because more than `[storage] max_resident_rooms` were open. An evicted room loads from the store the next time anything asks for it. A fast climb means the budget is below the working set and rooms reload often (see `spindle_room_cold_loads_total`). |
 | `spindle_reset_links_issued_total` | counter | — | Reset links issued through the admin API (the offline CLI cannot count into a running server). |
 
 ## Alert rules, a scrape target and a dashboard
@@ -80,13 +94,14 @@ renamed metric cannot leave a rule that never fires.
 `spindle_fork_resolutions_total` is not a throughput metric. It is the
 instrument the architecture is falsified by.
 
-SPEC §9.2 splits every append into three cases, cheapest first:
+Spindle counts every append in one of three cases, cheapest first (SPEC §9.2):
 
-- **case 1** — a non-state event. Cannot conflict; no state resolution.
-- **case 2** — a state event whose key nothing in the fork window touched.
-  One `apply()`; no state resolution.
-- **case 3** — a state event contested inside the window. The expensive
-  path: bounded state resolution.
+- **case 1** — a non-state event whose parents hold one state. No state
+  resolution.
+- **case 2** — a state event whose parents hold one state. One `apply()`;
+  no state resolution.
+- **case 3** — an event whose parents' states differ. The expensive
+  path: the room version's state resolution (ADR 0005).
 
 SPEC §18.3 then states the target that makes the design testable rather
 than merely asserted:
@@ -124,18 +139,12 @@ pager. A brief spike during a federation catch-up is expected.
 
 ### One caveat, stated plainly
 
-Case 3 counts **forks that needed the resolver**. Today Spindle defers
-those rather than resolving them: bounded resolution is implemented in
-`spindle-core` (#8, #30) but is not yet wired into ingest (#16). A
-federated event naming the contesting tips is refused. A local send sets
-the contesting tip aside — it stays a forward extremity for the resolver,
-and local events are authored on the linear head without it (#225) — and
-the server logs a warning naming the room, the tip and the key. Each fork
-is counted once, when the tip is set aside, not once per send while it
-stays open. The counter sits at the decision point, so it counts the same
-fork before and after #16 lands — but until it does, a non-zero case 3
-means "a contested fork was found and stepped around", not "a resolution
-ran".
+Case 3 counts **appends whose parents' states differ**. The room version's
+algorithm resolves each of them (ADR 0005). Spindle does not defer a fork,
+and a fork does not stop a local send. The counter records a fork once, at
+the event that names its tips, local or received. Later events build on that
+event. Spindle also resolves the room's current state over several
+extremities, but that is not an append, so this counter ignores it.
 
 ## Checking the latency targets
 
@@ -173,6 +182,21 @@ delivered. The **twenty deepest destinations get their own series and
 the rest are summed into `other`**: a room full of fabricated server
 names must not be able to mint a series each and turn the scrape into
 the attack. The tail is added up, never dropped.
+
+The gauge counts PDUs only. The EDUs that a peer must get (to-device
+messages, device-list updates and key updates) wait in a different
+outbox. They go in the same transactions. Thus a peer that waits for
+only those EDUs shows 0 here. The admin API `federation/destinations`
+shows its failures and its backoff.
+
+A server that stays down does not keep its queue. After ten minutes of
+failures, its wait grows with the outage, up to a day. The outbox also
+cuts its queue to the newest ten events of each room
+(`spindle_federation_catch_up_dropped_total`). A request from that server
+ends the wait at once. Thus a queue depth that stays high for one
+destination is a live peer that is slow, not a dead one.
+`spindle_federation_destinations_backing_off{backoff="long"}` counts the
+dead ones.
 
 ```promql
 topk(5, spindle_federation_queue_depth)

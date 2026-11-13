@@ -133,6 +133,32 @@ federation. complement-crypto drives the real rust-sdk and js-sdk against a
 homeserver and can run them **against each other**, which is precisely the
 interop shape we need. Adopt it at M2 rather than writing E2EE tests by hand.
 
+The `complement-crypto` job in `.github/workflows/compliance.yml` runs it each
+night and on demand, through `contrib/complement-crypto/run.sh`. The script
+gets the suite at a pinned commit, without a fork. Its clients are
+matrix-js-sdk, at the version that the suite's lockfile names. They run in
+headless Chrome against two Spindles from `complement/Dockerfile`.
+
+The job uses the `jj` and `jJ` permutations. The first puts two clients on
+one server. The second puts the clients on two servers, so device lists go
+over federation.
+
+The job does not use Rust SDK clients. They need FFI bindings from a fork of
+`uniffi-bindgen-go`. Also, the `rust-sdk-suite` job already runs the
+matrix-rust-sdk tests against Spindle each night.
+
+The job only reports. When a test fails, the job stays green. The log and
+the `complement-crypto` artifact give the name of the test. The job fails
+only when no test passes, because then the rig has a fault. In one probe
+run, Chrome could not start its sandbox, and all tests failed in the first
+second. The next probe run passed 35 of the 41 tests that ran.
+
+One run is not a baseline, so we cannot yet tell a new failure from an old
+one. People ignore a nightly job that fails each night for a known reason.
+When tests pass on two consecutive runs, we put them in an allowlist. Then
+the job becomes a ratchet, as Complement is (§3.3). That is the first step to
+the M2 gate in §6.
+
 ### 4.3 Schema conformance from the spec itself
 
 `matrix-spec` ships OpenAPI definitions and JSON Schemas for every event type.
@@ -250,15 +276,17 @@ a delivery race. It produces each case and asserts on the counters:
 | Case | Injection | Assert |
 |---|---|---|
 | 1 — non-state event on a stale head | Send a message PDU pointing at an old event | Appended at tail, no state res invoked, client order sane |
-| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window, one slot or several, preset or not | Single `apply()`, both branches' writes survive, every state read agrees |
-| 3 — genuine conflict | Two competing power-level or membership changes in-window | Counted once per tip; the room stays writable on its linear head (#359); the head's branch is what the client reads, what `/state_ids` reports and what the room enforces |
-| Partition and heal | Each side sets state and sends on its own branch, then the peer's branch lands at once | The heal event names both tips, no state res invoked, one state and one timeline |
-| Window overflow | Fork deeper than `max_fork_window` | Falls back to full state res, stays *correct*, and alerts — not yet driven |
+| 2 — state event, disjoint key | Fork with a `(type, state_key)` untouched in the window, one slot or several, preset or not | Parent states differ, so the merging send runs the room version's resolver once; both branches' writes survive, every state read agrees |
+| 3 — genuine conflict | Two competing topic, power-level or membership changes in-window | The local send that merges the tips succeeds, names both and runs the resolver once; the room holds the resolver's choice, and the client, `/state_ids` and authorization agree on it |
+| Partition and heal | Each side sets state and sends on its own branch, then the peer's branch lands at once | The heal event names both tips, runs the resolver once, one state and one timeline |
 
-Case 3 is *deferred*, not resolved: the resolver is not wired into ingest yet,
-and the row says what the executable behaviour is today rather than what the
-design targets. When the resolver lands, the same test must move from
-"the head's branch" to "what full state res v2 would choose".
+The room version's algorithm resolves every case-2 and case-3 merge
+(ADR 0005); no fork refuses a local send or is set aside. The resolver's choice is
+told apart from "the linear head's branch" by
+`a_local_send_on_a_contested_fork_merges_both_tips_by_the_room_versions_rules`,
+whose later-appended branch carries the older timestamp and loses. There is no
+fork-window cap to overflow: resolution takes the parents' whole states at any
+depth, and `RoomLog::fork_window` is diagnostic only.
 
 Instrument the case-1/2/3 counters (spec §17.2) and assert on them: a test that
 passes while silently taking the expensive path is a test that has stopped
@@ -276,6 +304,7 @@ property linear_fold_matches_state_res:
     for arbitrary chain DAG D:
         assert fold_state(D) == ruma_state_res_v2(D)
 
+# ADR 0005 retired the depth cap: the resolver now runs at any depth.
 property window_bounded_matches_full:
     for arbitrary forked DAG D, fork depth ≤ max_fork_window:
         assert window_state_res(D) == ruma_state_res_v2(D)
@@ -299,8 +328,8 @@ so it runs on every commit, and a counterexample is a release blocker.
 | Per commit | Unit tests, §5.3 property tests, schema validation (§4.3), fuzz corpus | Blocking |
 | Per PR | Complement with `spindle_blacklist`, blacklist-size ratchet | Blocking |
 | Per PR | §5.2 fork injection | Blocking |
-| Nightly | sytest, full fuzzing, §5.1 interop run against Synapse's Complement image (`compliance-interop`, report-only, both directions) | Non-blocking, tracked |
-| Nightly | complement-crypto | Blocking from M2 |
+| Nightly | full fuzzing, §5.1 interop run against Synapse's Complement image (`compliance-interop`, report-only, both directions); sytest is planned (§7, M5) and not yet run | Non-blocking, tracked |
+| Nightly | complement-crypto, JS SDK clients (`complement-crypto`, §4.2) | Report-only until it has a baseline, then a ratchet; blocking from M2 |
 | Weekly | Interop rig against Synapse `develop`; Element Web Playwright suite | Non-blocking, alerts |
 | Release | Full matrix + manual client pass + federation tester against a live deploy | Blocking |
 
