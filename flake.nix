@@ -33,10 +33,14 @@
             "--features"
             features
           ];
-          # nixpkgs' cargo hook sets AWS_LC_SYS_USE_SYSTEM=1, so aws-lc-sys
-          # links the system AWS-LC and must find it through pkg-config.
+          # nixpkgs' cargo hook sets AWS_LC_SYS_USE_SYSTEM=1 and
+          # LIBSQLITE3_SYS_USE_PKG_CONFIG=1, so aws-lc-sys and rusqlite link
+          # the system AWS-LC and SQLite and find them through pkg-config.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.aws-lc ];
+          buildInputs = [
+            pkgs.aws-lc
+            pkgs.sqlite
+          ];
           # The test suite is CI's job; building it here would double the build.
           doCheck = false;
           meta = {
