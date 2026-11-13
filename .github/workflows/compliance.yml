@@ -54,7 +54,9 @@ jobs:
   # start all of them. Sixty runners are shared by every project in the
   # organization, and twelve jobs on every merge was a queue of its own.
   plan:
-    runs-on: ubuntu-latest
+    # gh and bash only; the slim pool keeps the gate out of the standard queue
+    # that every rig below waits behind.
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
       contents: read
