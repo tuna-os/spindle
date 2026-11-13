@@ -333,6 +333,11 @@ pub enum Budget {
     RoomCreation,
     /// A new media ID: `POST /upload` or `POST /media/v1/create`.
     MediaUpload,
+    /// `GET /preview_url` (#833).
+    UrlPreview,
+    /// A fetch of another server's media on an authenticated download or
+    /// thumbnail (#833).
+    RemoteMedia,
 }
 
 impl Budget {
@@ -345,6 +350,8 @@ impl Budget {
             Self::Invited => config.invites_per_target,
             Self::RoomCreation => config.room_creation,
             Self::MediaUpload => config.media_uploads,
+            Self::UrlPreview => config.url_previews,
+            Self::RemoteMedia => config.remote_media,
         }
     }
 
@@ -359,6 +366,8 @@ impl Budget {
             Self::Invited => "invited",
             Self::RoomCreation => "create-room",
             Self::MediaUpload => "media",
+            Self::UrlPreview => "url-preview",
+            Self::RemoteMedia => "remote-media",
         }
     }
 }

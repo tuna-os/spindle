@@ -87,7 +87,8 @@ pub struct MediaRecord {
     pub size: usize,
     pub uploaded_by: String,
     /// When the bytes arrived, in milliseconds. Absent on records written
-    /// before this was kept; the cache purge reads those as the oldest.
+    /// before this was kept; the cache purge and the size cap read those as
+    /// the oldest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_ts: Option<u64>,
     /// The admin who quarantined it. A quarantined record is kept as
@@ -221,6 +222,15 @@ pub struct Media {
     /// Decodes that got as far as reading pixel data. Counted so a test can
     /// show an over-budget image never reached the decoder.
     decodes_started: Arc<AtomicU64>,
+    /// `[media] remote_cache_max_bytes`; `None` is no cap.
+    remote_cache_cap: Option<u64>,
+    /// Bytes other servers' cached media holds, built from the records the
+    /// first time a remote item is cached and kept in step after. Derived
+    /// for the same reason as `usage`.
+    remote_bytes: Mutex<Option<u64>>,
+    /// Serialises remote caching, so two fetches cannot each see room that
+    /// only one of them can have. Held across blob writes, hence async.
+    remote_write: tokio::sync::Mutex<()>,
 }
 
 /// Most image decodes in flight at once.
@@ -264,6 +274,9 @@ impl Media {
             decode_slots: Arc::new(tokio::sync::Semaphore::new(DECODE_CONCURRENCY)),
             decode_failures: Mutex::new(HashMap::new()),
             decodes_started: Arc::new(AtomicU64::new(0)),
+            remote_cache_cap: None,
+            remote_bytes: Mutex::new(None),
+            remote_write: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -303,6 +316,14 @@ impl Media {
             }
         }
         failures.insert(hash.to_owned(), (Instant::now(), failure));
+    }
+
+    /// Hold other servers' cached media to `cap` bytes in total, removing
+    /// the oldest items first; `None` is no cap.
+    #[must_use]
+    pub const fn with_remote_cache_cap(mut self, cap: Option<u64>) -> Self {
+        self.remote_cache_cap = cap;
+        self
     }
 
     /// Use the configured cap for uploads and remote media caching.
@@ -641,6 +662,25 @@ impl Media {
                 limit: self.max_upload_bytes,
             });
         }
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // An item bigger than the whole cache could only be stored by
+        // evicting everything, itself included.
+        if let Some(cap) = self.remote_cache_cap
+            && size > cap
+        {
+            return Err(MediaError::TooLarge {
+                size: bytes.len(),
+                limit: usize::try_from(cap).unwrap_or(usize::MAX),
+            });
+        }
+        let _serial = self.remote_write.lock().await;
+        let cache_id = Self::remote_id(server_name, media_id);
+        // Read before the write: the first read scans the records, and a scan
+        // after the write would already count the item being added.
+        let held = self.remote_held()?;
+        let prior = self
+            .record(&cache_id)?
+            .map_or(0, |record| u64::try_from(record.size).unwrap_or(u64::MAX));
         let hash = blake3::hash(bytes).to_hex().to_string();
         self.blobs.put(&hash, bytes).await?;
         let record = MediaRecord {
@@ -655,9 +695,68 @@ impl Media {
         };
         Store::put(
             self.store.as_ref(),
-            &keys::media(&Self::remote_id(server_name, media_id)),
+            &keys::media(&cache_id),
             &serde_json::to_vec(&record)?,
         )?;
+        self.set_remote_held(held.saturating_sub(prior).saturating_add(size));
+        self.evict_remote(&cache_id).await
+    }
+
+    fn set_remote_held(&self, held: u64) {
+        *self
+            .remote_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(held);
+    }
+
+    /// Bytes of remote media held, scanning the records the first time.
+    fn remote_held(&self) -> Result<u64, MediaError> {
+        let mut total = self
+            .remote_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = *total {
+            return Ok(held);
+        }
+        let held = self
+            .records()?
+            .iter()
+            .filter(|(id, _)| id.contains('/'))
+            .map(|(_, record)| u64::try_from(record.size).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        *total = Some(held);
+        Ok(held)
+    }
+
+    /// Remove the oldest remote items until the cache fits its cap,
+    /// sparing `keep`, the item just written.
+    ///
+    /// Oldest by when the bytes arrived, so a purge by age elsewhere and
+    /// this cap remove from the same end and cannot disagree about order.
+    async fn evict_remote(&self, keep: &str) -> Result<(), MediaError> {
+        let Some(cap) = self.remote_cache_cap else {
+            return Ok(());
+        };
+        if self.remote_held()? <= cap {
+            return Ok(());
+        }
+        let mut cached: Vec<_> = self
+            .records()?
+            .into_iter()
+            // A quarantined item is evidence, so the cap spares it as the
+            // age purge does, and may be left over the cap by it.
+            .filter(|(id, record)| {
+                id.contains('/') && id != keep && record.quarantined_by.is_none()
+            })
+            .collect();
+        cached.sort_by_key(|(id, record)| (record.created_ts.unwrap_or(0), id.clone()));
+        for (id, _) in cached {
+            if self.remote_held()? <= cap {
+                break;
+            }
+            // `delete` takes the bytes off the running total itself.
+            self.delete(&id).await?;
+        }
         Ok(())
     }
 
@@ -901,7 +1000,16 @@ impl Media {
         Store::delete(self.store.as_ref(), &keys::media(media_id))?;
         // The bytes stop counting with the record, whatever happens to the
         // blob: from here the upload is not the account's to serve.
-        if !media_id.contains('/') {
+        if media_id.contains('/') {
+            let size = u64::try_from(record.size).unwrap_or(u64::MAX);
+            let mut total = self
+                .remote_bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(held) = total.as_mut() {
+                *held = held.saturating_sub(size);
+            }
+        } else {
             self.refund(&record.uploaded_by, record.size);
         }
         if record.hash.is_empty() {
@@ -1046,6 +1154,28 @@ impl Media {
             }
         }
         Ok(purged)
+    }
+
+    /// Whether `media_id` is quarantined. Anything that removes media to
+    /// save space must spare these: the operator holds them as evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn is_quarantined(&self, media_id: &str) -> Result<bool, MediaError> {
+        Ok(self
+            .record(media_id)?
+            .is_some_and(|record| record.quarantined_by.is_some()))
+    }
+
+    /// Whether `media_id` is quarantined or protected, so that no automatic
+    /// path may remove it (see [`Self::delete_unheld`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaError`] if the record cannot be read or decoded.
+    pub fn is_held(&self, media_id: &str) -> Result<bool, MediaError> {
+        Ok(self.record(media_id)?.is_some_and(|record| record.held()))
     }
 
     /// The `mxc://` URI for one of this server's media IDs.

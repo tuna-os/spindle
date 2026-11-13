@@ -15,7 +15,7 @@ use tempfile::TempDir;
 /// One full homeserver on a real TCP listener, named by its own address,
 /// counting every request it is sent.
 struct Instance {
-    _dir: TempDir,
+    dir: TempDir,
     name: String,
     client: reqwest::Client,
     store: Arc<FjallStore>,
@@ -24,6 +24,12 @@ struct Instance {
 
 impl Instance {
     async fn start() -> Instance {
+        Self::start_with("enabled = false", "").await
+    }
+
+    /// `ratelimit` is the body of `[ratelimit]`; `media` the body of
+    /// `[media]`, empty for the defaults.
+    async fn start_with(ratelimit: &str, media: &str) -> Instance {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
@@ -33,7 +39,7 @@ impl Instance {
         // `./data` is the crate's source tree.
         let config = spindle_server::Config::parse(&format!(
             "[server]\nname = \"{name}\"\n[storage]\npath = \"{}\"\n\
-             [ratelimit]\nenabled = false\n\
+             [ratelimit]\n{ratelimit}\n[media]\n{media}\n\
              [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\nretry_base_ms = 50\n",
             dir.path().display(),
         ))
@@ -57,7 +63,7 @@ impl Instance {
             .unwrap();
         });
         Instance {
-            _dir: dir,
+            dir,
             name,
             client: reqwest::Client::new(),
             store,
@@ -583,4 +589,181 @@ async fn purging_the_cache_spares_protected_media_until_it_is_unprotected() {
         json!({ "deleted": 1 }),
         "unprotected, it is removable"
     );
+}
+
+/// Distinct bytes of `len` bytes, so each upload is its own blob.
+fn blob(seed: u8, len: usize) -> Vec<u8> {
+    vec![seed; len]
+}
+
+/// How many blob files the instance's local media directory holds.
+fn blob_files(instance: &Instance) -> usize {
+    fn walk(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() { walk(&path) } else { 1 }
+                })
+                .sum()
+        })
+    }
+    walk(&instance.dir.path().join("media"))
+}
+
+/// A fetch of remote media spends from the asking account's own budget:
+/// one account's flood is refused once the budget is spent, another account
+/// on the same server is not affected, and media already cached stays free.
+#[tokio::test]
+async fn a_remote_media_flood_from_one_account_is_refused_and_others_are_not() {
+    let origin = Instance::start().await;
+    // Burst of 3 and a refill too slow to matter inside the test.
+    let mirror =
+        Instance::start_with("remote_media = { per_second = 0.0001, burst = 3 }", "").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let carol = mirror.register("carol").await;
+    let mut ids = Vec::new();
+    for seed in 1..=6_u8 {
+        ids.push(
+            origin
+                .upload(&alice, "application/octet-stream", "f.bin", &blob(seed, 64))
+                .await,
+        );
+    }
+
+    let mut statuses = Vec::new();
+    for id in &ids {
+        statuses.push(mirror.download(&bob, &origin.name, id).await.0);
+    }
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 200).count(),
+        3,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 429).count(),
+        3,
+        "{statuses:?}"
+    );
+
+    // The refusal is the spec's rate-limit error.
+    let response = mirror
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/download/{}/{}",
+            mirror.name, origin.name, ids[5]
+        ))
+        .header("authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 429);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+
+    // Cached media costs nothing to read, budget or no budget.
+    let (status, _, _) = mirror.download(&bob, &origin.name, &ids[0]).await;
+    assert_eq!(status, 200, "a cache hit spends nothing");
+
+    // Another account has its own budget.
+    let (status, _, _) = mirror.download(&carol, &origin.name, &ids[5]).await;
+    assert_eq!(status, 200, "carol is not limited by bob's flood");
+}
+
+/// The remote cache holds to its byte cap, oldest first, and an eviction
+/// removes the record and the bytes together.
+#[tokio::test]
+async fn the_remote_cache_evicts_oldest_first_rows_and_bytes_together() {
+    let origin = Instance::start().await;
+    // Room for two 1000-byte items, not three.
+    let mirror = Instance::start_with("enabled = false", "remote_cache_max_bytes = 2500").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    let mut ids = Vec::new();
+    for seed in 1..=3_u8 {
+        ids.push(
+            origin
+                .upload(
+                    &alice,
+                    "application/octet-stream",
+                    "f.bin",
+                    &blob(seed, 1000),
+                )
+                .await,
+        );
+    }
+
+    for (index, id) in ids.iter().enumerate() {
+        let (status, _, _) = mirror.download(&bob, &origin.name, id).await;
+        assert_eq!(status, 200);
+        if index == 1 {
+            assert_eq!(blob_files(&mirror), 2, "both fit");
+        }
+        // Records are ordered by the millisecond they arrived.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Only cached items answer on the legacy route, which never fetches:
+    // the record is the oldest's, gone; the two newest remain.
+    let cached = |id: &str| format!("/_matrix/media/v3/download/{}/{id}", origin.name);
+    assert_eq!(mirror.get(&cached(&ids[0])).await.0, 404, "oldest evicted");
+    assert_eq!(mirror.get(&cached(&ids[1])).await.0, 200);
+    assert_eq!(mirror.get(&cached(&ids[2])).await.0, 200);
+    assert_eq!(blob_files(&mirror), 2, "the evicted item's bytes are gone");
+}
+
+/// The size cap never removes a quarantined item, even when it is the
+/// oldest and the cache is over its cap: the operator holds it as evidence.
+#[tokio::test]
+async fn the_remote_cap_never_evicts_quarantined_media() {
+    let origin = Instance::start().await;
+    let mirror = Instance::start_with("enabled = false", "remote_cache_max_bytes = 2500").await;
+    let alice = origin.register("alice").await;
+    let bob = mirror.register("bob").await;
+    mirror.promote("bob");
+    let mut ids = Vec::new();
+    for seed in 1..=4_u8 {
+        ids.push(
+            origin
+                .upload(
+                    &alice,
+                    "application/octet-stream",
+                    "f.bin",
+                    &blob(seed, 1000),
+                )
+                .await,
+        );
+    }
+
+    // The oldest cached item is quarantined before the cache fills.
+    let (status, _, _) = mirror.download(&bob, &origin.name, &ids[0]).await;
+    assert_eq!(status, 200);
+    let (status, body) = mirror
+        .admin_post(
+            &bob,
+            &format!(
+                "/_synapse/admin/v1/media/quarantine/{}/{}",
+                origin.name, ids[0]
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    for id in &ids[1..] {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (status, _, _) = mirror.download(&bob, &origin.name, id).await;
+        assert_eq!(status, 200);
+    }
+
+    let held = |id: &str| {
+        let key = spindle_core::keys::media(&format!("{}/{id}", origin.name));
+        spindle_store::ReadView::get(mirror.store.as_ref(), &key)
+            .unwrap()
+            .is_some()
+    };
+    assert!(held(&ids[0]), "the quarantined item is kept");
+    assert!(!held(&ids[1]), "older unquarantined items went instead");
+    assert!(!held(&ids[2]));
+    assert!(held(&ids[3]), "the item just written stays");
 }
