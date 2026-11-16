@@ -1752,10 +1752,10 @@ fn sliding_departed_entry(
         crate::sliding::Summary {
             name,
             avatar,
-            joined_count: 0,
-            invited_count: 0,
+            joined_count: Some(0),
+            invited_count: Some(0),
             heroes: Vec::new(),
-            bump_stamp: departure.ts,
+            bump_stamp: Some(departure.ts),
             is_dm: false,
         },
         required_state,
