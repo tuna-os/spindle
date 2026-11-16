@@ -1075,34 +1075,34 @@ fn sliding_invite_entry(
         .stripped_state(room_id, &identity.user_id)
         .map_err(room_error)?;
     let mut entry = serde_json::Map::new();
-    if let Some(name) = events
+    let name = events
         .iter()
         .find(|event| event["type"] == "m.room.name")
-        .and_then(|event| event["content"]["name"].as_str())
-    {
+        .and_then(|event| crate::sliding::room_name(&event["content"]));
+    if let Some(name) = name {
         entry.insert("name".to_owned(), json!(name));
+    } else {
+        // Only a room with no name is named by its heroes (MSC4186).
+        let heroes: Vec<Value> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "m.room.member"
+                    && event["state_key"] != json!(identity.user_id)
+                    && event["content"]["membership"] == "join"
+            })
+            .filter_map(|event| {
+                Some(crate::sliding::hero_entry(
+                    event["state_key"].as_str()?,
+                    event["content"]["displayname"].as_str(),
+                    event["content"]["avatar_url"].as_str(),
+                ))
+            })
+            .take(5)
+            .collect();
+        if !heroes.is_empty() {
+            entry.insert("heroes".to_owned(), Value::Array(heroes));
+        }
     }
-    let heroes: Vec<Value> = events
-        .iter()
-        .filter(|event| {
-            event["type"] == "m.room.member"
-                && event["state_key"] != json!(identity.user_id)
-                && event["content"]["membership"] == "join"
-        })
-        .take(5)
-        .map(|event| {
-            let mut hero = serde_json::Map::new();
-            hero.insert("user_id".to_owned(), event["state_key"].clone());
-            if let Some(name) = event["content"]["displayname"].as_str() {
-                hero.insert("name".to_owned(), json!(name));
-            }
-            if let Some(avatar) = event["content"]["avatar_url"].as_str() {
-                hero.insert("avatar".to_owned(), json!(avatar));
-            }
-            Value::Object(hero)
-        })
-        .collect();
-    entry.insert("heroes".to_owned(), Value::Array(heroes));
     entry.insert("invite_state".to_owned(), Value::Array(events));
     entry.insert(
         "bump_stamp".to_owned(),
@@ -1346,7 +1346,7 @@ fn sliding_room_entry(
         .rooms
         .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
+        .and_then(|content| crate::sliding::room_name(&content));
     let (timeline, changed_ids) = sliding_timeline(state, identity, room)?;
     let state_events = if let (crate::sliding::Need::Since { widened, .. }, Some(changed_ids)) =
         (room.need, &changed_ids)
@@ -1369,7 +1369,11 @@ fn sliding_room_entry(
         .state_event_unscoped(room_id, "m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
-    let heroes = crate::sliding::heroes(&roster.heroes, &identity.user_id);
+    let heroes = if name.is_none() {
+        crate::sliding::heroes(&roster.heroes, &identity.user_id)
+    } else {
+        Vec::new()
+    };
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms
