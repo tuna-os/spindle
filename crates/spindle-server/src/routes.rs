@@ -642,41 +642,176 @@ pub(crate) fn ruleset_of(
         ))
 }
 
-/// The device-list changes in `(since, until]` that `identity` may see.
+/// The `device_lists` of a sync: who to query keys for again, and who to
+/// stop tracking.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeviceListUpdates {
+    pub changed: Vec<String>,
+    pub left: Vec<String>,
+}
+
+impl DeviceListUpdates {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.left.is_empty()
+    }
+}
+
+/// The asker's rooms, as a caller of [`device_list_updates`] read them.
+#[derive(Clone, Copy)]
+pub(crate) struct KnownRooms<'a> {
+    pub joined: &'a [String],
+    /// Departed rooms: every one, or at least each that had an event in the
+    /// window, since only a departure in the window is news.
+    pub departed: &'a [String],
+}
+
+/// The device-list updates in `(since, until]` for `identity`, as Synapse
+/// computes them (#904).
+///
+/// `changed` is everyone who shares a room with the asker and whose keys
+/// changed, and the asker if their own did. It is also everyone who came
+/// into one of the asker's rooms in the window (joined, invited or
+/// knocked, from none of those), and every member of a room the asker
+/// joined in the window. Without that, a client never fetched the keys of
+/// a user who joined its encrypted room, never shared the room key with
+/// that user's devices, and the newcomer could not decrypt a thing.
+///
+/// `left` is everyone who went out of one of the asker's rooms in the
+/// window, and every member of a room the asker left in it, who now shares
+/// no room with the asker. The client stops tracking them. A user who
+/// left one room but shares another is in neither list, as on Synapse.
+///
+/// Like Synapse, every shared room counts, not only encrypted ones: a
+/// client tracks only the users of its encrypted rooms and ignores the
+/// rest. Unlike Synapse, an invitee shares the room too: a client that
+/// shares room keys with invited members (history visibility other than
+/// `joined`) must not be told to stop tracking one. A wrong name in `left`
+/// makes a client drop a user's sessions; one in `changed` costs a key
+/// query.
 ///
 /// The watermark scan names everyone; this narrows it to the asker's own
 /// account plus users they share a room with. Not an optimization — an
 /// unnarrowed list would tell any account which strangers reprovisioned a
 /// device and when, which is surveillance the room graph never granted.
-pub(crate) fn visible_device_changes(
+/// For the same reason a room the asker left is read as it stood when they
+/// left: someone who joined it after that is none of their business.
+///
+/// `known` is the asker's rooms when the caller has already read them:
+/// classic `/sync` has, and reading the membership index again cost a row
+/// per room on every sync (`sync_cost.rs`).
+pub(crate) fn device_list_updates(
     state: &AppState,
     identity: &crate::accounts::Identity,
     since: u64,
     until: u64,
-) -> Result<Vec<String>, MatrixError> {
-    let changed = state
+    known: Option<KnownRooms<'_>>,
+) -> Result<DeviceListUpdates, MatrixError> {
+    let me = identity.user_id.as_str();
+    let read;
+    let known = if let Some(known) = known {
+        known
+    } else {
+        read = state.rooms.joined_and_departed(me).map_err(room_error)?;
+        KnownRooms {
+            joined: &read.0,
+            departed: &read.1,
+        }
+    };
+    let mine: std::collections::HashSet<&str> = known.joined.iter().map(String::as_str).collect();
+    let in_room =
+        |membership: Option<&str>| matches!(membership, Some("join" | "invite" | "knock"));
+    let mut changed = std::collections::BTreeSet::new();
+    let mut gone = std::collections::BTreeSet::new();
+    // Users sure to share a room with the asker: those joined to or
+    // invited to a room of theirs that this looked at anyway. Spares a
+    // membership scan for each of them below.
+    let mut sharing = std::collections::HashSet::new();
+
+    for &room_id in &mine {
+        let moves = state
+            .rooms
+            .membership_moves(room_id, since, until)
+            .map_err(room_error)?;
+        if moves.is_empty() {
+            continue;
+        }
+        let roster = state.rooms.roster(room_id).map_err(room_error)?;
+        sharing.extend(roster.joined.iter().chain(roster.invited.iter()).cloned());
+        for change in moves {
+            let (before, after) = (change.before.as_deref(), change.after.as_deref());
+            if change.user_id == me {
+                // The asker joined in the window: everyone in the room may
+                // be new to them.
+                if before != Some("join") && after == Some("join") {
+                    changed.extend(roster.joined.iter().filter(|user| *user != me).cloned());
+                }
+            } else if in_room(after) && !in_room(before) {
+                changed.insert(change.user_id);
+            } else if in_room(before) && !in_room(after) {
+                gone.insert(change.user_id);
+            }
+        }
+    }
+    for room_id in known.departed {
+        let moves = state
+            .rooms
+            .membership_moves(room_id, since, until)
+            .map_err(room_error)?;
+        let left_now = moves.iter().any(|change| {
+            change.user_id == me
+                && change.before.as_deref() == Some("join")
+                && change.after.as_deref() != Some("join")
+        });
+        if !left_now {
+            continue;
+        }
+        // Everyone the room had joined when the asker left, by the asker's
+        // own read of it, which ends where they left.
+        let Ok(reader) = state.rooms.reader(me, room_id) else {
+            continue;
+        };
+        for member in reader.members().map_err(room_error)? {
+            if member["content"]["membership"] == "join"
+                && let Some(user_id) = member["state_key"].as_str()
+            {
+                gone.insert(user_id.to_owned());
+            }
+        }
+    }
+
+    let shares = |user_id: &str| -> Result<bool, MatrixError> {
+        if sharing.contains(user_id) {
+            return Ok(true);
+        }
+        let joined = state.rooms.joined(user_id).map_err(room_error)?;
+        let invited = state.rooms.invited(user_id).map_err(room_error)?;
+        Ok(joined
+            .iter()
+            .chain(invited.iter())
+            .any(|room_id| mine.contains(room_id.as_str())))
+    };
+    for user_id in state
         .devices
         .device_lists_changed(since, Some(until))
-        .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    if changed.is_empty() {
-        return Ok(changed);
-    }
-    let mine = state.rooms.joined(&identity.user_id).map_err(room_error)?;
-    let mut visible = Vec::new();
-    for user_id in changed {
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
         // One's own changes are always visible: the account that grew a new
         // device is exactly the account whose other devices must hear it,
         // rooms or no rooms.
-        if user_id == identity.user_id {
-            visible.push(user_id);
-            continue;
-        }
-        let theirs = state.rooms.joined(&user_id).map_err(room_error)?;
-        if theirs.iter().any(|room_id| mine.contains(room_id)) {
-            visible.push(user_id);
+        if user_id == me || changed.contains(&user_id) || shares(&user_id)? {
+            changed.insert(user_id);
         }
     }
-    Ok(visible)
+    let mut left = Vec::new();
+    for user_id in gone {
+        if user_id != me && !changed.contains(&user_id) && !shares(&user_id)? {
+            left.push(user_id);
+        }
+    }
+    Ok(DeviceListUpdates {
+        changed: changed.into_iter().collect(),
+        left,
+    })
 }
 
 /// Pre-serialize a value so it can sit beside an already-rendered one.

@@ -1139,6 +1139,69 @@ async fn the_account_data_extension_carries_global_and_room_data() {
     assert_eq!(room_data[0]["type"], "m.tag", "{response}");
 }
 
+/// #904: the E2EE extension's `device_lists` names a user who joins a room
+/// the user is in (`changed`), and wakes the long poll for it; and one who
+/// then shares no room with the user (`left`). Without it, Element X never
+/// fetched the newcomer's keys, and the newcomer could not decrypt.
+#[tokio::test]
+async fn the_e2ee_extension_names_who_comes_to_share_a_room_and_who_leaves() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let henry = harness.register("henry").await;
+    let room = harness.named_room(&alice, "Encrypted").await;
+    let encryption = json!({ "extensions": { "e2ee": { "enabled": true } } });
+    let first = harness.sliding(&alice, None, &encryption).await;
+    let mut poll = encryption;
+    poll["timeout"] = json!(30_000);
+
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        let since = pos(&first);
+        let poll = poll.clone();
+        tokio::spawn(async move { harness.sliding(&alice, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    harness.invite(&room, &alice, "henry").await;
+    harness.join(&room, &henry).await;
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll slept through a newcomer")
+        .unwrap();
+    // The invite alone can answer the poll; the join then follows.
+    let joined = if joined["extensions"]["e2ee"]["device_lists"]["changed"]
+        == json!(["@henry:example.org"])
+    {
+        joined
+    } else {
+        harness
+            .sliding(&alice, Some(&pos(&joined)), &json!({}))
+            .await
+    };
+    assert_eq!(
+        joined["extensions"]["e2ee"]["device_lists"],
+        json!({ "changed": ["@henry:example.org"], "left": [] }),
+        "{joined}"
+    );
+
+    let (status, body) = harness
+        .request(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/leave"),
+            &henry,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    poll["timeout"] = json!(0);
+    let parted = harness.sliding(&alice, Some(&pos(&joined)), &poll).await;
+    assert_eq!(
+        parted["extensions"]["e2ee"]["device_lists"],
+        json!({ "changed": [], "left": ["@henry:example.org"] }),
+        "{parted}"
+    );
+}
+
 #[tokio::test]
 async fn the_receipts_extension_carries_read_receipts_and_keeps_private_ones_private() {
     let harness = Harness::new();
