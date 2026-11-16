@@ -463,8 +463,8 @@ struct SlidingInputs<'a> {
 /// the answer tells the client anything it does not hold: a room, a list
 /// count, or an extension's news. With the E2EE extension on and keys held,
 /// an event in any of the user's rooms is news too. The one-time-key
-/// counts and the account data are in every answer, so being there is not
-/// news: see [`sliding_extensions`].
+/// list counts and one-time-key counts are in every answer, so being there
+/// is not news: see [`sliding_extensions`].
 #[allow(
     clippy::too_many_lines,
     reason = "one answer: what each part says and what the connection then holds"
@@ -523,7 +523,7 @@ fn sliding_answer(
         .keys()
         .map(|name| (name.clone(), json!({ "count": ordered.len() })))
         .collect();
-    let (extensions, receipts_current, typing_current, extension_news) = sliding_extensions(
+    let (extensions, held_current, extension_news) = sliding_extensions(
         state,
         identity,
         &params.extensions,
@@ -533,6 +533,7 @@ fn sliding_answer(
             to_device_since,
             selection: &selection,
             receipts: previous.map(|held| &held.receipts),
+            account_data: previous.map(|held| &held.account_data),
             typing: previous.map(|held| &held.typing),
         },
     )?;
@@ -559,17 +560,22 @@ fn sliding_answer(
         };
         rooms.insert(room_id.clone(), sent);
     }
-    let mut receipts: std::collections::HashMap<String, u64> = previous
-        .map(|held| &held.receipts)
-        .into_iter()
-        .flatten()
-        .filter(|(room_id, _)| visible.contains(room_id.as_str()))
-        .map(|(room_id, at)| (room_id.clone(), *at))
-        .collect();
-    receipts.extend(
-        receipts_current
+    // A room the user can no longer see is forgotten here as above; the
+    // empty string, the global account data, is no room and is kept.
+    let carried = |held: Option<&std::collections::HashMap<String, u64>>, current: Vec<String>| {
+        let mut out: std::collections::HashMap<String, u64> = held
             .into_iter()
-            .map(|room_id| (room_id, position)),
+            .flatten()
+            .filter(|(room_id, _)| room_id.is_empty() || visible.contains(room_id.as_str()))
+            .map(|(room_id, at)| (room_id.clone(), *at))
+            .collect();
+        out.extend(current.into_iter().map(|room_id| (room_id, position)));
+        out
+    };
+    let receipts = carried(previous.map(|held| &held.receipts), held_current.receipts);
+    let account_data = carried(
+        previous.map(|held| &held.account_data),
+        held_current.account_data,
     );
 
     let mut news = previous.is_none_or(|held| held.listed != ordered.len())
@@ -605,7 +611,8 @@ fn sliding_answer(
         params,
         rooms,
         receipts,
-        typing: held_typing(previous, &visible, typing_current),
+        account_data,
+        typing: held_typing(previous, &visible, held_current.typing),
         listed: ordered.len(),
     };
     Ok((body, connection, news))
@@ -802,50 +809,58 @@ struct ExtensionInputs<'a> {
     selection: &'a crate::sliding::Selection,
     /// The receipts the connection holds, by room.
     receipts: Option<&'a std::collections::HashMap<String, u64>>,
+    /// The account data the connection holds, by room, `""` for global.
+    account_data: Option<&'a std::collections::HashMap<String, u64>>,
     /// Who the connection holds as typing, by room.
     typing: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// What the client holds as of the answer's position once it has it, by
+/// extension: the rooms whose receipts it is current to, the rooms (`""`
+/// for global) whose account data it is, and who it holds as typing in the
+/// typing extension's rooms.
+#[derive(Default)]
+struct HeldCurrent {
+    receipts: Vec<String>,
+    account_data: Vec<String>,
+    typing: TypingCurrent,
 }
 
 /// Who is typing in each room of the typing extension's scope, as the
 /// client holds it once it has the answer.
 type TypingCurrent = Vec<(String, Vec<String>)>;
 
-/// The `extensions` object of a sliding-sync response, the rooms whose
-/// receipts the client is current to once it has it, who it then holds as
-/// typing in the typing extension's rooms, and whether any extension has
-/// news since the connection's previous response.
+/// The `extensions` object of a sliding-sync response, what the client
+/// holds as current once it has it, and whether any extension has news
+/// since the connection's previous response.
 ///
 /// Each room extension speaks about its own scope (see
-/// [`crate::sliding::RoomExtension::scope`]). The account data extension
-/// answers for every room in its scope, changed or not: repeating a
-/// scope's worth is the answer that cannot silently drop one -- the same
-/// trade classic sync makes for room account data. So whether account data
-/// is news is asked of its stream marks rather than of what the extension
-/// sends. Typing has no stream position to ask "since" from, so the
-/// connection holds who it last said was typing, and the extension sends
-/// the rooms where that changed. Receipts
-/// bump the stream too (`Rooms::mark_receipt`), and their extension is
-/// incremental: see [`receipts_extension`].
+/// [`crate::sliding::RoomExtension::scope`]). Receipts and account data
+/// bump the stream (`Rooms::mark_receipt`, and the account-data stream
+/// marks), and their extensions are incremental: see [`receipts_extension`]
+/// and [`account_data_extension`]. Typing has no stream position to ask
+/// "since" from, so the connection holds who it last said was typing, and
+/// the extension sends the rooms where that changed.
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
     inputs: ExtensionInputs<'_>,
-) -> Result<(Value, Vec<String>, TypingCurrent, ExtensionNews), MatrixError> {
+) -> Result<(Value, HeldCurrent, ExtensionNews), MatrixError> {
     let ExtensionInputs {
         since,
         position,
         to_device_since,
         selection,
         receipts,
+        account_data,
         typing,
     } = inputs;
     let mut out = serde_json::Map::new();
-    let mut receipts_current = Vec::new();
-    let mut typing_current = Vec::new();
+    let mut current = HeldCurrent::default();
     let mut news = ExtensionNews::default();
     if !extensions.any() {
-        return Ok((Value::Object(out), receipts_current, typing_current, news));
+        return Ok((Value::Object(out), current, news));
     }
 
     if extensions.to_device.on() {
@@ -869,15 +884,13 @@ fn sliding_extensions(
         let scope = extensions
             .account_data
             .scope(&selection.windows, &selection.subscribed);
-        out.insert(
-            "account_data".to_owned(),
-            account_data_extension(state, identity, &scope)?,
-        );
-        if let Some(since) = since
-            && !news.news
-        {
-            news.news = account_data_moved(state, identity, &scope, since, position)?;
-        }
+        let (body, any) = account_data_extension(state, identity, &scope, account_data, position)?;
+        news.news |= any;
+        out.insert("account_data".to_owned(), body);
+        current.account_data = std::iter::once("")
+            .chain(scope)
+            .map(str::to_owned)
+            .collect();
     }
     if extensions.receipts.on() {
         let scope = extensions
@@ -886,7 +899,7 @@ fn sliding_extensions(
         let (receipts, any) = receipts_extension(state, identity, &scope, receipts, position)?;
         news.news |= any;
         out.insert("receipts".to_owned(), receipts);
-        receipts_current = scope.into_iter().map(str::to_owned).collect();
+        current.receipts = scope.into_iter().map(str::to_owned).collect();
     }
     if extensions.typing.on() {
         // A room goes out when who is typing in it differs from what the
@@ -909,13 +922,13 @@ fn sliding_extensions(
                     json!({ "type": "m.typing", "content": { "user_ids": users } }),
                 );
             }
-            typing_current.push((room_id.to_owned(), users));
+            current.typing.push((room_id.to_owned(), users));
         }
         news.news |= !rooms.is_empty();
         out.insert("typing".to_owned(), json!({ "rooms": rooms }));
     }
 
-    Ok((Value::Object(out), receipts_current, typing_current, news))
+    Ok((Value::Object(out), current, news))
 }
 
 /// Whether typing in a room the connection may speak about differs from
@@ -930,24 +943,6 @@ fn typing_differs(typing: &crate::typing::Typing, held: &crate::sliding::Connect
         || typing.rooms_active().into_iter().any(|(room_id, users)| {
             held.rooms.contains_key(&room_id) && held.typing.get(&room_id) != Some(&users)
         })
-}
-
-/// Whether the global account data, or that of a room in `scope`, changed
-/// in `(since, position]`.
-fn account_data_moved(
-    state: &AppState,
-    identity: &crate::accounts::Identity,
-    scope: &std::collections::BTreeSet<&str>,
-    since: u64,
-    position: u64,
-) -> Result<bool, MatrixError> {
-    let moved = state
-        .account_data
-        .rooms_changed_between(&identity.user_id, since, position)
-        .map_err(|error| account_data_error(&error))?;
-    Ok(moved
-        .iter()
-        .any(|room_id| room_id.is_empty() || scope.contains(room_id.as_str())))
 }
 
 /// The to-device extension: what is pending for this device, acknowledged
@@ -1025,25 +1020,39 @@ fn e2ee_extension(
     ))
 }
 
-/// The account-data extension: the global events, and each room in scope
-/// that has any.
+/// The account-data extension, and whether it says anything: the global
+/// events, and each room in scope that has any.
+///
+/// Incremental once the connection holds them, as Synapse sends it (#903):
+/// sending every event in every answer cost bandwidth, and the client
+/// processed its DMs and push rules again on each one. The global events,
+/// or a room's, that the connection does not hold -- its first answer, or
+/// the first time a room is in the extension's scope -- go in full: so a
+/// room coming into view is not left without its tags, which is what
+/// sending a scope's worth every time was for. After that, the types that
+/// changed since the client was last current for them, which for a room
+/// back in scope after an absence is further back than the previous answer.
 fn account_data_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     scope: &std::collections::BTreeSet<&str>,
-) -> Result<Value, MatrixError> {
-    let global = sync_account_data(state, identity, None, None, state.rooms.stream_position())?;
+    held: Option<&std::collections::HashMap<String, u64>>,
+    position: u64,
+) -> Result<(Value, bool), MatrixError> {
+    let held_since = |room_id: &str| held.and_then(|held| held.get(room_id)).copied();
+    let global = sync_account_data(state, identity, None, held_since(""), position)?;
     let mut rooms = serde_json::Map::new();
     for &room_id in scope {
         let data = state
             .account_data
-            .all(&identity.user_id, room_id)
+            .between(&identity.user_id, room_id, held_since(room_id), position)
             .map_err(|error| account_data_error(&error))?;
         if !data.is_empty() {
             rooms.insert(room_id.to_owned(), Value::Array(data));
         }
     }
-    Ok(json!({ "global": global, "rooms": rooms }))
+    let any = !global.is_empty() || !rooms.is_empty();
+    Ok((json!({ "global": global, "rooms": rooms }), any))
 }
 
 /// The receipts extension: one `m.receipt` event per room in scope that has
