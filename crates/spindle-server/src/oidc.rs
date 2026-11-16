@@ -398,8 +398,7 @@ fn redirect_scheme_allowed(uri: &str) -> bool {
 /// trusted name in front of the person who reads it. The legacy SSO
 /// redirect refuses the same thing (`upstream.rs`).
 fn carries_credentials(uri: &str) -> bool {
-    reqwest::Url::parse(uri)
-        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
+    reqwest::Url::parse(uri).is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
 }
 
 fn load_client(state: &AppState, client_id: &str) -> Result<Option<ClientRecord>, MatrixError> {
