@@ -124,10 +124,30 @@ type MemberIds = ([u8; 32], Arc<Roster>);
 pub struct Roster {
     pub joined: Arc<Vec<String>>,
     pub invited: Arc<Vec<String>>,
-    /// Up to six members, joined first then invited, in state order: one
-    /// more than the five heroes a room shows, so the viewer can be left
-    /// out and five remain.
+    /// Up to six members, joined first then invited, each in the order
+    /// their member events reached the room: one more than the five heroes
+    /// a room shows, so the viewer can be left out and five remain. The
+    /// order is Synapse's (its room summary sorts by stream ordering), so a
+    /// client names an unnamed room alike on both servers.
     pub heroes: Vec<Hero>,
+}
+
+/// Keep `hero` among `candidates` if it is one of the six members whose
+/// member events came first: the [`Roster::heroes`] of one membership.
+/// Built only when it is kept, so a large room renders six profiles.
+fn keep_earliest(candidates: &mut Vec<(i64, Hero)>, li: i64, hero: impl FnOnce() -> Hero) {
+    const HEROES: usize = 6;
+    if candidates.len() < HEROES {
+        candidates.push((li, hero()));
+        return;
+    }
+    if let Some(latest) = candidates
+        .iter_mut()
+        .max_by_key(|(held, _)| *held)
+        .filter(|(held, _)| li < *held)
+    {
+        *latest = (li, hero());
+    }
 }
 
 /// One member as a room-list row shows them: the name and avatar from
@@ -2362,7 +2382,14 @@ impl Rooms {
             let members = current_state(log)
                 .into_iter()
                 .filter(|(key, _)| key.event_type().as_str() == "m.room.member")
-                .map(|(key, event_id)| (key.state_key().to_owned(), event_id))
+                .map(|(key, event_id)| {
+                    // Where the member event sits in the room: state is
+                    // keyed by user ID, and the heroes go in arrival order.
+                    let li = log
+                        .get(&EventId::new(event_id.as_str()))
+                        .map_or(i64::MAX, |entry| entry.li.get());
+                    (key.state_key().to_owned(), event_id, li)
+                })
                 .collect::<Vec<_>>();
             Ok((root, members))
         })?;
@@ -2373,7 +2400,7 @@ impl Rooms {
         let mut invited = Vec::new();
         let mut invited_heroes = Vec::new();
         let mut heroes = Vec::new();
-        for (user_id, event_id) in members {
+        for (user_id, event_id, li) in members {
             // `read_event`, not `event`: the room's existence is already
             // established above, and `event` re-proves it under the room
             // lock once per member.
@@ -2385,21 +2412,23 @@ impl Rooms {
             };
             match event["content"]["membership"].as_str() {
                 Some(JOIN_STR) => {
-                    if heroes.len() < 6 {
-                        heroes.push(hero());
-                    }
+                    keep_earliest(&mut heroes, li, hero);
                     joined.push(user_id);
                 }
                 Some(INVITE_STR) => {
-                    if invited_heroes.len() < 6 {
-                        invited_heroes.push(hero());
-                    }
+                    keep_earliest(&mut invited_heroes, li, hero);
                     invited.push(user_id);
                 }
                 _ => {}
             }
         }
-        heroes.extend(invited_heroes);
+        heroes.sort_unstable_by_key(|(li, _)| *li);
+        invited_heroes.sort_unstable_by_key(|(li, _)| *li);
+        let mut heroes: Vec<Hero> = heroes
+            .into_iter()
+            .chain(invited_heroes)
+            .map(|(_, hero)| hero)
+            .collect();
         heroes.truncate(6);
         let roster = Arc::new(Roster {
             joined: Arc::new(joined),
@@ -9936,6 +9965,30 @@ mod warm_order_tests {
                 "!mid",
                 "!idle-small"
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod hero_order_tests {
+    use super::{Hero, keep_earliest};
+
+    #[test]
+    fn the_heroes_are_the_six_members_who_came_first() {
+        let mut kept = Vec::new();
+        for li in [9, 3, 8, 1, 7, 6, 2, 5, 4] {
+            keep_earliest(&mut kept, li, || Hero {
+                user_id: format!("@{li}:x"),
+                displayname: None,
+                avatar_url: None,
+            });
+        }
+        let mut order: Vec<i64> = kept.iter().map(|(li, _)| *li).collect();
+        order.sort_unstable();
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6]);
+        assert!(
+            kept.iter()
+                .all(|(li, hero)| hero.user_id == format!("@{li}:x"))
         );
     }
 }

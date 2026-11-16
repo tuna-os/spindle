@@ -1359,6 +1359,15 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/avatar_url",
+            &bob,
+            &json!({ "avatar_url": "mxc://example.org/bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
         .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1395,10 +1404,21 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         vec!["@bob:example.org", "@carol:example.org"],
         "{entry}"
     );
-    assert_eq!(heroes[0]["name"], json!("Bob"), "{entry}");
-    assert!(
-        heroes[1].get("name").is_none(),
-        "carol never set one: {entry}"
+    // MSC4186's `Hero` keys, the member event's own: ruma reads no others
+    // (#899).
+    assert_eq!(
+        heroes[0],
+        json!({
+            "user_id": "@bob:example.org",
+            "displayname": "Bob",
+            "avatar_url": "mxc://example.org/bob",
+        }),
+        "{entry}"
+    );
+    assert_eq!(
+        heroes[1],
+        json!({ "user_id": "@carol:example.org" }),
+        "carol never set a name or an avatar: {entry}"
     );
 
     // The bump stamp is the newest event's timestamp, so it moves when the
@@ -1415,6 +1435,68 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         .unwrap();
     assert_eq!(before, newest, "{entry}");
     drop(carol);
+}
+
+#[tokio::test]
+async fn heroes_name_only_a_room_without_a_name() {
+    // MSC4186 sends heroes only for a room with no `m.room.name`, and
+    // Synapse leaves them out of a named room. An empty name is no name,
+    // as the spec's `m.room.name` says. The heroes come in the order the
+    // members joined, as Synapse's room summary orders them, so a client
+    // names the room alike on both servers.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let zoe = harness.register("zoe").await;
+    let bob = harness.register("bob").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/displayname",
+            &bob,
+            &json!({ "displayname": "Bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    harness.invite(&room, &alice, "zoe").await;
+    harness.join(&room, &zoe).await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let name = |name: &'static str| {
+        let (harness, room, alice) = (&harness, &room, &alice);
+        async move {
+            let (status, body) = harness
+                .request(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+                    alice,
+                    &json!({ "name": name }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let response = harness.sliding(alice, None, &window()).await;
+            response["rooms"][room].clone()
+        }
+    };
+
+    let entry = name("the reading circle").await;
+    assert_eq!(entry["name"], json!("the reading circle"), "{entry}");
+    assert!(entry.get("heroes").is_none(), "{entry}");
+
+    let entry = name("").await;
+    assert!(entry.get("name").is_none(), "{entry}");
+    assert_eq!(
+        entry["heroes"],
+        json!([
+            { "user_id": "@zoe:example.org" },
+            { "user_id": "@bob:example.org", "displayname": "Bob" },
+        ]),
+        "{entry}"
+    );
 }
 
 #[tokio::test]
@@ -1460,16 +1542,9 @@ async fn an_invite_is_a_room_in_the_list() {
         "an invitee gets no timeline: {entry}"
     );
     assert!(entry.get("joined_count").is_none(), "nor counts: {entry}");
-    let ids: Vec<&str> = entry["heroes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|hero| hero["user_id"].as_str())
-        .collect();
-    assert_eq!(
-        ids,
-        vec!["@alice:example.org"],
-        "the inviter is the hero: {entry}"
+    assert!(
+        entry.get("heroes").is_none(),
+        "a named room needs no heroes: {entry}"
     );
 
     // On an initial request the invite is there too, sorted with the rest.

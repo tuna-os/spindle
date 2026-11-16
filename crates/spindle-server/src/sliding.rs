@@ -1229,8 +1229,8 @@ pub fn wants_state(
 }
 
 /// MSC4186 `heroes`: up to five members other than `viewer`, each as
-/// `{user_id, name?, avatar?}` from their own member event. Six candidates
-/// come in so that leaving the viewer out still leaves five.
+/// `{user_id, displayname?, avatar_url?}` from their own member event. Six
+/// candidates come in so that leaving the viewer out still leaves five.
 #[must_use]
 pub fn heroes(candidates: &[crate::rooms::Hero], viewer: &str) -> Vec<Value> {
     candidates
@@ -1238,17 +1238,45 @@ pub fn heroes(candidates: &[crate::rooms::Hero], viewer: &str) -> Vec<Value> {
         .filter(|hero| hero.user_id != viewer)
         .take(5)
         .map(|hero| {
-            let mut entry = Map::new();
-            entry.insert("user_id".to_owned(), json!(hero.user_id));
-            if let Some(name) = &hero.displayname {
-                entry.insert("name".to_owned(), json!(name));
-            }
-            if let Some(avatar) = &hero.avatar_url {
-                entry.insert("avatar".to_owned(), json!(avatar));
-            }
-            Value::Object(entry)
+            hero_entry(
+                &hero.user_id,
+                hero.displayname.as_deref(),
+                hero.avatar_url.as_deref(),
+            )
         })
         .collect()
+}
+
+/// One MSC4186 `Hero`, with only the fields its member event has.
+///
+/// The keys are the member event's own, as MSC4186's `Hero` and ruma's
+/// `SlidingSyncRoomHero` spell them, and matrix-rust-sdk reads no others.
+/// A hero sent as `name` reached the client with no name, so it named the
+/// room from whichever member events it had loaded, and the name changed
+/// as more of them loaded (#899).
+#[must_use]
+pub fn hero_entry(user_id: &str, displayname: Option<&str>, avatar_url: Option<&str>) -> Value {
+    let mut entry = Map::new();
+    entry.insert("user_id".to_owned(), json!(user_id));
+    if let Some(name) = displayname {
+        entry.insert("displayname".to_owned(), json!(name));
+    }
+    if let Some(avatar) = avatar_url {
+        entry.insert("avatar_url".to_owned(), json!(avatar));
+    }
+    Value::Object(entry)
+}
+
+/// A room's name for a room-list row: the `name` of its `m.room.name`, if
+/// that is a string that is not empty. The spec treats an empty or absent
+/// name as no name, and a room with no name is the one MSC4186 sends
+/// heroes for.
+#[must_use]
+pub fn room_name(content: &Value) -> Option<String> {
+    content["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 /// Clip `ranges` to a list of `len` rooms, yielding the indices in view.
@@ -1302,7 +1330,9 @@ pub struct Summary {
     pub avatar: Option<String>,
     pub joined_count: usize,
     pub invited_count: usize,
-    /// Up to five members other than the viewer, joined first.
+    /// Up to five members other than the viewer, joined first. Empty for
+    /// a room with a name: MSC4186 sends heroes only to name a room that
+    /// has none, and Synapse leaves them out.
     pub heroes: Vec<Value>,
     /// The room's recency, comparable across rooms: the timestamp of its
     /// newest event. A client sorts its list by this without a timeline.
@@ -1325,7 +1355,9 @@ pub fn room_entry(
     if let Some(avatar) = summary.avatar {
         entry.insert("avatar".to_owned(), json!(avatar));
     }
-    entry.insert("heroes".to_owned(), Value::Array(summary.heroes));
+    if !summary.heroes.is_empty() {
+        entry.insert("heroes".to_owned(), Value::Array(summary.heroes));
+    }
     entry.insert("invited_count".to_owned(), json!(summary.invited_count));
     entry.insert("bump_stamp".to_owned(), json!(summary.bump_stamp));
     entry.insert("required_state".to_owned(), Value::Array(required_state));
