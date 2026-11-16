@@ -698,7 +698,13 @@ async fn an_incremental_entry_leaves_out_what_did_not_change() {
 
     let first = harness.sliding(&alice, None, &window()).await;
     let entry = &first["rooms"][&room];
-    for field in ["name", "avatar", "joined_count", "invited_count", "bump_stamp"] {
+    for field in [
+        "name",
+        "avatar",
+        "joined_count",
+        "invited_count",
+        "bump_stamp",
+    ] {
         assert!(entry.get(field).is_some(), "sent in full: {field}: {first}");
     }
     assert!(first["rooms"][&unnamed].get("heroes").is_some(), "{first}");
@@ -741,9 +747,7 @@ async fn an_incremental_entry_leaves_out_what_did_not_change() {
     harness.invite(&room, &alice, "bob").await;
     harness.join(&room, &bob).await;
     harness.invite(&unnamed, &alice, "carol").await;
-    let fourth = harness
-        .sliding(&alice, Some(&pos(&third)), &window())
-        .await;
+    let fourth = harness.sliding(&alice, Some(&pos(&third)), &window()).await;
     let entry = &fourth["rooms"][&room];
     assert_eq!(entry["joined_count"], json!(2), "{fourth}");
     assert_eq!(entry["invited_count"], json!(0), "{fourth}");

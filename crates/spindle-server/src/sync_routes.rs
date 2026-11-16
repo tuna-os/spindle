@@ -1504,13 +1504,7 @@ fn sliding_timeline(
     state: &AppState,
     identity: &crate::accounts::Identity,
     render: &RoomRender<'_>,
-) -> Result<
-    (
-        crate::sliding::Timeline,
-        Option<HeldRange>,
-    ),
-    MatrixError,
-> {
+) -> Result<(crate::sliding::Timeline, Option<HeldRange>), MatrixError> {
     let RoomRender {
         room_id,
         config,
@@ -1834,8 +1828,12 @@ fn sliding_room_entry(
     };
     let name_changed = changed("m.room.name");
     let avatar_changed = changed("m.room.avatar");
-    let members_changed = held_range.as_ref().is_none_or(|range| range.members_changed);
-    let has_events = held_range.as_ref().is_none_or(|range| !range.ids.is_empty());
+    let members_changed = held_range
+        .as_ref()
+        .is_none_or(|range| range.members_changed);
+    let has_events = held_range
+        .as_ref()
+        .is_none_or(|range| !range.ids.is_empty());
     let avatar = if avatar_changed {
         state
             .rooms
