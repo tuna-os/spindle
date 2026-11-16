@@ -254,7 +254,7 @@ struct SlidingQuery {
 
 /// MSC4186's answer to a `pos` this server does not hold, which a client
 /// handles by dropping it and starting the connection over: one the
-/// connection retired or expired, one a restart forgot, one issued to
+/// connection retired or expired, one a crash lost, one issued to
 /// another device or connection, and the one a client kept from the
 /// homeserver this one replaced. Anything else -- a 400 `M_BAD_JSON` -- is
 /// an error a client retries with the same `pos`, forever.

@@ -117,7 +117,8 @@ pub struct AppState {
     pub key: Arc<signing::ServerKey>,
     pub rooms: Arc<rooms::Rooms>,
     pub typing: Arc<typing::Typing>,
-    /// Sliding-sync connections (MSC4186), in memory: `sliding.rs` says why.
+    /// Sliding-sync connections (MSC4186): in memory, with a copy in the
+    /// store that a restart resumes from. `sliding.rs` says how.
     pub sliding: Arc<sliding::Connections>,
     pub account_data: Arc<account_data::AccountData>,
     pub directory: Arc<directory::Directory>,
@@ -567,7 +568,7 @@ fn app_state_with(
         key,
         rooms,
         typing: Arc::new(typing::Typing::new()),
-        sliding: Arc::new(sliding::Connections::new()),
+        sliding: sliding::Connections::start(&store_for_sfu).map_err(AppError::Store)?,
         account_data,
         directory,
         filters: Arc::new(filters::Filters::new(Arc::clone(&store_for_filters))),

@@ -593,6 +593,20 @@ pub enum Keyspace {
     /// gap-backfill loop retries each until it is applied or given up on,
     /// so the newest event of a room that then goes quiet is not lost.
     OwedEvent = 0x4b,
+    /// `(user_id, device_id, conn_id)` -> what one Simplified Sliding Sync
+    /// (MSC4186) connection held at its newest positions (#897): a format
+    /// byte, then JSON. The server's memory is the hot path, and this row
+    /// is how a connection survives a restart or a long idle. It is written
+    /// behind the requests, so it can lag them. A missing or unreadable row
+    /// only costs the client one initial response, as before.
+    SlidingConnection = 0x4c,
+    /// `(user_id, device_id, conn_id)` -> when the connection's row was last
+    /// written, in Unix milliseconds (big-endian `u64`).
+    ///
+    /// Apart from [`Self::SlidingConnection`] so that a start reads eight
+    /// bytes for each stored connection, not its whole room record, to know
+    /// which rows exist and which have expired.
+    SlidingConnectionUsed = 0x4d,
     /// `(room_id, synapse_stream_ordering)` -> the linear index the
     /// importer gave that event (#568). Lets a Synapse pagination token
     /// a client kept across the migration name a place in this room.
@@ -1578,6 +1592,36 @@ pub fn device_scoped(keyspace: Keyspace, user_id: &str, device_id: &str, suffix:
     key.extend_from_slice(device);
     key.extend_from_slice(suffix);
     key
+}
+
+/// The row of one sliding-sync connection in `keyspace`, which is
+/// [`Keyspace::SlidingConnection`] or [`Keyspace::SlidingConnectionUsed`].
+/// The `conn_id` is the suffix, so it needs no length.
+#[must_use]
+pub fn sliding_connection(
+    keyspace: Keyspace,
+    user_id: &str,
+    device_id: &str,
+    conn_id: &str,
+) -> Vec<u8> {
+    device_scoped(keyspace, user_id, device_id, conn_id.as_bytes())
+}
+
+/// `(user_id, device_id, conn_id)` from a key [`sliding_connection`] built.
+#[must_use]
+pub fn sliding_connection_from_key(key: &[u8]) -> Option<(String, String, String)> {
+    let rest = key.get(2..)?;
+    let (user_id, rest) = take_framed(rest)?;
+    let (device_id, rest) = take_framed(rest)?;
+    let conn_id = std::str::from_utf8(rest).ok()?;
+    Some((user_id.to_owned(), device_id.to_owned(), conn_id.to_owned()))
+}
+
+/// One length-framed string from the front of `bytes`, and the rest.
+fn take_framed(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    let length = usize::from(u16::from_be_bytes([*bytes.first()?, *bytes.get(1)?]));
+    let value = std::str::from_utf8(bytes.get(2..2 + length)?).ok()?;
+    Some((value, bytes.get(2 + length..)?))
 }
 
 /// `(user_id, version)` key for [`Keyspace::KeyBackup`].

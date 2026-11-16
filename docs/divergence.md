@@ -250,6 +250,25 @@ after the join wrote.
 
 conduwuit-lineage servers do not ask for partial joins.
 
+### 4.10 Sliding-sync connections written behind (`server/src/sliding.rs`)
+
+The server keeps each MSC4186 connection in memory, and a copy of it in
+the store (#897). A request reads and writes only the memory. Every 15
+seconds, one batch writes the connections that changed. A graceful stop
+writes the remaining changes. A `pos` that the memory does not hold comes
+from the store.
+
+Thus a client keeps its connection across a restart, and its room list does
+not reload. A connection stays for seven days without a request, and stays
+in memory for one hour of them.
+
+**Siblings:** Synapse writes each connection to its database in the
+request that changes it, and keeps it for seven days. Spindle does not
+write in the request, because the room record is large and a long-poll
+answers every few seconds. The cost is a crash: a client that holds a
+`pos` from the last 15 seconds before the crash gets `M_UNKNOWN_POS`, and
+starts its connection again. Before #897, every restart had that cost.
+
 ## 5. What we take from the siblings without taking their code
 
 Tuwunel and continuwuity have run real Matrix traffic; we have not. Their
