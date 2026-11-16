@@ -1370,7 +1370,7 @@ fn sliding_room_entry(
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
     let heroes = crate::sliding::heroes(&roster.heroes, &identity.user_id);
-    let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
+    let bump_stamp = state.rooms.bump_stamp(room_id).map_err(room_error)?;
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)

@@ -807,7 +807,9 @@ pub struct Summary {
     /// Up to five members other than the viewer, joined first.
     pub heroes: Vec<Value>,
     /// The room's recency, comparable across rooms: the timestamp of its
-    /// newest event. A client sorts its list by this without a timeline.
+    /// newest event of a type MSC4186 counts as activity
+    /// ([`crate::rooms::BUMP_EVENT_TYPES`]). A client sorts its list by this
+    /// without a timeline.
     pub bump_stamp: i64,
 }
 
