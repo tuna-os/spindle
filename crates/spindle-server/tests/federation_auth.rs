@@ -336,10 +336,11 @@ async fn room_as_a_peer_would_see_it() -> Vec<ServerPdu> {
         .map(ServerPdu::parse)
         .collect();
     events.reverse();
-    // create, alice's join, power levels, join rules, name, topic, three
+    // create, alice's join, power levels, join rules, the `private_chat`
+    // preset's history visibility and guest access, name, topic, three
     // messages, then bob invited, joined, left and invited again, then the
     // join rules restricted and carol joining under them.
-    assert_eq!(events.len(), 15, "expected the full room, got {events:?}");
+    assert_eq!(events.len(), 17, "expected the full room, got {events:?}");
     events
 }
 

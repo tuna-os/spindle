@@ -543,8 +543,8 @@ async fn a_stranger_cannot_write_into_someone_elses_room() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // Refused means nothing landed: not the event, and not a linear index
-    // spent on it. Exactly the four events `createRoom` emits plus alice's
-    // one message -- counted rather than filtered, because a refused event
+    // spent on it. Exactly the six events `createRoom` emits (its default
+    // preset is `private_chat`) plus alice's one message -- counted rather than filtered, because a refused event
     // that consumed an index would leave a hole that pagination would then
     // have to explain away.
     let (status, body) = harness
@@ -563,7 +563,7 @@ async fn a_stranger_cannot_write_into_someone_elses_room() {
         senders.iter().all(|sender| *sender == "@alice:example.org"),
         "a refused event was stored anyway: {senders:?}"
     );
-    assert_eq!(chunk.len(), 5, "{body}");
+    assert_eq!(chunk.len(), 7, "{body}");
     assert!(
         body["end"].is_null(),
         "there should be nothing beyond: {body}"
@@ -635,6 +635,139 @@ async fn paginating_a_large_room_costs_what_paginating_a_small_one_does() {
 
     assert!(small.starts_with('t') && large.starts_with('t'));
     assert_ne!(small, large);
+}
+
+/// #906: each preset writes the spec's whole bundle, as Synapse does, and
+/// a request without a preset takes one from its `visibility`.
+#[tokio::test]
+async fn create_room_presets_write_history_visibility_and_guest_access() {
+    let harness = Harness::new();
+    let alice = harness.register().await;
+
+    // (request, join rule, history visibility, guest access); `None` is a
+    // room with no `m.room.guest_access`, which means `forbidden`.
+    let cases = [
+        (
+            json!({ "preset": "private_chat" }),
+            "invite",
+            "shared",
+            Some("can_join"),
+        ),
+        (
+            json!({ "preset": "trusted_private_chat" }),
+            "invite",
+            "shared",
+            Some("can_join"),
+        ),
+        (json!({ "preset": "public_chat" }), "public", "shared", None),
+        (json!({}), "invite", "shared", Some("can_join")),
+        (
+            json!({ "visibility": "private" }),
+            "invite",
+            "shared",
+            Some("can_join"),
+        ),
+        (json!({ "visibility": "public" }), "public", "shared", None),
+        // The client's own initial_state wins, and is not written twice.
+        (
+            json!({
+                "preset": "private_chat",
+                "initial_state": [
+                    { "type": "m.room.history_visibility", "content": { "history_visibility": "joined" } },
+                    { "type": "m.room.guest_access", "content": { "guest_access": "forbidden" } },
+                ],
+            }),
+            "invite",
+            "joined",
+            Some("forbidden"),
+        ),
+    ];
+    for (request, join_rule, history_visibility, guest_access) in cases {
+        let (status, body) = harness
+            .post("/_matrix/client/v3/createRoom", &alice, &request)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{request}: {body}");
+        let room = body["room_id"].as_str().unwrap().to_owned();
+        let (status, state) = harness
+            .get(&format!("/_matrix/client/v3/rooms/{room}/state"), &alice)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        let of = |event_type: &str| -> Vec<Value> {
+            state
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["type"] == event_type)
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            of("m.room.join_rules")[0]["content"]["join_rule"],
+            join_rule,
+            "{request}"
+        );
+        let visibility = of("m.room.history_visibility");
+        assert_eq!(visibility.len(), 1, "{request}: {visibility:?}");
+        assert_eq!(
+            visibility[0]["content"]["history_visibility"], history_visibility,
+            "{request}"
+        );
+        let guest = of("m.room.guest_access");
+        match guest_access {
+            Some(expected) => {
+                assert_eq!(guest.len(), 1, "{request}: {guest:?}");
+                assert_eq!(guest[0]["content"]["guest_access"], expected, "{request}");
+            }
+            None => assert!(guest.is_empty(), "{request}: {guest:?}"),
+        }
+    }
+}
+
+/// Restating a state event that would change nothing -- the same sender,
+/// type, key and content -- answers with the current event and appends
+/// nothing, as on Synapse. Complement's `TestInboundCanReturnMissingEvents`
+/// restates the preset's `shared` history visibility and counts the room's
+/// events.
+#[tokio::test]
+async fn restating_unchanged_state_appends_nothing() {
+    let harness = Harness::new();
+    let alice = harness.register().await;
+    let (status, body) = harness
+        .post(
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            &json!({ "preset": "public_chat" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let count = |body: &Value| body["chunk"].as_array().unwrap().len();
+    let messages = format!("/_matrix/client/v3/rooms/{room}/messages?limit=100");
+    let (_, before) = harness.get(&messages, &alice).await;
+    let path = format!("/_matrix/client/v3/rooms/{room}/state/m.room.history_visibility");
+    let current = before["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "m.room.history_visibility")
+        .unwrap_or_else(|| panic!("the preset's history visibility: {before}"))["event_id"]
+        .clone();
+
+    let (status, body) = harness
+        .put(&path, &alice, &json!({ "history_visibility": "shared" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, after) = harness.get(&messages, &alice).await;
+    assert_eq!(count(&after), count(&before), "{after}");
+    assert_eq!(body["event_id"], current, "the current event: {body}");
+
+    // A change is a change.
+    let (status, _) = harness
+        .put(&path, &alice, &json!({ "history_visibility": "joined" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, changed) = harness.get(&messages, &alice).await;
+    assert_eq!(count(&changed), count(&before) + 1, "{changed}");
 }
 
 #[tokio::test]

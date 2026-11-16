@@ -222,10 +222,16 @@ async fn a_child_only_the_other_server_holds_appears_in_the_hierarchy() {
 
 /// The space's own `m.space.child` events reach B by federation.
 async fn eventually_names(rig: &Rig, query: &str) -> Vec<String> {
+    eventually_at_least(rig, query, 2).await
+}
+
+/// The names once there are at least `count`: each child reaches B by its
+/// own `m.space.child` event, so the first of two can arrive alone.
+async fn eventually_at_least(rig: &Rig, query: &str, count: usize) -> Vec<String> {
     let mut names = Vec::new();
     for _ in 0..60 {
         names = rig.b.hierarchy_names(&rig.space, &rig.bob, query).await;
-        if names.len() > 1 {
+        if names.len() >= count {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -433,7 +439,7 @@ async fn a_next_batch_token_keeps_its_page_when_a_remote_child_appears_between_p
             .add_child(&rig.space, &rig.alice, &child, &rig.a.name)
             .await;
     }
-    assert_eq!(eventually_names(&rig, "").await.len(), 3);
+    assert_eq!(eventually_at_least(&rig, "", 3).await.len(), 3);
 
     let (status, first) = hierarchy(&rig.b, &rig.space, &rig.bob, "?limit=1").await;
     assert_eq!(status, 200, "{first}");

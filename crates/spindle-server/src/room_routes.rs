@@ -165,6 +165,19 @@ async fn create_room(
         .into_iter()
         .map(|event| (event.event_type, event.state_key, event.content))
         .collect();
+    // The spec: with no preset, `visibility` picks one -- `public` is
+    // `public_chat` and anything else `private_chat` -- and Synapse does
+    // the same. Without it a room created with no preset had no history
+    // visibility or guest access of its own (#906).
+    let preset =
+        request
+            .preset
+            .as_deref()
+            .unwrap_or(if request.visibility.as_deref() == Some("public") {
+                "public_chat"
+            } else {
+                "private_chat"
+            });
     let room_id = state
         .rooms
         .create(
@@ -172,7 +185,7 @@ async fn create_room(
             state.key.pair(),
             request.name.as_deref(),
             request.topic.as_deref(),
-            request.preset.as_deref(),
+            Some(preset),
             &request.invite,
             &initial_state,
             // The version asked for, refused with M_UNSUPPORTED_ROOM_VERSION
@@ -1725,6 +1738,18 @@ async fn set_room_state(
             .map_err(delay_error)?;
         return Ok(Json(json!({ "delay_id": delay_id })));
     }
+    if query.sticky.is_none()
+        && let Some(event_id) = unchanged_state(
+            &state,
+            &identity,
+            &room_id,
+            &event_type,
+            &state_key,
+            &content,
+        )
+    {
+        return Ok(Json(json!({ "event_id": event_id })));
+    }
     // A new `m.room.hub` in a room that has a hub is a handoff (#22).
     #[cfg(feature = "hub-mode")]
     if query.sticky.is_none()
@@ -1771,6 +1796,39 @@ async fn set_room_state(
     #[cfg(feature = "hub-mode")]
     crate::hub::after_local_send(&state, &room_id);
     Ok(Json(json!({ "event_id": event_id })))
+}
+
+/// The current event of a state key, when a write of `content` by the
+/// asker would change nothing: the asker sent it, with this same content.
+///
+/// Synapse answers such a write with the current event and appends
+/// nothing (its `deduplicate_state_event`), and Complement counts on it:
+/// with `createRoom`'s preset now writing `m.room.history_visibility`,
+/// a client restating `shared` appended a second, identical event (#906).
+/// A member event is left alone: a join can mean more than its content.
+fn unchanged_state(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room_id: &str,
+    event_type: &str,
+    state_key: &str,
+    content: &Value,
+) -> Option<String> {
+    if event_type == "m.room.member"
+        || !state
+            .rooms
+            .is_joined(&identity.user_id, room_id)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let current = state
+        .rooms
+        .state_event_full(room_id, event_type, state_key)
+        .ok()?;
+    (current["sender"] == identity.user_id.as_str() && current["content"] == *content)
+        .then(|| current["event_id"].as_str().map(str::to_owned))
+        .flatten()
 }
 
 /// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}`
