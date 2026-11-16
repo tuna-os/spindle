@@ -18,6 +18,7 @@ use tower::ServiceExt;
 struct Harness {
     _dir: TempDir,
     app: axum::Router,
+    store: Arc<FjallStore>,
 }
 
 impl Harness {
@@ -28,8 +29,13 @@ impl Harness {
             "[server]\nname = \"example.org\"\n[ratelimit]\nenabled = false\n",
         )
         .unwrap();
-        let app = spindle_server::app(config, store).expect("a signing key is established");
-        Self { _dir: dir, app }
+        let app =
+            spindle_server::app(config, Arc::clone(&store)).expect("a signing key is established");
+        Self {
+            _dir: dir,
+            app,
+            store,
+        }
     }
 
     async fn call(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -1850,8 +1856,9 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         "carol never set a name or an avatar: {entry}"
     );
 
-    // The bump stamp is the newest event's timestamp, so it moves when the
-    // room does and orders rooms without a timeline in the response.
+    // The bump stamp is a timestamp, so it orders rooms without a timeline
+    // in the response. This room has had no message, so its creation dates
+    // it: see `only_what_msc4186_counts_as_activity_moves_the_bump_stamp`.
     let before = entry["bump_stamp"]
         .as_i64()
         .unwrap_or_else(|| panic!("{entry}"));
@@ -1862,7 +1869,7 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         .filter_map(|event| event["origin_server_ts"].as_i64())
         .max()
         .unwrap();
-    assert_eq!(before, newest, "{entry}");
+    assert!(before > 0 && before <= newest, "{entry}");
     drop(carol);
 }
 
@@ -2012,6 +2019,71 @@ async fn an_invite_carries_the_room_avatar() {
     let entry = &response["rooms"][&room];
     assert!(entry["invite_state"].is_array(), "{entry}");
     assert_eq!(entry["avatar"], json!("mxc://example.org/room"), "{entry}");
+}
+
+#[tokio::test]
+async fn only_what_msc4186_counts_as_activity_moves_the_bump_stamp() {
+    // MSC4186 `bump_stamp` moves for the "proper" activity types alone --
+    // a message, an encrypted event, a sticker, a call invite, a poll, a
+    // live location share, the creation -- as Synapse's
+    // `DEFAULT_BUMP_EVENT_TYPES`. A client that sorts by it must not see a
+    // room jump to the top because it was renamed or someone joined (#901).
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "quiet").await;
+    harness.say(&room, &alice, "hello", "t1").await;
+    let first = harness.sliding(&alice, None, &window()).await;
+    let entry = &first["rooms"][&room];
+    let said = entry["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "m.room.message")
+        .and_then(|event| event["origin_server_ts"].as_i64())
+        .unwrap_or_else(|| panic!("{entry}"));
+    assert_eq!(entry["bump_stamp"], json!(said), "{entry}");
+
+    // A later millisecond, so a stamp the topic moved would differ.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.topic"),
+            &alice,
+            &json!({ "topic": "nothing to see" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let next = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    let entry = &next["rooms"][&room];
+    let topic = entry["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "m.room.topic")
+        .and_then(|event| event["origin_server_ts"].as_i64())
+        .unwrap_or_else(|| panic!("the topic is news: {next}"));
+    assert!(topic > said, "{next}");
+    assert_eq!(entry["bump_stamp"], json!(said), "{entry}");
+
+    // Read with nothing cached -- after a restart -- the stamp is found by
+    // walking back past the topic, from the store and from a resident log.
+    let cold = spindle_server::rooms::Rooms::new(Arc::clone(&harness.store), "example.org");
+    assert_eq!(cold.bump_stamp(&room).unwrap(), said);
+    let warm = spindle_server::rooms::Rooms::new(Arc::clone(&harness.store), "example.org");
+    warm.warm(&room).unwrap();
+    assert_eq!(warm.bump_stamp(&room).unwrap(), said);
+
+    // A message moves it.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    harness.say(&room, &alice, "again", "t2").await;
+    let moved = harness.sliding(&alice, Some(&pos(&next)), &window()).await;
+    let stamp = moved["rooms"][&room]["bump_stamp"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{moved}"));
+    assert!(stamp > topic, "{moved}");
 }
 
 #[tokio::test]

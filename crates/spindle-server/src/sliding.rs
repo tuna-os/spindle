@@ -1402,7 +1402,9 @@ pub struct Summary {
     /// has none, and Synapse leaves them out.
     pub heroes: Vec<Value>,
     /// The room's recency, comparable across rooms: the timestamp of its
-    /// newest event. A client sorts its list by this without a timeline.
+    /// newest event of a type MSC4186 counts as activity
+    /// ([`crate::rooms::BUMP_EVENT_TYPES`]). A client sorts its list by this
+    /// without a timeline.
     pub bump_stamp: i64,
     /// The user's `m.direct` account data names the room.
     pub is_dm: bool,

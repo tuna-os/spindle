@@ -1817,7 +1817,7 @@ fn sliding_room_entry(
     } else {
         Vec::new()
     };
-    let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
+    let bump_stamp = state.rooms.bump_stamp(room_id).map_err(room_error)?;
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)

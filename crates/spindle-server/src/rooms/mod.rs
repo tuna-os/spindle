@@ -247,6 +247,11 @@ pub struct Rooms {
     /// Dropped when the user's membership there changes, and not when the
     /// room is evicted, because eviction changes nothing it answers.
     departures: Mutex<HashMap<(String, String), Option<Departure>>>,
+    /// room -> the timestamp of its newest event of a type MSC4186 counts
+    /// as activity ([`BUMP_EVENT_TYPES`]): sliding sync's `bump_stamp`,
+    /// kept and refreshed like [`Self::last_activity`] and for the same
+    /// reason.
+    bump_stamps: Mutex<HashMap<String, i64>>,
     /// room -> user -> the stream position allocated when that user last
     /// sent a receipt in that room. A receipt is not an event and writes
     /// no stream row, so nothing about the room moves when one lands --
@@ -646,6 +651,7 @@ impl Rooms {
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
             departures: Mutex::new(HashMap::new()),
+            bump_stamps: Mutex::new(HashMap::new()),
             receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
@@ -5200,6 +5206,142 @@ impl Rooms {
             .or_insert(activity))
     }
 
+    /// Refresh the cached sort key and bump stamp for an event appended at
+    /// the head, so the sliding-sync room list never re-reads a body for
+    /// them. Unconditional: an absent entry is filled lazily, a present one
+    /// must not go stale.
+    fn note_recency(&self, room_id: &str, event_type: &str, ts: i64) {
+        // A dummy event (#626) is not activity, and leaves the key alone.
+        if event_type != extremities::DUMMY_EVENT_TYPE {
+            self.last_activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(room_id.to_owned(), ts);
+        }
+        // Only an event MSC4186 counts as activity moves the bump stamp; a
+        // name, a topic or a member change leaves it where it was.
+        if is_bump_event(event_type) {
+            self.bump_stamps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(room_id.to_owned(), ts);
+        }
+    }
+
+    /// MSC4186's `bump_stamp` for a room: the timestamp of its newest event
+    /// of one of the [`BUMP_EVENT_TYPES`], the "proper" activity a client
+    /// may sort its room list by.
+    ///
+    /// Apart from [`Self::last_activity`], which dates the room by any
+    /// event and orders the server's list. MSC4186 says the list is not
+    /// ordered by `bump_stamp`, and Synapse orders it by the newest event of
+    /// any type and dates `bump_stamp` by these types alone. A rename, a
+    /// topic or a member joining thus moves a room up the list, and leaves
+    /// its `bump_stamp` where it was, so a client that sorts by
+    /// `bump_stamp` does not jump the room to the top for it (#901).
+    ///
+    /// Cached and refreshed by the appends that move it, like
+    /// [`Self::last_activity`]. On a miss the room's newest
+    /// [`BUMP_LOOKBACK`] entries are walked from the head: a state entry's
+    /// type is in the log, so only a bump-type state event or a timeline
+    /// event costs a body read. A room with no bump event that far back --
+    /// none in a partial join's history, or a long run of state -- is dated
+    /// by the oldest entry the walk reached, so it sorts below everything it
+    /// looked at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or an event body cannot be read.
+    pub fn bump_stamp(&self, room_id: &str) -> Result<i64, RoomError> {
+        if let Some(&cached) = self
+            .bump_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(room_id)
+        {
+            return Ok(cached);
+        }
+        let in_memory = self
+            .resident(room_id)
+            .and_then(|room| match room.try_read() {
+                Ok(log) => Some(Self::tail_for_bump(&log)),
+                Err(std::sync::TryLockError::Poisoned(log)) => {
+                    Some(Self::tail_for_bump(&log.into_inner()))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            });
+        let stamp = if let Some(tail) = in_memory {
+            let mut tail = tail.into_iter();
+            self.bump_of(room_id, || Ok(tail.next()))?
+        } else {
+            let mut end: Option<Vec<u8>> = None;
+            self.bump_of(room_id, || {
+                let Some((head, key)) = self.head_in_store(room_id, end.as_deref())? else {
+                    return Ok(None);
+                };
+                end = Some(key);
+                Ok(Some(head))
+            })?
+        };
+        Ok(*self
+            .bump_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(room_id.to_owned())
+            .or_insert(stamp))
+    }
+
+    /// The timestamp of the newest bump-type entry `next` yields, newest
+    /// first, looking at most [`BUMP_LOOKBACK`] entries back; see
+    /// [`Self::bump_stamp`] for what dates a room with none.
+    fn bump_of(
+        &self,
+        room_id: &str,
+        mut next: impl FnMut() -> Result<Option<TailEntry>, RoomError>,
+    ) -> Result<i64, RoomError> {
+        let mut oldest: Option<TailEntry> = None;
+        for _ in 0..BUMP_LOOKBACK {
+            let Some(entry) = next()? else {
+                break;
+            };
+            // A rejected entry has no body to date it by, and a state event
+            // of a type that does not bump needs none.
+            let candidate =
+                !entry.rejected && entry.state_type.as_deref().is_none_or(is_bump_event);
+            if candidate {
+                let body = self.read_event(room_id, &EventId::new(entry.event_id.as_str()))?;
+                if is_bump_event(body["type"].as_str().unwrap_or_default()) {
+                    return Ok(body["origin_server_ts"].as_i64().unwrap_or(0));
+                }
+            }
+            if !entry.rejected {
+                oldest = Some(entry);
+            }
+        }
+        let Some(oldest) = oldest else {
+            return Ok(0);
+        };
+        let body = self.read_event(room_id, &EventId::new(oldest.event_id.as_str()))?;
+        Ok(body["origin_server_ts"].as_i64().unwrap_or(0))
+    }
+
+    /// The newest [`BUMP_LOOKBACK`] entries of a resident log, newest first.
+    fn tail_for_bump(log: &RoomLog) -> Vec<TailEntry> {
+        log.entries()
+            .rev()
+            .take(BUMP_LOOKBACK)
+            .map(|entry| TailEntry {
+                event_id: entry.event_id.as_str().to_owned(),
+                rejected: log.historically_rejected(&entry.event_id),
+                state: entry.state_key.is_some(),
+                state_type: entry
+                    .state_key
+                    .as_ref()
+                    .map(|key| key.event_type().as_str().to_owned()),
+            })
+            .collect()
+    }
+
     /// The timestamp of the newest entry `next` yields, newest first, that
     /// is not an `org.matrix.dummy_event`. Looks at most
     /// [`ACTIVITY_LOOKBACK`] entries back; a tail of nothing but dummy
@@ -5238,6 +5380,10 @@ impl Rooms {
                 event_id: entry.event_id.as_str().to_owned(),
                 rejected: log.historically_rejected(&entry.event_id),
                 state,
+                state_type: entry
+                    .state_key
+                    .as_ref()
+                    .map(|key| key.event_type().as_str().to_owned()),
             });
             if state {
                 break;
@@ -5296,6 +5442,7 @@ impl Rooms {
                 event_id: record.event_id,
                 rejected,
                 state: record.state_key.is_some(),
+                state_type: record.state_key.map(|(event_type, _)| event_type),
             },
             key,
         )))
@@ -6178,6 +6325,7 @@ impl Rooms {
         }
         clear(&self.unread_index, room_id);
         clear(&self.last_activity, room_id);
+        clear(&self.bump_stamps, room_id);
         clear(&self.state_heads, room_id);
         clear(&self.state_render, room_id);
         clear(&self.member_ids, room_id);
@@ -6203,6 +6351,7 @@ impl Rooms {
         }
         has(&self.unread_index, room_id)
             || has(&self.last_activity, room_id)
+            || has(&self.bump_stamps, room_id)
             || has(&self.state_heads, room_id)
             || has(&self.state_render, room_id)
             || has(&self.member_ids, room_id)
@@ -7591,20 +7740,11 @@ impl Rooms {
             }
         }
 
-        // The append that changes a room's recency refreshes the cached
-        // sort key, so the sliding-sync room list never re-reads a body
-        // for it. Unconditional: an absent entry is filled lazily, a
-        // present one must not go stale.
-        // A dummy event (#626) is not activity, and leaves the key alone.
-        if input.event_type != extremities::DUMMY_EVENT_TYPE {
-            self.last_activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    room_id.to_owned(),
-                    input.json["origin_server_ts"].as_i64().unwrap_or(0),
-                );
-        }
+        self.note_recency(
+            room_id,
+            input.event_type,
+            input.json["origin_server_ts"].as_i64().unwrap_or(0),
+        );
 
         // The signed JSON is stored beside the log entry, in the entry's own
         // batch. The log holds ordering and state; the event body is what a
@@ -8014,13 +8154,39 @@ const ACTIVITY_LOOKBACK: usize = 16;
 /// reads to find what the dummy events it leaves out displaced.
 const TIMELINE_DUMMY_SLACK: usize = 4;
 
-/// One entry near a room's head, as [`Rooms::last_activity`] reads it.
+/// The event types MSC4186 counts as activity that moves a room's
+/// `bump_stamp`: Synapse's `DEFAULT_BUMP_EVENT_TYPES`.
+pub const BUMP_EVENT_TYPES: &[&str] = &[
+    "m.room.create",
+    "m.room.message",
+    "m.room.encrypted",
+    "m.sticker",
+    "m.call.invite",
+    "m.poll.start",
+    "m.beacon_info",
+];
+
+/// Whether an event of `event_type` bumps a room: by its type alone, as
+/// Synapse decides it.
+fn is_bump_event(event_type: &str) -> bool {
+    BUMP_EVENT_TYPES.contains(&event_type)
+}
+
+/// How far back from a room's head [`Rooms::bump_stamp`] looks for a bump
+/// event when nothing has cached one. Each room walks it at most once per
+/// process, and a state entry along the way costs no body read.
+const BUMP_LOOKBACK: usize = 256;
+
+/// One entry near a room's head, as [`Rooms::last_activity`] and
+/// [`Rooms::bump_stamp`] read it.
 struct TailEntry {
     event_id: String,
     /// Historically rejected: there is no body to date it by.
     rejected: bool,
     /// A state event, which is never a dummy event.
     state: bool,
+    /// The type of a state event, from the log, with no body read.
+    state_type: Option<String>,
 }
 
 /// One open room in the registry, with when it was last used.
