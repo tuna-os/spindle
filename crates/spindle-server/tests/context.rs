@@ -201,8 +201,9 @@ async fn the_window_stops_at_the_ends_of_the_room() {
         body["events_after"].as_array().unwrap().is_empty(),
         "there is nothing after the newest event: {body}"
     );
-    // And before it: the first message plus the four create-sequence events.
-    assert_eq!(body["events_before"].as_array().unwrap().len(), 5, "{body}");
+    // And before it: the first message plus the six create-sequence events
+    // (`createRoom`'s default preset is `private_chat`).
+    assert_eq!(body["events_before"].as_array().unwrap().len(), 7, "{body}");
 
     // Around the *first* message: the create sequence before, `last` after.
     let (_, body) = harness

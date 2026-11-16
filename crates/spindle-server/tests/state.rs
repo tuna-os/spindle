@@ -151,6 +151,8 @@ async fn a_rooms_state_is_every_current_state_event_and_nothing_else() {
         keys,
         vec![
             ("m.room.create", ""),
+            ("m.room.guest_access", ""),
+            ("m.room.history_visibility", ""),
             ("m.room.join_rules", ""),
             ("m.room.member", "@alice:example.org"),
             ("m.room.name", ""),

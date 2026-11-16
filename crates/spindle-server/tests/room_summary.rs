@@ -298,8 +298,10 @@ async fn fields_the_room_never_set_are_absent_rather_than_null() {
     }
     // The two booleans are always present: for them, unset and false mean the
     // same thing, so there is nothing to distinguish.
+    // `createRoom` with no preset is `private_chat`, whose guest access is
+    // `can_join` by the spec's preset table.
     assert_eq!(body["world_readable"], false);
-    assert_eq!(body["guest_can_join"], false);
+    assert_eq!(body["guest_can_join"], true);
 }
 
 #[tokio::test]

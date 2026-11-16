@@ -181,7 +181,9 @@ async fn a_room_is_still_writable_after_a_restart() {
         .filter_map(|event| event["content"]["body"].as_str())
         .collect();
     assert_eq!(bodies, vec!["after", "before"], "{body}");
-    assert_eq!(body["chunk"].as_array().unwrap().len(), 6, "{body}");
+    // `createRoom`'s six events (its default preset is `private_chat`) and
+    // the two messages.
+    assert_eq!(body["chunk"].as_array().unwrap().len(), 8, "{body}");
 }
 
 #[tokio::test]

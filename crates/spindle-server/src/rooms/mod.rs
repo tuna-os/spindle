@@ -1243,6 +1243,7 @@ impl Rooms {
                 }),
             ),
         ];
+        events.extend(preset_state(preset, initial_state));
         if let Some(name) = name {
             events.push((
                 "m.room.name",
@@ -9605,6 +9606,71 @@ fn build_create_content(
         content.extend(reserved);
     }
     Value::Object(content)
+}
+
+/// The state the rest of the spec's preset table writes, beyond the join
+/// rule. Without these events a client falls back to the spec's defaults,
+/// which is not what Synapse writes, so the same room showed different
+/// settings on each server (#906). A key the client sets in `initial_state`
+/// is left to it, as Synapse does, rather than written twice.
+fn preset_state(
+    preset: Option<&str>,
+    initial_state: &[(String, String, Value)],
+) -> Vec<(&'static str, String, Value)> {
+    let client_sets = |event_type: &str| {
+        initial_state
+            .iter()
+            .any(|(kind, state_key, _)| kind == event_type && state_key.is_empty())
+    };
+    let mut events = Vec::new();
+    let Some(bundle) = preset.and_then(PresetBundle::of) else {
+        return events;
+    };
+    if !client_sets("m.room.history_visibility") {
+        events.push((
+            "m.room.history_visibility",
+            String::new(),
+            serde_json::json!({ "history_visibility": bundle.history_visibility }),
+        ));
+    }
+    if let Some(guest_access) = bundle.guest_access
+        && !client_sets("m.room.guest_access")
+    {
+        events.push((
+            "m.room.guest_access",
+            String::new(),
+            serde_json::json!({ "guest_access": guest_access }),
+        ));
+    }
+    events
+}
+
+/// The state a `createRoom` preset writes beyond the join rule, from the
+/// spec's preset table.
+#[derive(Debug, PartialEq, Eq)]
+struct PresetBundle {
+    history_visibility: &'static str,
+    /// `None` leaves the event out: `forbidden` is what a room without one
+    /// means, and Synapse does not write it for `public_chat`.
+    guest_access: Option<&'static str>,
+}
+
+impl PresetBundle {
+    /// The bundle of a preset the spec names. An unknown preset gets none,
+    /// so a room is never given settings that nobody asked for.
+    fn of(preset: &str) -> Option<Self> {
+        match preset {
+            "private_chat" | "trusted_private_chat" => Some(Self {
+                history_visibility: "shared",
+                guest_access: Some("can_join"),
+            }),
+            "public_chat" => Some(Self {
+                history_visibility: "shared",
+                guest_access: None,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// `supplied` with `invitees` named as additional creators (MSC4289).

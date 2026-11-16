@@ -297,8 +297,8 @@ async fn a_stranger_cannot_redact_and_an_unknown_event_cannot_be_redacted() {
     // front, the redaction is appended and signed *first* and only then fails
     // on the missing body -- same 404, but the room is left holding a
     // redaction event pointing at nothing. So count the room, not the reply:
-    // the four events `createRoom` emits, plus alice's one message, and no
-    // redaction at all.
+    // the six events `createRoom` emits (its default preset is
+    // `private_chat`), plus alice's one message, and no redaction at all.
     let (_, timeline) = harness
         .get(
             &format!("/_matrix/client/v3/rooms/{room}/messages?limit=100"),
@@ -312,7 +312,7 @@ async fn a_stranger_cannot_redact_and_an_unknown_event_cannot_be_redacted() {
             .all(|event| event["type"] != "m.room.redaction"),
         "a refused redaction was appended anyway: {timeline}"
     );
-    assert_eq!(events.len(), 5, "{timeline}");
+    assert_eq!(events.len(), 7, "{timeline}");
 }
 
 /// Room v11 carries the target in `content.redacts` (MSC2174), not at the top
