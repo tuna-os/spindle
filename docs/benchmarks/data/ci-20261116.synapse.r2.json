@@ -1,0 +1,177 @@
+{
+  "base_url": "http://127.0.0.1:8098",
+  "benchmarks": {
+    "context_deep/200": {
+      "lower_ns": 3799383.0,
+      "mean_ns": 3975403.0,
+      "samples": 25,
+      "upper_ns": 4320042.0
+    },
+    "context_deep/3200": {
+      "lower_ns": 3916293.0,
+      "mean_ns": 4013142.0,
+      "samples": 25,
+      "upper_ns": 4206686.0
+    },
+    "context_deep/800": {
+      "lower_ns": 3751914.0,
+      "mean_ns": 3944529.0,
+      "samples": 25,
+      "upper_ns": 4480510.0
+    },
+    "join/200": {
+      "lower_ns": 38560873.0,
+      "mean_ns": 42617460.0,
+      "samples": 25,
+      "upper_ns": 44210676.0
+    },
+    "join/3200": {
+      "lower_ns": 39526572.0,
+      "mean_ns": 44395392.0,
+      "samples": 25,
+      "upper_ns": 48101902.0
+    },
+    "join/800": {
+      "lower_ns": 40795624.0,
+      "mean_ns": 45123626.0,
+      "samples": 25,
+      "upper_ns": 47700311.0
+    },
+    "messages_page/200": {
+      "lower_ns": 4635612.0,
+      "mean_ns": 5042122.0,
+      "samples": 25,
+      "upper_ns": 5521444.0
+    },
+    "messages_page/3200": {
+      "lower_ns": 4702944.0,
+      "mean_ns": 4995207.0,
+      "samples": 25,
+      "upper_ns": 5596105.0
+    },
+    "messages_page/800": {
+      "lower_ns": 4416553.0,
+      "mean_ns": 5122995.0,
+      "samples": 25,
+      "upper_ns": 5792032.0
+    },
+    "send/200": {
+      "lower_ns": 23664387.0,
+      "mean_ns": 25367743.0,
+      "samples": 25,
+      "upper_ns": 35131499.0
+    },
+    "send/3200": {
+      "lower_ns": 24470122.0,
+      "mean_ns": 25732388.0,
+      "samples": 25,
+      "upper_ns": 28453418.0
+    },
+    "send/800": {
+      "lower_ns": 24733621.0,
+      "mean_ns": 25943698.0,
+      "samples": 25,
+      "upper_ns": 27802017.0
+    },
+    "sliding_window/200": {
+      "lower_ns": 6274181.0,
+      "mean_ns": 6738649.0,
+      "samples": 25,
+      "upper_ns": 8040549.0
+    },
+    "sliding_window/3200": {
+      "lower_ns": 6094850.0,
+      "mean_ns": 6719704.0,
+      "samples": 25,
+      "upper_ns": 7631891.0
+    },
+    "sliding_window/800": {
+      "lower_ns": 7055226.0,
+      "mean_ns": 7363304.0,
+      "samples": 25,
+      "upper_ns": 8528067.0
+    },
+    "state/200": {
+      "lower_ns": 1490473.0,
+      "mean_ns": 1610996.0,
+      "samples": 25,
+      "upper_ns": 2319047.0
+    },
+    "state/3200": {
+      "lower_ns": 1564640.0,
+      "mean_ns": 1731073.0,
+      "samples": 25,
+      "upper_ns": 2492823.0
+    },
+    "state/800": {
+      "lower_ns": 1476940.0,
+      "mean_ns": 1598487.0,
+      "samples": 25,
+      "upper_ns": 2437874.0
+    },
+    "sync_delta/200": {
+      "lower_ns": 8789157.0,
+      "mean_ns": 9452219.0,
+      "samples": 25,
+      "upper_ns": 10377176.0
+    },
+    "sync_delta/3200": {
+      "lower_ns": 8483891.0,
+      "mean_ns": 9164802.0,
+      "samples": 25,
+      "upper_ns": 13288523.0
+    },
+    "sync_delta/800": {
+      "lower_ns": 9446864.0,
+      "mean_ns": 10332451.0,
+      "samples": 25,
+      "upper_ns": 10857693.0
+    },
+    "sync_initial/200": {
+      "lower_ns": 2295004.0,
+      "mean_ns": 2408895.0,
+      "samples": 25,
+      "upper_ns": 2679397.0
+    },
+    "sync_initial/3200": {
+      "lower_ns": 2380488.0,
+      "mean_ns": 2546007.0,
+      "samples": 25,
+      "upper_ns": 2663237.0
+    },
+    "sync_initial/800": {
+      "lower_ns": 2387331.0,
+      "mean_ns": 2582423.0,
+      "samples": 25,
+      "upper_ns": 3182100.0
+    },
+    "sync_poll/200": {
+      "lower_ns": 2289342.0,
+      "mean_ns": 2373167.0,
+      "samples": 25,
+      "upper_ns": 2595538.0
+    },
+    "sync_poll/3200": {
+      "lower_ns": 2308162.0,
+      "mean_ns": 2504340.0,
+      "samples": 25,
+      "upper_ns": 3385638.0
+    },
+    "sync_poll/800": {
+      "lower_ns": 2494769.0,
+      "mean_ns": 2561808.0,
+      "samples": 25,
+      "upper_ns": 2782126.0
+    }
+  },
+  "clients": null,
+  "dimension": "events",
+  "round": 2,
+  "samples": 25,
+  "server": "synapse",
+  "sizes": [
+    200,
+    800,
+    3200
+  ]
+}
