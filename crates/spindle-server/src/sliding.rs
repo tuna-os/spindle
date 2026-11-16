@@ -440,6 +440,11 @@ pub struct SentRoom {
     pub config: Arc<RoomConfig>,
     /// Whether it was sent as an invite: stripped state only.
     pub invite: bool,
+    /// Whether it was sent as a room the user is out of: its timeline and
+    /// state end at their departure. A room the user joins again goes in
+    /// full, not as what changed since, which would hand them what was
+    /// said while they were out.
+    pub departed: bool,
 }
 
 /// What a connection holds at one `pos`.
@@ -973,6 +978,7 @@ mod tests {
                 timeline_limit: 1,
             }),
             invite: false,
+            departed: false,
         };
         let config = |required: &[(&str, &str)], limit| RoomConfig {
             required_state: pairs(required),

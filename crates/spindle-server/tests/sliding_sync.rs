@@ -905,6 +905,152 @@ async fn a_subscription_does_not_outlive_membership() {
     );
 }
 
+/// The last event of a room entry's timeline: what a client takes as the
+/// room's newest news.
+fn last_event(entry: &Value) -> Value {
+    entry["timeline"]
+        .as_array()
+        .and_then(|timeline| timeline.last())
+        .cloned()
+        .unwrap_or_else(|| panic!("a timeline: {entry}"))
+}
+
+#[tokio::test]
+async fn a_room_left_is_sent_once_with_the_leave() {
+    // MSC4186 and Synapse: a room the user leaves is sent on the connection
+    // that holds it, with their leave last in its timeline, and then drops
+    // out of the list. Spindle only lowered the count, and Element X kept
+    // the room as joined for good (#898).
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "goodbye").await;
+    let _other = harness.named_room(&alice, "stays").await;
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(first["lists"]["main"]["count"], json!(2), "{first}");
+
+    harness.leave(&room, &alice).await;
+    let left = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    assert_eq!(left["lists"]["main"]["count"], json!(2), "{left}");
+    let entry = &left["rooms"][&room];
+    let leave = last_event(entry);
+    assert_eq!(leave["type"], "m.room.member", "{entry}");
+    assert_eq!(leave["state_key"], "@alice:example.org", "{entry}");
+    assert_eq!(leave["content"]["membership"], "leave", "{entry}");
+    assert!(
+        entry.get("initial").is_none_or(|initial| initial == false),
+        "the client holds the room; the leave is news about it: {entry}"
+    );
+    assert_eq!(entry["name"], json!("goodbye"), "{entry}");
+
+    // Told once. Then the room is out of the list, and nothing said in it
+    // reaches her.
+    let then = harness.sliding(&alice, Some(&pos(&left)), &window()).await;
+    assert_eq!(then["lists"]["main"]["count"], json!(1), "{then}");
+    assert!(then["rooms"].get(&room).is_none(), "{then}");
+    let fresh = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(fresh["lists"]["main"]["count"], json!(1), "{fresh}");
+    assert!(fresh["rooms"].get(&room).is_none(), "{fresh}");
+}
+
+#[tokio::test]
+async fn a_refused_invite_is_sent_once_with_the_leave() {
+    // Refusing an invite is a leave of the invitee's own: the connection
+    // that holds the invite is told, once, or the client offers it still.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&bob, "come in").await;
+    harness.invite(&room, &bob, "alice").await;
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert!(first["rooms"][&room]["invite_state"].is_array(), "{first}");
+
+    harness.leave(&room, &alice).await;
+    let refused = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    let entry = &refused["rooms"][&room];
+    assert!(entry.get("invite_state").is_none(), "{entry}");
+    assert!(
+        entry.get("initial").is_none_or(|initial| initial == false),
+        "news about the invite the client holds: {entry}"
+    );
+    let leave = last_event(entry);
+    assert_eq!(leave["state_key"], "@alice:example.org", "{entry}");
+    assert_eq!(leave["content"]["membership"], "leave", "{entry}");
+    // Never joined: the refusal is all she may see of the room.
+    assert_eq!(entry["timeline"].as_array().unwrap().len(), 1, "{entry}");
+
+    let then = harness
+        .sliding(&alice, Some(&pos(&refused)), &window())
+        .await;
+    assert_eq!(then["lists"]["main"]["count"], json!(0), "{then}");
+}
+
+#[tokio::test]
+async fn a_kicked_room_stays_in_the_list() {
+    // MSC4186 keeps a room the user was kicked or banned from, since they
+    // may not have seen it happen, and Synapse lists it on every
+    // connection. Its timeline ends at the kick.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&bob, "strict").await;
+    harness.invite(&room, &bob, "alice").await;
+    harness.join(&room, &alice).await;
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(first["lists"]["main"]["count"], json!(1), "{first}");
+
+    let (status, body) = harness
+        .request(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/kick"),
+            &bob,
+            &json!({ "user_id": "@alice:example.org", "reason": "spam" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    harness.say(&room, &bob, "after the kick", "t1").await;
+
+    let kicked = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    assert_eq!(kicked["lists"]["main"]["count"], json!(1), "{kicked}");
+    let entry = &kicked["rooms"][&room];
+    let kick = last_event(entry);
+    assert_eq!(kick["sender"], "@bob:example.org", "{entry}");
+    assert_eq!(kick["state_key"], "@alice:example.org", "{entry}");
+    assert_eq!(kick["content"]["membership"], "leave", "{entry}");
+    assert!(
+        !kicked.to_string().contains("after the kick"),
+        "nothing said after the kick reaches her: {kicked}"
+    );
+
+    // Still listed, and quiet about what the room says without her.
+    harness.say(&room, &bob, "and again", "t2").await;
+    let then = harness
+        .sliding(&alice, Some(&pos(&kicked)), &window())
+        .await;
+    assert_eq!(then["lists"]["main"]["count"], json!(1), "{then}");
+    assert!(then["rooms"].get(&room).is_none(), "{then}");
+
+    // A connection that starts over gets it in full, as it stood.
+    let fresh = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(fresh["lists"]["main"]["count"], json!(1), "{fresh}");
+    let entry = &fresh["rooms"][&room];
+    assert_eq!(entry["initial"], json!(true), "{entry}");
+    assert_eq!(last_event(entry)["sender"], "@bob:example.org", "{entry}");
+    assert!(!fresh.to_string().contains("again"), "{fresh}");
+
+    // Back in: the room is sent in full from the present, not as what
+    // changed while she was out.
+    harness.invite(&room, &bob, "alice").await;
+    harness.join(&room, &alice).await;
+    let back = harness.sliding(&alice, Some(&pos(&fresh)), &window()).await;
+    let entry = &back["rooms"][&room];
+    assert_eq!(entry["initial"], json!(true), "{entry}");
+    assert_eq!(
+        last_event(entry)["content"]["membership"],
+        "join",
+        "{entry}"
+    );
+}
+
 #[tokio::test]
 async fn ranges_past_the_end_are_clipped_not_refused() {
     let harness = Harness::new();
