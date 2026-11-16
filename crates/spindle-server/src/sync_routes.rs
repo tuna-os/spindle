@@ -456,8 +456,12 @@ struct SlidingInputs<'a> {
 /// the answer tells the client anything it does not hold: a room, a list
 /// count, or an extension's news. With the E2EE extension on and keys held,
 /// an event in any of the user's rooms is news too. The one-time-key
-/// counts, the account data and the typing rooms are in every answer, so
-/// being there is not news: see [`sliding_extensions`].
+/// counts and the typing rooms are in every answer, so being there is not
+/// news: see [`sliding_extensions`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one answer: what each part says and what the connection then holds"
+)]
 fn sliding_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -512,7 +516,7 @@ fn sliding_answer(
         .keys()
         .map(|name| (name.clone(), json!({ "count": ordered.len() })))
         .collect();
-    let (extensions, receipts_current, extension_news) = sliding_extensions(
+    let (extensions, held_current, extension_news) = sliding_extensions(
         state,
         identity,
         &params.extensions,
@@ -522,6 +526,7 @@ fn sliding_answer(
             to_device_since,
             selection: &selection,
             receipts: previous.map(|held| &held.receipts),
+            account_data: previous.map(|held| &held.account_data),
         },
     )?;
     state.metrics.observe_sync_phase(
@@ -547,17 +552,22 @@ fn sliding_answer(
         };
         rooms.insert(room_id.clone(), sent);
     }
-    let mut receipts: std::collections::HashMap<String, u64> = previous
-        .map(|held| &held.receipts)
-        .into_iter()
-        .flatten()
-        .filter(|(room_id, _)| visible.contains(room_id.as_str()))
-        .map(|(room_id, at)| (room_id.clone(), *at))
-        .collect();
-    receipts.extend(
-        receipts_current
+    // A room the user can no longer see is forgotten here as above; the
+    // empty string, the global account data, is no room and is kept.
+    let carried = |held: Option<&std::collections::HashMap<String, u64>>, current: Vec<String>| {
+        let mut out: std::collections::HashMap<String, u64> = held
             .into_iter()
-            .map(|room_id| (room_id, position)),
+            .flatten()
+            .filter(|(room_id, _)| room_id.is_empty() || visible.contains(room_id.as_str()))
+            .map(|(room_id, at)| (room_id.clone(), *at))
+            .collect();
+        out.extend(current.into_iter().map(|room_id| (room_id, position)));
+        out
+    };
+    let receipts = carried(previous.map(|held| &held.receipts), held_current.receipts);
+    let account_data = carried(
+        previous.map(|held| &held.account_data),
+        held_current.account_data,
     );
 
     let mut news = previous.is_none_or(|held| held.listed != ordered.len())
@@ -593,6 +603,7 @@ fn sliding_answer(
         params,
         rooms,
         receipts,
+        account_data,
         listed: ordered.len(),
     };
     Ok((body, connection, news))
@@ -744,39 +755,49 @@ struct ExtensionInputs<'a> {
     selection: &'a crate::sliding::Selection,
     /// The receipts the connection holds, by room.
     receipts: Option<&'a std::collections::HashMap<String, u64>>,
+    /// The account data the connection holds, by room, `""` for global.
+    account_data: Option<&'a std::collections::HashMap<String, u64>>,
 }
 
-/// The `extensions` object of a sliding-sync response, the rooms whose
-/// receipts the client is current to once it has it, and whether any
-/// extension has news since the connection's previous response.
+/// What the client holds as of the answer's position once it has it, by
+/// extension: the rooms whose receipts it is current to, and the rooms
+/// (`""` for global) whose account data it is.
+#[derive(Default)]
+struct HeldCurrent {
+    receipts: Vec<String>,
+    account_data: Vec<String>,
+}
+
+/// The `extensions` object of a sliding-sync response, what the client
+/// holds as current once it has it, and whether any extension has news
+/// since the connection's previous response.
 ///
 /// Each room extension speaks about its own scope (see
-/// [`crate::sliding::RoomExtension::scope`]). The account data and typing
-/// extensions answer for every room in theirs, changed or not: typing has
-/// no stream position to ask "since" from, and repeating a scope's worth is
-/// the answer that cannot silently drop one -- the same trade classic sync
-/// makes for room account data. So whether account data is news is asked
-/// of its stream marks rather than of what the extension sends. Receipts
-/// bump the stream too (`Rooms::mark_receipt`), and their extension is
-/// incremental: see [`receipts_extension`].
+/// [`crate::sliding::RoomExtension::scope`]). The typing extension answers
+/// for every room in its scope: typing has no stream position to ask
+/// "since" from. Receipts and account data bump the stream
+/// (`Rooms::mark_receipt`, and the account-data stream marks), and their
+/// extensions are incremental: see [`receipts_extension`] and
+/// [`account_data_extension`].
 fn sliding_extensions(
     state: &AppState,
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
     inputs: ExtensionInputs<'_>,
-) -> Result<(Value, Vec<String>, ExtensionNews), MatrixError> {
+) -> Result<(Value, HeldCurrent, ExtensionNews), MatrixError> {
     let ExtensionInputs {
         since,
         position,
         to_device_since,
         selection,
         receipts,
+        account_data,
     } = inputs;
     let mut out = serde_json::Map::new();
-    let mut receipts_current = Vec::new();
+    let mut current = HeldCurrent::default();
     let mut news = ExtensionNews::default();
     if !extensions.any() {
-        return Ok((Value::Object(out), receipts_current, news));
+        return Ok((Value::Object(out), current, news));
     }
 
     if extensions.to_device.on() {
@@ -800,15 +821,13 @@ fn sliding_extensions(
         let scope = extensions
             .account_data
             .scope(&selection.windows, &selection.subscribed);
-        out.insert(
-            "account_data".to_owned(),
-            account_data_extension(state, identity, &scope)?,
-        );
-        if let Some(since) = since
-            && !news.news
-        {
-            news.news = account_data_moved(state, identity, &scope, since, position)?;
-        }
+        let (body, any) = account_data_extension(state, identity, &scope, account_data, position)?;
+        news.news |= any;
+        out.insert("account_data".to_owned(), body);
+        current.account_data = std::iter::once("")
+            .chain(scope)
+            .map(str::to_owned)
+            .collect();
     }
     if extensions.receipts.on() {
         let scope = extensions
@@ -817,7 +836,7 @@ fn sliding_extensions(
         let (receipts, any) = receipts_extension(state, identity, &scope, receipts, position)?;
         news.news |= any;
         out.insert("receipts".to_owned(), receipts);
-        receipts_current = scope.into_iter().map(str::to_owned).collect();
+        current.receipts = scope.into_iter().map(str::to_owned).collect();
     }
     if extensions.typing.on() {
         let mut rooms = serde_json::Map::new();
@@ -832,25 +851,7 @@ fn sliding_extensions(
         out.insert("typing".to_owned(), json!({ "rooms": rooms }));
     }
 
-    Ok((Value::Object(out), receipts_current, news))
-}
-
-/// Whether the global account data, or that of a room in `scope`, changed
-/// in `(since, position]`.
-fn account_data_moved(
-    state: &AppState,
-    identity: &crate::accounts::Identity,
-    scope: &std::collections::BTreeSet<&str>,
-    since: u64,
-    position: u64,
-) -> Result<bool, MatrixError> {
-    let moved = state
-        .account_data
-        .rooms_changed_between(&identity.user_id, since, position)
-        .map_err(|error| account_data_error(&error))?;
-    Ok(moved
-        .iter()
-        .any(|room_id| room_id.is_empty() || scope.contains(room_id.as_str())))
+    Ok((Value::Object(out), current, news))
 }
 
 /// The to-device extension: what is pending for this device, acknowledged
@@ -928,25 +929,39 @@ fn e2ee_extension(
     ))
 }
 
-/// The account-data extension: the global events, and each room in scope
-/// that has any.
+/// The account-data extension, and whether it says anything: the global
+/// events, and each room in scope that has any.
+///
+/// Incremental once the connection holds them, as Synapse sends it (#903):
+/// sending every event in every answer cost bandwidth, and the client
+/// processed its DMs and push rules again on each one. The global events,
+/// or a room's, that the connection does not hold -- its first answer, or
+/// the first time a room is in the extension's scope -- go in full: so a
+/// room coming into view is not left without its tags, which is what
+/// sending a scope's worth every time was for. After that, the types that
+/// changed since the client was last current for them, which for a room
+/// back in scope after an absence is further back than the previous answer.
 fn account_data_extension(
     state: &AppState,
     identity: &crate::accounts::Identity,
     scope: &std::collections::BTreeSet<&str>,
-) -> Result<Value, MatrixError> {
-    let global = sync_account_data(state, identity, None, None, state.rooms.stream_position())?;
+    held: Option<&std::collections::HashMap<String, u64>>,
+    position: u64,
+) -> Result<(Value, bool), MatrixError> {
+    let held_since = |room_id: &str| held.and_then(|held| held.get(room_id)).copied();
+    let global = sync_account_data(state, identity, None, held_since(""), position)?;
     let mut rooms = serde_json::Map::new();
     for &room_id in scope {
         let data = state
             .account_data
-            .all(&identity.user_id, room_id)
+            .between(&identity.user_id, room_id, held_since(room_id), position)
             .map_err(|error| account_data_error(&error))?;
         if !data.is_empty() {
             rooms.insert(room_id.to_owned(), Value::Array(data));
         }
     }
-    Ok(json!({ "global": global, "rooms": rooms }))
+    let any = !global.is_empty() || !rooms.is_empty();
+    Ok((json!({ "global": global, "rooms": rooms }), any))
 }
 
 /// The receipts extension: one `m.receipt` event per room in scope that has

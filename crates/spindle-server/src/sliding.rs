@@ -455,6 +455,11 @@ pub struct Connection {
     /// it holds them as of. Apart from [`Self::rooms`] because the receipts
     /// extension has its own scope.
     pub receipts: HashMap<String, u64>,
+    /// For each room whose account data the client holds, the stream
+    /// position it holds it as of; the empty string is the global account
+    /// data. Apart from [`Self::rooms`] because the account-data extension
+    /// has its own scope.
+    pub account_data: HashMap<String, u64>,
     /// The `count` the lists were answered with. Held so a long-poll can
     /// tell that a room joined or left outside every window is news: the
     /// count is the only part of the answer that changes for it.

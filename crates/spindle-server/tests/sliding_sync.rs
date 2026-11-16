@@ -1139,6 +1139,116 @@ async fn the_account_data_extension_carries_global_and_room_data() {
     assert_eq!(room_data[0]["type"], "m.tag", "{response}");
 }
 
+/// #903: the account-data extension sends everything on a connection's
+/// first answer, and after that only the types that changed since the
+/// connection's position, as Synapse does. A room that comes into the
+/// extension's scope later gets its account data in full, changed or not:
+/// the client has never been sent it.
+#[tokio::test]
+async fn the_account_data_extension_is_incremental_after_the_first_answer() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let older = harness.named_room(&alice, "Older").await;
+    let newer = harness.named_room(&alice, "Newer").await;
+    let put = |path: String, content: Value| {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        async move {
+            let (status, body) = harness.request("PUT", &path, &alice, &content).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    };
+    let global = |event_type: &str| {
+        format!("/_matrix/client/v3/user/@alice:example.org/account_data/{event_type}")
+    };
+    let tag = |room: &str| {
+        format!("/_matrix/client/v3/user/@alice:example.org/rooms/{room}/account_data/m.tag")
+    };
+    put(global("io.example.one"), json!({ "n": 1 })).await;
+    for room in [&older, &newer] {
+        put(tag(room), json!({ "tags": { "m.favourite": {} } })).await;
+    }
+    let types = |response: &Value| -> Vec<String> {
+        response["extensions"]["account_data"]["global"]
+            .as_array()
+            .unwrap_or_else(|| panic!("global account data: {response}"))
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let rooms = |response: &Value| -> Vec<String> {
+        response["extensions"]["account_data"]["rooms"]
+            .as_object()
+            .unwrap_or_else(|| panic!("room account data: {response}"))
+            .keys()
+            .cloned()
+            .collect()
+    };
+
+    // Only the newer room is in the window.
+    let mut body = json!({
+        "lists": { "main": { "ranges": [[0, 0]], "timeline_limit": 1 } },
+        "extensions": { "account_data": { "enabled": true } },
+    });
+    let first = harness.sliding(&alice, None, &body).await;
+    let first_types = types(&first);
+    assert!(
+        first_types.contains(&"io.example.one".to_owned()),
+        "{first}"
+    );
+    assert!(first_types.contains(&"m.push_rules".to_owned()), "{first}");
+    assert_eq!(rooms(&first), vec![newer.clone()], "{first}");
+
+    // Nothing changed: nothing is sent again.
+    let quiet = json!({ "timeout": 200 });
+    let second = harness.sliding(&alice, Some(&pos(&first)), &quiet).await;
+    assert!(types(&second).is_empty(), "{second}");
+    assert!(rooms(&second).is_empty(), "{second}");
+
+    // A global change wakes the long poll and goes alone.
+    let mut poll = json!({ "timeout": 30_000 });
+    let waiting = {
+        let harness = Arc::clone(&harness);
+        let alice = alice.clone();
+        let since = pos(&second);
+        let poll = poll.clone();
+        tokio::spawn(async move { harness.sliding(&alice, Some(&since), &poll).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    put(global("io.example.two"), json!({ "n": 2 })).await;
+    let third = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll slept through an account-data change")
+        .unwrap();
+    assert_eq!(types(&third), vec!["io.example.two".to_owned()], "{third}");
+    assert!(rooms(&third).is_empty(), "{third}");
+
+    // A room's change goes alone too.
+    put(tag(&newer), json!({ "tags": { "m.lowpriority": {} } })).await;
+    poll["timeout"] = json!(0);
+    let fourth = harness.sliding(&alice, Some(&pos(&third)), &poll).await;
+    assert!(types(&fourth).is_empty(), "{fourth}");
+    assert_eq!(rooms(&fourth), vec![newer.clone()], "{fourth}");
+    assert_eq!(
+        fourth["extensions"]["account_data"]["rooms"][&newer][0]["content"],
+        json!({ "tags": { "m.lowpriority": {} } }),
+        "{fourth}"
+    );
+
+    // The client lost that answer and asks again with the same pos: it
+    // gets the change again, because the pos it holds is before it.
+    let retried = harness.sliding(&alice, Some(&pos(&third)), &poll).await;
+    assert!(types(&retried).is_empty(), "{retried}");
+    assert_eq!(rooms(&retried), vec![newer.clone()], "{retried}");
+
+    // The older room comes into scope by a subscription: its tags, which
+    // did not change, come in full, because the client never had them.
+    body = json!({ "room_subscriptions": { &older: { "timeline_limit": 1 } } });
+    let fifth = harness.sliding(&alice, Some(&pos(&retried)), &body).await;
+    assert!(types(&fifth).is_empty(), "{fifth}");
+    assert_eq!(rooms(&fifth), vec![older.clone()], "{fifth}");
+}
+
 #[tokio::test]
 async fn the_receipts_extension_carries_read_receipts_and_keeps_private_ones_private() {
     let harness = Harness::new();
@@ -1330,7 +1440,16 @@ async fn an_extension_speaks_only_about_the_lists_and_rooms_it_names() {
     );
 
     // A request that restates nothing keeps the scopes: typing, which is
-    // repeated every time, is still about the first list alone.
+    // repeated every time, is still about the first list alone; and when
+    // bob tags both rooms again, account data speaks about the subscription
+    // alone.
+    for room in [&one, &two] {
+        let path =
+            format!("/_matrix/client/v3/user/@bob:example.org/rooms/{room}/account_data/m.tag");
+        let tags = json!({ "tags": { "m.lowpriority": {} } });
+        let (status, body) = harness.request("PUT", &path, &bob, &tags).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
     let next = harness
         .sliding(&bob, Some(&pos(&response)), &json!({}))
         .await;
