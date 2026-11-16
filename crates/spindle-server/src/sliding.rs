@@ -455,6 +455,10 @@ pub struct Connection {
     /// it holds them as of. Apart from [`Self::rooms`] because the receipts
     /// extension has its own scope.
     pub receipts: HashMap<String, u64>,
+    /// For each room where the client holds someone as typing, who. The
+    /// typing extension sends a room only when this differs from now, so
+    /// a room whose typists all stopped goes out once with `user_ids: []`.
+    pub typing: HashMap<String, Vec<String>>,
     /// The `count` the lists were answered with. Held so a long-poll can
     /// tell that a room joined or left outside every window is news: the
     /// count is the only part of the answer that changes for it.
