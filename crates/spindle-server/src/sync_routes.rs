@@ -1489,20 +1489,22 @@ struct RoomRender<'a> {
     is_dm: bool,
 }
 
-/// A room entry's timeline, and for a room the client holds, the IDs of
-/// every event since it last held the room current -- what tells changed
-/// state from state it already has.
+/// What a room's range since the client last held it current holds.
+struct HeldRange {
+    /// The ID of every event in the range -- what tells changed state from
+    /// state the client already has.
+    ids: std::collections::HashSet<String>,
+    /// The range holds a membership event.
+    members_changed: bool,
+}
+
+/// A room entry's timeline, and for a room the client holds, what happened
+/// to the room since it last held it current.
 fn sliding_timeline(
     state: &AppState,
     identity: &crate::accounts::Identity,
     render: &RoomRender<'_>,
-) -> Result<
-    (
-        crate::sliding::Timeline,
-        Option<std::collections::HashSet<String>>,
-    ),
-    MatrixError,
-> {
+) -> Result<(crate::sliding::Timeline, Option<HeldRange>), MatrixError> {
     let RoomRender {
         room_id,
         config,
@@ -1538,7 +1540,10 @@ fn sliding_timeline(
                 .rooms
                 .room_delta(room_id, *since, position, delta_limit)
                 .map_err(room_error)?;
-            changed_ids = Some(delta.event_ids);
+            changed_ids = Some(HeldRange {
+                ids: delta.event_ids,
+                members_changed: delta.members_changed,
+            });
             if *expanded_timeline {
                 expanded = true;
                 tail()?
@@ -1747,10 +1752,10 @@ fn sliding_departed_entry(
         crate::sliding::Summary {
             name,
             avatar,
-            joined_count: 0,
-            invited_count: 0,
+            joined_count: Some(0),
+            invited_count: Some(0),
             heroes: Vec::new(),
-            bump_stamp: departure.ts,
+            bump_stamp: Some(departure.ts),
             is_dm: false,
         },
         required_state,
@@ -1790,9 +1795,9 @@ fn sliding_room_entry(
         .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
         .and_then(|content| crate::sliding::room_name(&content));
-    let (timeline, changed_ids) = sliding_timeline(state, identity, room)?;
-    let state_events = if let (crate::sliding::Need::Since { widened, .. }, Some(changed_ids)) =
-        (room.need, &changed_ids)
+    let (timeline, held_range) = sliding_timeline(state, identity, room)?;
+    let state_events = if let (crate::sliding::Need::Since { widened, .. }, Some(range)) =
+        (room.need, &held_range)
     {
         sliding_state_delta(
             state,
@@ -1800,24 +1805,54 @@ fn sliding_room_entry(
             room_id,
             (room.config, widened),
             &timeline.events,
-            changed_ids,
+            &range.ids,
         )?
     } else {
         let required_state = lazy_members_expanded(&room.config.required_state, &timeline.events);
         sliding_required_state(state, identity, room_id, &required_state)?
     };
     let roster = state.rooms.roster(room_id).map_err(room_error)?;
-    let avatar = state
-        .rooms
-        .state_event_unscoped(room_id, "m.room.avatar", "")
-        .ok()
-        .and_then(|content| content["url"].as_str().map(str::to_owned));
-    let heroes = if name.is_none() {
+    // A room the client holds is told only what changed in the range since
+    // (Synapse does the same): a name or avatar whose event is in it, counts
+    // after a membership event, heroes for an unnamed room after a
+    // membership or name change, and a bump_stamp when an event is in it.
+    // A room sent in full carries all of it.
+    let changed = |event_type: &str| match &held_range {
+        None => true,
+        Some(range) => state
+            .rooms
+            .state_event_full(room_id, event_type, "")
+            .ok()
+            .and_then(|event| event["event_id"].as_str().map(str::to_owned))
+            .is_some_and(|event_id| range.ids.contains(&event_id)),
+    };
+    let name_changed = changed("m.room.name");
+    let avatar_changed = changed("m.room.avatar");
+    let members_changed = held_range
+        .as_ref()
+        .is_none_or(|range| range.members_changed);
+    let has_events = held_range
+        .as_ref()
+        .is_none_or(|range| !range.ids.is_empty());
+    let avatar = if avatar_changed {
+        state
+            .rooms
+            .state_event_unscoped(room_id, "m.room.avatar", "")
+            .ok()
+            .and_then(|content| content["url"].as_str().map(str::to_owned))
+    } else {
+        None
+    };
+    let heroes = if name.is_none() && (members_changed || name_changed) {
         crate::sliding::heroes(&roster.heroes, &identity.user_id)
     } else {
         Vec::new()
     };
-    let bump_stamp = state.rooms.bump_stamp(room_id).map_err(room_error)?;
+    let bump_stamp = if has_events {
+        Some(state.rooms.bump_stamp(room_id).map_err(room_error)?)
+    } else {
+        None
+    };
     let unread = state
         .rooms
         .unread(room_id, &identity.user_id)
@@ -1825,10 +1860,10 @@ fn sliding_room_entry(
     let badge = badge(state, identity, room_id, &unread)?;
     Ok(crate::sliding::room_entry(
         crate::sliding::Summary {
-            name,
+            name: name.filter(|_| name_changed),
             avatar,
-            joined_count: roster.joined.len(),
-            invited_count: roster.invited.len(),
+            joined_count: members_changed.then_some(roster.joined.len()),
+            invited_count: members_changed.then_some(roster.invited.len()),
             heroes,
             bump_stamp,
             is_dm: room.is_dm,
