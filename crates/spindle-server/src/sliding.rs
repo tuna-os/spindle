@@ -18,15 +18,31 @@
 //! client left it, not from the previous request; and a room whose
 //! `required_state` or `timeline_limit` grows be sent the difference.
 //!
-//! The table lives in memory, with an idle expiry, and that is a choice
-//! rather than a shortcut. A `pos` the server does not hold — after a
-//! restart, after [`CONNECTION_IDLE_EXPIRY`] without a request, or one never
-//! issued to this device and connection — is answered `M_UNKNOWN_POS`,
-//! which every MSC4186 client handles by starting the connection over, at
-//! the price of one initial response for its visible window. To-device
-//! messages are acknowledged by the extension's own `since`, not by `pos`,
-//! so a lost connection loses no keys. Persisting the table would cost a
-//! write on every request to save that one window.
+//! The table lives in memory, and the store keeps a copy (#897). Before
+//! the copy, a restart or an idle hour answered every client's `pos` with
+//! `M_UNKNOWN_POS`. matrix-rust-sdk then drops its room list and loads the
+//! window again, so the room list of every Element X user went blank and
+//! refilled on every deploy. Synapse keeps its connections in its database,
+//! and a restart costs its clients nothing.
+//!
+//! A write on every request would be the obvious copy, and the wrong one:
+//! a long-poll answers every few seconds, and the room record is the
+//! largest thing a request handles. So memory stays the hot path. A request
+//! reads and writes only the table. Every [`FLUSH_INTERVAL`] the
+//! connections that changed are written in one unsynced batch, and the drop
+//! of the table at a graceful stop writes the rest. A `pos` that memory does
+//! not hold is looked up in the store. A crash can lose the positions of the
+//! last interval, and a client that holds one of them starts over, as every
+//! client did before. To-device messages are acknowledged by the
+//! extension's own `since`, not by `pos`, so a lost connection loses no
+//! keys.
+//!
+//! A connection lasts [`CONNECTION_IDLE_EXPIRY`] without a request, seven
+//! days as in Synapse, and stays in memory for [`RESIDENT_IDLE`] of them.
+//! Each device keeps at most sixteen, in memory and in the store. The stored
+//! row is versioned JSON in which every field is optional, so a field added
+//! to the held state needs no migration, and a row this binary cannot read
+//! is only a `pos` it does not know.
 //!
 //! The sort is by each room's last activity, newest first. The linear index
 //! cannot order rooms against each other — it is per-room by design — so the
@@ -36,15 +52,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use spindle_core::keys::{self, Keyspace};
+use spindle_store::{BatchOp, Durability, FjallStore, ReadView as _, Store as _, StoreError};
 
 /// `(type, state_key)` pairs, as `required_state` names them.
 pub type RequiredState = Vec<(String, String)>;
 
 /// One list, after the sticky merge: which slice of the sorted rooms, and
 /// what to send for each room in it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ListRequest {
     pub ranges: Vec<(usize, usize)>,
     pub required_state: RequiredState,
@@ -53,7 +72,8 @@ pub struct ListRequest {
 
 /// A direct subscription to one room, window position notwithstanding,
 /// after the sticky merge.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct RoomSubscription {
     pub required_state: RequiredState,
     pub timeline_limit: usize,
@@ -96,7 +116,8 @@ pub struct SlidingRequest {
 /// What a connection asks for: the lists, subscriptions and extension
 /// configs of its latest request, over its earlier ones where that request
 /// is silent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Params {
     pub lists: BTreeMap<String, ListRequest>,
     pub subscriptions: BTreeMap<String, RoomSubscription>,
@@ -194,7 +215,7 @@ impl SlidingRequest {
 /// Sticky like the rest of a connection's parameters, field by field.
 /// `to_device` carries its own `since`, because to-device messages are
 /// acknowledged by the token that delivered them rather than by `pos`.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct Extensions {
     pub to_device: ToDeviceExtension,
@@ -205,7 +226,7 @@ pub struct Extensions {
 }
 
 /// One extension's switch. Absent is off.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct Toggle {
     pub enabled: Option<bool>,
@@ -223,7 +244,7 @@ impl Toggle {
 /// `"*"` in either is all of them, and a field left out is `["*"]`, which
 /// is how Synapse reads it too -- an extension that names no scope applies
 /// to every room in view.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct RoomExtension {
     pub enabled: Option<bool>,
@@ -288,7 +309,7 @@ impl RoomExtension {
 
 /// The to-device extension: enabled, and the token of the last batch the
 /// client has, which is what acknowledges everything before it.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct ToDeviceExtension {
     pub enabled: Option<bool>,
@@ -335,7 +356,8 @@ impl Extensions {
 }
 
 /// What a room is sent with: MSC4186's "room config".
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct RoomConfig {
     pub required_state: RequiredState,
     pub timeline_limit: usize,
@@ -527,17 +549,34 @@ pub fn widened(old: &[(String, String)], new: &[(String, String)]) -> RequiredSt
         .collect()
 }
 
-/// How long a connection survives without a request. Element X polls with
-/// a timeout of seconds while it is open; a connection idle this long
-/// belongs to a client that will be answered `M_UNKNOWN_POS` and start over
-/// with one window's worth of rooms, which costs it less than holding every
-/// abandoned connection's room record costs the server.
-pub const CONNECTION_IDLE_EXPIRY: Duration = Duration::from_secs(60 * 60);
+/// How long a connection survives without a request. Synapse keeps its
+/// connections for seven days, and so does Spindle: a phone that slept over
+/// a weekend resumes where it was instead of reloading its room list. The
+/// store holds an idle connection for this long; memory holds it for
+/// [`RESIDENT_IDLE`] and reads it back from the store when it returns.
+pub const CONNECTION_IDLE_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// The connections one device may hold at once. `conn_id` is the client's
-/// to choose, so without a bound one device could grow the table without
-/// end; Element X uses two. Past the bound the least recently used goes.
+/// How long a connection stays in memory without a request. Element X polls
+/// every few seconds while it is open, so an hour of silence is a client
+/// that went away. Its room record then costs the server memory for nothing,
+/// and the store copy answers if it comes back.
+pub const RESIDENT_IDLE: Duration = Duration::from_secs(60 * 60);
+
+/// How often the connections that changed are written to the store. A
+/// crash loses at most this much: a client whose newest `pos` was not
+/// written yet gets `M_UNKNOWN_POS`, which is what every client got after
+/// every restart before #897. A graceful stop writes everything first.
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The connections one device may hold at once, in memory and in the
+/// store alike. `conn_id` is the client's to choose, so without a bound one
+/// device could grow the table without end; Element X uses two. Past the
+/// bound the least recently used goes.
 const CONNECTIONS_PER_DEVICE: usize = 16;
+
+/// The longest `conn_id` the store keeps. A longer one still works, from
+/// memory only: the id is part of the key, and the client chooses it.
+const STORED_CONN_ID_MAX: usize = 255;
 
 /// The positions one connection keeps. A request with `pos` acknowledges
 /// that position and retires the rest, so normally two remain: the one the
@@ -549,6 +588,14 @@ const POSITIONS_PER_CONNECTION: usize = 4;
 /// How often an access sweeps the table for idle connections.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The first byte of a stored connection row. A row with another byte is
+/// read as absent, which costs its client one initial response and nothing
+/// else, so a format change needs no migration: bump this.
+const STORED_FORMAT: u8 = 1;
+
+/// The positions one connection holds, each with its number.
+type Held = Vec<(u64, Arc<Connection>)>;
+
 /// Whose connection: the user, the device, and the request's `conn_id`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ConnectionKey {
@@ -557,22 +604,76 @@ pub struct ConnectionKey {
     pub conn_id: String,
 }
 
-/// Every live connection's positions, in memory.
+impl ConnectionKey {
+    fn row(&self, keyspace: Keyspace) -> Vec<u8> {
+        keys::sliding_connection(keyspace, &self.user_id, &self.device_id, &self.conn_id)
+    }
+
+    fn same_device(&self, other: &Self) -> bool {
+        self.user_id == other.user_id && self.device_id == other.device_id
+    }
+}
+
+/// Every connection's positions: the live ones in memory, and with a store,
+/// every one of the last [`CONNECTION_IDLE_EXPIRY`] there too.
+///
+/// Memory is the hot path. A request reads and writes only the table, and
+/// [`Self::flush`] writes the connections that changed since the last flush
+/// in one unsynced batch, every [`FLUSH_INTERVAL`] and when the table is
+/// dropped at shutdown. A `pos` the table does not hold is looked up in the
+/// store, which is how a connection survives a restart or an idle hour.
 pub struct Connections {
     table: Mutex<Table>,
+    store: Option<Arc<FjallStore>>,
+    /// When each stored connection was last written, in Unix milliseconds.
+    /// Read from [`Keyspace::SlidingConnectionUsed`] at start, so expiry and
+    /// the per-device bound need no store reads afterwards.
+    stored: Mutex<HashMap<ConnectionKey, u64>>,
 }
 
 struct Table {
     connections: HashMap<ConnectionKey, Positions>,
-    /// The next position number. One counter for the whole table, so a
-    /// `pos` never names a position of another connection's numbering.
-    next: u64,
     swept: Instant,
+    /// Connections recorded since the last flush.
+    dirty: HashSet<ConnectionKey>,
+    /// Connections evicted by the per-device bound since the last flush,
+    /// whose stored rows go too.
+    gone: HashSet<ConnectionKey>,
+    /// Whether a store takes the rows. Without one nothing is flushed, so
+    /// nothing is marked to be.
+    stored: bool,
+}
+
+impl Table {
+    fn new(stored: bool) -> Self {
+        Self {
+            connections: HashMap::new(),
+            swept: Instant::now(),
+            dirty: HashSet::new(),
+            gone: HashSet::new(),
+            stored,
+        }
+    }
 }
 
 struct Positions {
-    held: Vec<(u64, Arc<Connection>)>,
+    held: Held,
     used: Instant,
+}
+
+impl Positions {
+    /// The connection at position `number`, which must have answered at
+    /// `stream`, retiring every other position.
+    fn take(&mut self, stream: u64, number: u64, now: Instant) -> Option<Arc<Connection>> {
+        let state = self
+            .held
+            .iter()
+            .find(|(held, state)| *held == number && state.stream == stream)
+            .map(|(_, state)| Arc::clone(state))?;
+        self.held.retain(|(held, _)| *held == number);
+        self.used = now;
+        Some(state)
+    }
 }
 
 impl Default for Connections {
@@ -582,15 +683,63 @@ impl Default for Connections {
 }
 
 impl Connections {
+    /// A table in memory only: a connection lasts while the process does.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            table: Mutex::new(Table {
-                connections: HashMap::new(),
-                next: 1,
-                swept: Instant::now(),
-            }),
+            table: Mutex::new(Table::new(false)),
+            store: None,
+            stored: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A table kept in `store` as well, and which connections it holds
+    /// there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the scan of the stored connections fails.
+    pub fn with_store(store: Arc<FjallStore>) -> Result<Self, StoreError> {
+        let mut stored = HashMap::new();
+        let prefix = keys::keyspace_prefix(Keyspace::SlidingConnectionUsed);
+        store.visit_prefix(&prefix, &mut |key, value| {
+            let Some((user_id, device_id, conn_id)) = keys::sliding_connection_from_key(key) else {
+                return Ok(());
+            };
+            let used = value.try_into().map(u64::from_be_bytes).unwrap_or_default();
+            stored.insert(
+                ConnectionKey {
+                    user_id,
+                    device_id,
+                    conn_id,
+                },
+                used,
+            );
+            Ok(())
+        })?;
+        Ok(Self {
+            table: Mutex::new(Table::new(true)),
+            store: Some(store),
+            stored: Mutex::new(stored),
+        })
+    }
+
+    /// The server's table: kept in `store`, and flushed every
+    /// [`FLUSH_INTERVAL`] by a task that holds it weakly, like every loop
+    /// `spawn_delivery_loops` starts. The last reference, and the flush its
+    /// drop does, thus stays with the router. Outside a runtime nothing is
+    /// spawned, and only the drop flushes.
+    ///
+    /// # Errors
+    ///
+    /// Names the store error if the stored connections cannot be scanned.
+    pub fn start(store: &Arc<FjallStore>) -> Result<Arc<Self>, String> {
+        let connections =
+            Arc::new(Self::with_store(Arc::clone(store)).map_err(|error| error.to_string())?);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(flush_loop(Arc::downgrade(&connections), FLUSH_INTERVAL));
+        }
+        Ok(connections)
     }
 
     /// What connection `key` held at `pos`, retiring every other position
@@ -600,21 +749,56 @@ impl Connections {
     /// this connection does not hold, never held, or held before it expired.
     pub fn resume(&self, key: &ConnectionKey, pos: &str, now: Instant) -> Option<Arc<Connection>> {
         let (stream, number) = parse_pos(pos)?;
+        {
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            table.sweep(now);
+            // A connection in memory is never behind its stored copy, so
+            // what memory does not hold of it, the store does not either.
+            if let Some(positions) = table.connections.get_mut(key) {
+                return positions.take(stream, number, now);
+            }
+        }
+        let held = self.recover(key)?;
         let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
-        table.sweep(now);
-        let positions = table.connections.get_mut(key)?;
-        if now.saturating_duration_since(positions.used) > CONNECTION_IDLE_EXPIRY {
-            table.connections.remove(key);
+        // Another request of this connection may have recovered it, or
+        // recorded a new position, while the store was read.
+        if !table.connections.contains_key(key) {
+            table.make_room_for(key);
+        }
+        table
+            .connections
+            .entry(key.clone())
+            .or_insert(Positions { held, used: now })
+            .take(stream, number, now)
+    }
+
+    /// The positions the store holds of `key`, if it holds any that have
+    /// not expired and that this binary can read.
+    fn recover(&self, key: &ConnectionKey) -> Option<Held> {
+        let store = self.store.as_ref()?;
+        let used = *self
+            .stored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)?;
+        if expired(used, unix_ms()) {
             return None;
         }
-        let state = positions
-            .held
-            .iter()
-            .find(|(held, state)| *held == number && state.stream == stream)
-            .map(|(_, state)| Arc::clone(state))?;
-        positions.held.retain(|(held, _)| *held == number);
-        positions.used = now;
-        Some(state)
+        let row = match store.get(&key.row(Keyspace::SlidingConnection)) {
+            Ok(row) => row?,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read a stored sliding-sync connection");
+                return None;
+            }
+        };
+        let held = decode_positions(&row);
+        if held.is_none() {
+            tracing::debug!(
+                user_id = %key.user_id,
+                "stored sliding-sync connection does not decode; starting it over"
+            );
+        }
+        held
     }
 
     /// Keep `state` as a new position of connection `key`, and return the
@@ -628,12 +812,18 @@ impl Connections {
         now: Instant,
     ) -> String {
         let stream = state.stream;
+        // Random, not counted: a count would start again at a restart, and
+        // a client still holding a number from before could then be handed
+        // the position a later request recorded under it.
+        let number = rand::random::<u64>();
         let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
         table.sweep(now);
-        let number = table.next;
-        table.next += 1;
         if !table.connections.contains_key(&key) {
             table.make_room_for(&key);
+        }
+        table.gone.remove(&key);
+        if table.stored {
+            table.dirty.insert(key.clone());
         }
         let positions = table.connections.entry(key).or_insert_with(|| Positions {
             held: Vec::new(),
@@ -649,6 +839,310 @@ impl Connections {
         positions.used = now;
         format_pos(stream, number)
     }
+
+    /// Write every connection recorded since the last flush to the store,
+    /// and remove the stored ones that expired or that the per-device bound
+    /// evicted. One batch, not synced: the rows are a cache of what memory
+    /// holds, and losing the newest of them to a crash costs only what a
+    /// restart cost before they existed. Returns how many connections it
+    /// wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the batch fails. The connections it would
+    /// have written are kept for the next flush.
+    pub fn flush(&self) -> Result<usize, StoreError> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        if !store.accepts_writes() {
+            return Ok(0);
+        }
+        let (changed, gone) = {
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            let dirty = std::mem::take(&mut table.dirty);
+            let changed: Vec<(ConnectionKey, Held)> = dirty
+                .into_iter()
+                .filter_map(|key| {
+                    let held = table.connections.get(&key)?.held.clone();
+                    Some((key, held))
+                })
+                .collect();
+            (changed, std::mem::take(&mut table.gone))
+        };
+        if changed.is_empty() && gone.is_empty() && !self.anything_expired() {
+            return Ok(0);
+        }
+        // Encoded before the stored index is locked: a large room record
+        // takes a moment, and `resume` reads the index.
+        let encoded: Vec<(ConnectionKey, Vec<u8>)> = changed
+            .iter()
+            .filter(|(key, _)| key.conn_id.len() <= STORED_CONN_ID_MAX)
+            .map(|(key, held)| (key.clone(), encode_positions(held)))
+            .collect();
+        let now = unix_ms();
+        let mut ops = Vec::new();
+        let written = encoded.len();
+        {
+            let mut stored = self.stored.lock().unwrap_or_else(PoisonError::into_inner);
+            let drop_row = |key: &ConnectionKey, ops: &mut Vec<BatchOp>| {
+                ops.push(BatchOp::Delete(key.row(Keyspace::SlidingConnection)));
+                ops.push(BatchOp::Delete(key.row(Keyspace::SlidingConnectionUsed)));
+            };
+            for key in &gone {
+                if stored.remove(key).is_some() {
+                    drop_row(key, &mut ops);
+                }
+            }
+            let mut devices = Vec::new();
+            for (key, row) in encoded {
+                let mut value = Vec::with_capacity(row.len() + 1);
+                value.push(STORED_FORMAT);
+                value.extend_from_slice(&row);
+                ops.push(BatchOp::Put(key.row(Keyspace::SlidingConnection), value));
+                ops.push(BatchOp::Put(
+                    key.row(Keyspace::SlidingConnectionUsed),
+                    now.to_be_bytes().to_vec(),
+                ));
+                if stored.insert(key.clone(), now).is_none() {
+                    devices.push(key);
+                }
+            }
+            for key in evictions(&stored, &devices, now) {
+                stored.remove(&key);
+                drop_row(&key, &mut ops);
+            }
+        }
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        if let Err(error) = store.commit_ops(&ops, Durability::Relaxed) {
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            table.dirty.extend(changed.into_iter().map(|(key, _)| key));
+            table.gone.extend(gone);
+            return Err(error);
+        }
+        Ok(written)
+    }
+
+    fn anything_expired(&self) -> bool {
+        let now = unix_ms();
+        self.stored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|used| expired(*used, now))
+    }
+}
+
+impl Drop for Connections {
+    /// The graceful stop: the router, and the table with it, is dropped
+    /// after the last request was answered, so every position a client may
+    /// hold is written before the store closes.
+    fn drop(&mut self) {
+        if let Err(error) = self.flush() {
+            tracing::warn!(%error, "cannot store the sliding-sync connections at shutdown");
+        }
+    }
+}
+
+/// Flush `connections` every `interval` until they are gone. It looks
+/// every second, so that it ends within a second of the router, as every
+/// delivery loop does (`tests/delivery_loops.rs`).
+async fn flush_loop(connections: std::sync::Weak<Connections>, interval: Duration) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut flushed = tokio::time::Instant::now();
+    loop {
+        ticks.tick().await;
+        let Some(connections) = connections.upgrade() else {
+            return;
+        };
+        if flushed.elapsed() < interval {
+            continue;
+        }
+        flushed = tokio::time::Instant::now();
+        if let Err(error) = connections.flush() {
+            tracing::warn!(%error, "cannot store the sliding-sync connections");
+        }
+    }
+}
+
+/// Whether a connection last written at `used` has expired at `now`, both
+/// in Unix milliseconds.
+fn expired(used: u64, now: u64) -> bool {
+    let limit = u64::try_from(CONNECTION_IDLE_EXPIRY.as_millis()).unwrap_or(u64::MAX);
+    now.saturating_sub(used) > limit
+}
+
+/// The stored connections to remove: every expired one, and for each
+/// device in `devices` -- the ones that just gained a stored connection --
+/// the least recently used past [`CONNECTIONS_PER_DEVICE`].
+fn evictions(
+    stored: &HashMap<ConnectionKey, u64>,
+    devices: &[ConnectionKey],
+    now: u64,
+) -> Vec<ConnectionKey> {
+    let mut gone: Vec<ConnectionKey> = stored
+        .iter()
+        .filter(|(_, used)| expired(**used, now))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for device in devices {
+        let mut same: Vec<(&ConnectionKey, u64)> = stored
+            .iter()
+            .filter(|(key, used)| key.same_device(device) && !expired(**used, now))
+            .map(|(key, used)| (key, *used))
+            .collect();
+        if same.len() <= CONNECTIONS_PER_DEVICE {
+            continue;
+        }
+        same.sort_by_key(|(_, used)| *used);
+        let extra = same.len() - CONNECTIONS_PER_DEVICE;
+        for (key, _) in same.into_iter().take(extra) {
+            if !gone.contains(key) {
+                gone.push(key.clone());
+            }
+        }
+    }
+    gone
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// A connection's positions as the store keeps them. Every struct here
+/// reads a field it does not know as absent and a field it lacks as its
+/// default, so a row written by an older or a newer binary still reads.
+/// The room configs are kept once each and named by index, because rooms
+/// share a handful of them and a copy in each room would make the row many
+/// times larger.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct StoredConnection {
+    configs: Vec<RoomConfig>,
+    positions: Vec<StoredPosition>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct StoredPosition {
+    number: u64,
+    stream: u64,
+    params: Params,
+    rooms: HashMap<String, StoredRoom>,
+    receipts: HashMap<String, u64>,
+    listed: usize,
+}
+
+/// One held room. Short names, because the row has one of these for each
+/// room the client holds.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct StoredRoom {
+    at: u64,
+    #[serde(rename = "c")]
+    config: usize,
+    #[serde(rename = "i", skip_serializing_if = "std::ops::Not::not")]
+    invite: bool,
+}
+
+/// The positions of one connection as a stored row, without its format
+/// byte.
+fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
+    let mut configs: Vec<Arc<RoomConfig>> = Vec::new();
+    let mut index_of = |config: &Arc<RoomConfig>| {
+        if let Some(index) = configs
+            .iter()
+            .position(|known| Arc::ptr_eq(known, config) || **known == **config)
+        {
+            index
+        } else {
+            configs.push(Arc::clone(config));
+            configs.len() - 1
+        }
+    };
+    let positions = held
+        .iter()
+        .map(|(number, connection)| {
+            // Destructured whole, so a field added to `Connection` or
+            // `SentRoom` fails to compile here until it is stored too.
+            let Connection {
+                stream,
+                params,
+                rooms,
+                receipts,
+                listed,
+            } = connection.as_ref();
+            let rooms = rooms
+                .iter()
+                .map(|(room_id, sent)| {
+                    let SentRoom { at, config, invite } = sent;
+                    let room = StoredRoom {
+                        at: *at,
+                        config: index_of(config),
+                        invite: *invite,
+                    };
+                    (room_id.clone(), room)
+                })
+                .collect();
+            StoredPosition {
+                number: *number,
+                stream: *stream,
+                params: params.clone(),
+                rooms,
+                receipts: receipts.clone(),
+                listed: *listed,
+            }
+        })
+        .collect();
+    let stored = StoredConnection {
+        configs: configs.iter().map(|config| (**config).clone()).collect(),
+        positions,
+    };
+    serde_json::to_vec(&stored).unwrap_or_default()
+}
+
+/// A stored row back as positions, or `None` if it is not one this binary
+/// reads.
+fn decode_positions(row: &[u8]) -> Option<Held> {
+    let (&format, body) = row.split_first()?;
+    if format != STORED_FORMAT {
+        return None;
+    }
+    let stored: StoredConnection = serde_json::from_slice(body).ok()?;
+    let configs: Vec<Arc<RoomConfig>> = stored.configs.into_iter().map(Arc::new).collect();
+    stored
+        .positions
+        .into_iter()
+        .map(|position| {
+            let rooms = position
+                .rooms
+                .into_iter()
+                .map(|(room_id, room)| {
+                    let sent = SentRoom {
+                        at: room.at,
+                        config: Arc::clone(configs.get(room.config)?),
+                        invite: room.invite,
+                    };
+                    Some((room_id, sent))
+                })
+                .collect::<Option<HashMap<_, _>>>()?;
+            let connection = Connection {
+                stream: position.stream,
+                params: position.params,
+                rooms,
+                receipts: position.receipts,
+                listed: position.listed,
+            };
+            Some((position.number, Arc::new(connection)))
+        })
+        .collect()
 }
 
 impl Table {
@@ -656,8 +1150,11 @@ impl Table {
         if now.saturating_duration_since(self.swept) < SWEEP_INTERVAL {
             return;
         }
-        self.connections.retain(|_, positions| {
-            now.saturating_duration_since(positions.used) <= CONNECTION_IDLE_EXPIRY
+        // A connection not yet flushed stays until it is, so that leaving
+        // memory never loses a position the store has not got.
+        let dirty = &self.dirty;
+        self.connections.retain(|key, positions| {
+            now.saturating_duration_since(positions.used) <= RESIDENT_IDLE || dirty.contains(key)
         });
         self.swept = now;
     }
@@ -665,13 +1162,10 @@ impl Table {
     /// Evict the device's least recently used connection if `key` would be
     /// one too many.
     fn make_room_for(&mut self, key: &ConnectionKey) {
-        let same_device = |other: &ConnectionKey| {
-            other.user_id == key.user_id && other.device_id == key.device_id
-        };
         let held = self
             .connections
             .keys()
-            .filter(|other| same_device(other))
+            .filter(|other| other.same_device(key))
             .count();
         if held < CONNECTIONS_PER_DEVICE {
             return;
@@ -679,11 +1173,15 @@ impl Table {
         if let Some(oldest) = self
             .connections
             .iter()
-            .filter(|(other, _)| same_device(other))
+            .filter(|(other, _)| other.same_device(key))
             .min_by_key(|(_, positions)| positions.used)
             .map(|(other, _)| other.clone())
         {
             self.connections.remove(&oldest);
+            self.dirty.remove(&oldest);
+            if self.stored {
+                self.gone.insert(oldest);
+            }
         }
     }
 }
@@ -1100,13 +1598,193 @@ mod tests {
         let connections = Connections::new();
         let start = Instant::now();
         let pos = connections.record(key("list"), at(3), true, start);
-        let soon = start + CONNECTION_IDLE_EXPIRY / 2;
+        let soon = start + RESIDENT_IDLE / 2;
         assert!(connections.resume(&key("list"), &pos, soon).is_some());
         // Idle is counted from the last use, not from creation.
-        let later = soon + CONNECTION_IDLE_EXPIRY;
+        let later = soon + RESIDENT_IDLE;
         assert!(connections.resume(&key("list"), &pos, later).is_some());
-        let too_late = later + CONNECTION_IDLE_EXPIRY + Duration::from_secs(1);
+        let too_late = later + RESIDENT_IDLE + Duration::from_secs(61);
         assert!(connections.resume(&key("list"), &pos, too_late).is_none());
+    }
+
+    fn stored_in(dir: &tempfile::TempDir) -> (Arc<FjallStore>, Connections) {
+        let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+        let connections = Connections::with_store(Arc::clone(&store)).unwrap();
+        (store, connections)
+    }
+
+    /// A connection holding one room, as a response leaves it.
+    fn holding(stream: u64, room_id: &str) -> Connection {
+        let params = request(json!({
+            "lists": { "all": { "ranges": [[0, 9]], "required_state": [["m.room.name", ""]], "timeline_limit": 1 } },
+            "extensions": { "typing": { "enabled": true } },
+        }))
+        .params(None)
+        .unwrap();
+        let config = Arc::new(RoomConfig {
+            required_state: pairs(&[("m.room.name", "")]),
+            timeline_limit: 1,
+        });
+        Connection {
+            stream,
+            params,
+            rooms: [(
+                room_id.to_owned(),
+                SentRoom {
+                    at: stream,
+                    config,
+                    invite: false,
+                },
+            )]
+            .into(),
+            receipts: [(room_id.to_owned(), stream)].into(),
+            listed: 1,
+        }
+    }
+
+    /// #897: a request costs the store nothing, a flush writes each changed
+    /// connection once however many requests changed it, and a table built
+    /// over the store afterwards resumes every position it wrote.
+    #[test]
+    fn a_connection_outlives_the_table_that_held_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, connections) = stored_in(&dir);
+        let now = Instant::now();
+        let before = store.written();
+        let mut pos = connections.record(key("list"), holding(3, "!a:x"), true, now);
+        for stream in 4..50 {
+            let held = connections.resume(&key("list"), &pos, now).unwrap();
+            assert!(held.stream < stream);
+            pos = connections.record(key("list"), holding(stream, "!a:x"), false, now);
+        }
+        assert_eq!(store.written(), before, "a request writes nothing");
+        assert_eq!(connections.flush().unwrap(), 1);
+        assert_eq!(
+            store.written(),
+            before + 2,
+            "one connection is two rows: its record and when it was used"
+        );
+        assert_eq!(connections.flush().unwrap(), 0, "nothing changed since");
+        assert_eq!(store.written(), before + 2);
+
+        let restarted = Connections::with_store(Arc::clone(&store)).unwrap();
+        let held = restarted
+            .resume(&key("list"), &pos, now)
+            .expect("the position survives");
+        assert_eq!(held.stream, 49);
+        assert_eq!(held.rooms["!a:x"].at, 49);
+        assert_eq!(
+            held.rooms["!a:x"].config.required_state,
+            pairs(&[("m.room.name", "")])
+        );
+        assert_eq!(held.receipts["!a:x"], 49);
+        assert_eq!(held.listed, 1);
+        assert!(held.params.extensions.typing.on());
+        assert_eq!(held.params.lists["all"].ranges, vec![(0, 9)]);
+        // Another connection's `pos` stays unknown.
+        assert!(restarted.resume(&key("other"), &pos, now).is_none());
+    }
+
+    /// The drop of the table is the graceful stop, and writes what the
+    /// interval has not.
+    #[test]
+    fn dropping_the_table_writes_what_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, connections) = stored_in(&dir);
+        let pos = connections.record(key("list"), holding(3, "!a:x"), true, Instant::now());
+        drop(connections);
+        let restarted = Connections::with_store(store).unwrap();
+        assert!(
+            restarted
+                .resume(&key("list"), &pos, Instant::now())
+                .is_some()
+        );
+    }
+
+    /// A row written by a newer binary -- a field this one does not know --
+    /// still reads, and a row in another format is an unknown `pos`, not an
+    /// error.
+    #[test]
+    fn a_stored_row_is_read_tolerantly() {
+        let held = vec![(7_u64, Arc::new(holding(3, "!a:x")))];
+        let mut row = vec![STORED_FORMAT];
+        row.extend_from_slice(&encode_positions(&held));
+        let decoded = decode_positions(&row).unwrap();
+        assert_eq!(decoded[0].0, 7);
+        assert_eq!(decoded[0].1.rooms["!a:x"].at, 3);
+
+        let mut value: Value = serde_json::from_slice(&row[1..]).unwrap();
+        value["positions"][0]["rooms"]["!a:x"]["future"] = json!(1);
+        value["positions"][0]["future"] = json!({ "x": 1 });
+        let mut newer = vec![STORED_FORMAT];
+        newer.extend_from_slice(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(decode_positions(&newer).unwrap()[0].1.rooms["!a:x"].at, 3);
+
+        // A field this binary has and the row lacks takes its default.
+        value["positions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("receipts");
+        let mut older = vec![STORED_FORMAT];
+        older.extend_from_slice(&serde_json::to_vec(&value).unwrap());
+        assert!(decode_positions(&older).unwrap()[0].1.receipts.is_empty());
+
+        row[0] = STORED_FORMAT + 1;
+        assert!(decode_positions(&row).is_none());
+        assert!(decode_positions(&[]).is_none());
+        assert!(decode_positions(&[STORED_FORMAT, b'{']).is_none());
+    }
+
+    /// A stored connection idle past the expiry is unknown, and the next
+    /// flush deletes it.
+    #[test]
+    fn a_stored_connection_expires() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, connections) = stored_in(&dir);
+        let pos = connections.record(key("list"), holding(3, "!a:x"), true, Instant::now());
+        connections.flush().unwrap();
+        drop(connections);
+        let week = u64::try_from(CONNECTION_IDLE_EXPIRY.as_millis()).unwrap();
+        let long_ago = unix_ms() - week - 1000;
+        store
+            .put(
+                &key("list").row(Keyspace::SlidingConnectionUsed),
+                &long_ago.to_be_bytes(),
+            )
+            .unwrap();
+        let restarted = Connections::with_store(Arc::clone(&store)).unwrap();
+        assert!(
+            restarted
+                .resume(&key("list"), &pos, Instant::now())
+                .is_none()
+        );
+        restarted.flush().unwrap();
+        for keyspace in [Keyspace::SlidingConnection, Keyspace::SlidingConnectionUsed] {
+            assert!(store.get(&key("list").row(keyspace)).unwrap().is_none());
+        }
+    }
+
+    /// The store keeps no more connections per device than memory does.
+    #[test]
+    fn a_device_stores_a_bounded_number_of_connections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, connections) = stored_in(&dir);
+        let start = Instant::now();
+        for index in 0..=CONNECTIONS_PER_DEVICE {
+            let now = start + Duration::from_secs(u64::try_from(index).unwrap());
+            connections.record(key(&index.to_string()), at(1), true, now);
+            connections.flush().unwrap();
+        }
+        let rows = store
+            .scan_prefix(&keys::keyspace_prefix(Keyspace::SlidingConnection))
+            .unwrap();
+        assert_eq!(rows.len(), CONNECTIONS_PER_DEVICE);
+        assert!(
+            store
+                .get(&key("0").row(Keyspace::SlidingConnection))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -233,6 +233,8 @@ fn keyspace_table() -> Vec<(Keyspace, u8)> {
         (Keyspace::SearchPosting, 0x80),
         (Keyspace::SearchVocab, 0x81),
         (Keyspace::SearchMarker, 0x82),
+        (Keyspace::SlidingConnection, 0x4c),
+        (Keyspace::SlidingConnectionUsed, 0x4d),
     ]
 }
 
