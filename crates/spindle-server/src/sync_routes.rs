@@ -254,7 +254,7 @@ struct SlidingQuery {
 
 /// MSC4186's answer to a `pos` this server does not hold, which a client
 /// handles by dropping it and starting the connection over: one the
-/// connection retired or expired, one a restart forgot, one issued to
+/// connection retired or expired, one a crash lost, one issued to
 /// another device or connection, and the one a client kept from the
 /// homeserver this one replaced. Anything else -- a 400 `M_BAD_JSON` -- is
 /// an error a client retries with the same `pos`, forever.
@@ -378,19 +378,26 @@ async fn sliding_sync(
     // second before its next request, and a room key sent in that second
     // waits it out -- what #781 fixed for classic `/sync` (#705).
     let mut position = state.rooms.stream_position();
-    let mut typing_moved = false;
+    // Typing moves no position, so a typist who stopped (or whose notice
+    // ran out) between the previous answer and this request is not seen by
+    // the stream check below. Without this the long poll slept out its
+    // timeout while the client still showed the typist (#902).
+    let mut typing_moved = typing_wakes
+        && previous
+            .as_deref()
+            .is_some_and(|held| typing_differs(&state.typing, held));
     let (mut body, connection) = loop {
         // Nothing at all since the connection's position, so there is no
-        // answer to assemble to find that out -- unless a typing change
-        // woke the wait, which moves no position.
+        // answer to assemble to find that out -- unless typing may have
+        // changed, which moves no position.
         let quiet = since == Some(position) && !typing_moved;
         let expired = tokio::time::Instant::now() >= deadline;
         if !long_poll || expired || !quiet {
             let (body, connection, news) = assemble(position).await?;
-            // A typing wake is news on its own: the typing extension
-            // answers who is typing now, and has no "since" to say whether
-            // that differs from what the client last saw.
-            if !long_poll || expired || news || typing_moved {
+            // The typing extension says whether its rooms changed from what
+            // the connection holds, so a typing wake in a room outside its
+            // scope answers nothing and the wait goes on.
+            if !long_poll || expired || news {
                 break (body, connection);
             }
         }
@@ -398,7 +405,7 @@ async fn sliding_sync(
         typing_moved = if typing_wakes {
             tokio::select! {
                 () = state.rooms.wait_past(position, left) => false,
-                () = state.typing.wait(left) => true,
+                () = state.typing.wait_or_expiry(left) => true,
             }
         } else {
             state.rooms.wait_past(position, left).await;
@@ -456,8 +463,12 @@ struct SlidingInputs<'a> {
 /// the answer tells the client anything it does not hold: a room, a list
 /// count, or an extension's news. With the E2EE extension on and keys held,
 /// an event in any of the user's rooms is news too. The one-time-key
-/// counts, the account data and the typing rooms are in every answer, so
-/// being there is not news: see [`sliding_extensions`].
+/// counts and the account data are in every answer, so being there is not
+/// news: see [`sliding_extensions`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one answer: what each part says and what the connection then holds"
+)]
 fn sliding_answer(
     state: &AppState,
     identity: &crate::accounts::Identity,
@@ -512,7 +523,7 @@ fn sliding_answer(
         .keys()
         .map(|name| (name.clone(), json!({ "count": ordered.len() })))
         .collect();
-    let (extensions, receipts_current, extension_news) = sliding_extensions(
+    let (extensions, receipts_current, typing_current, extension_news) = sliding_extensions(
         state,
         identity,
         &params.extensions,
@@ -522,6 +533,7 @@ fn sliding_answer(
             to_device_since,
             selection: &selection,
             receipts: previous.map(|held| &held.receipts),
+            typing: previous.map(|held| &held.typing),
         },
     )?;
     state.metrics.observe_sync_phase(
@@ -593,9 +605,36 @@ fn sliding_answer(
         params,
         rooms,
         receipts,
+        typing: held_typing(previous, &visible, typing_current),
         listed: ordered.len(),
     };
     Ok((body, connection, news))
+}
+
+/// Who the connection holds as typing once the client has an answer: what
+/// it held, less the rooms it can no longer see, with the typing
+/// extension's rooms as they are now. A room nobody is typing in is not
+/// held, so the next typist there is news.
+fn held_typing(
+    previous: Option<&crate::sliding::Connection>,
+    visible: &std::collections::HashSet<&str>,
+    current: TypingCurrent,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut typing: std::collections::HashMap<String, Vec<String>> = previous
+        .map(|held| &held.typing)
+        .into_iter()
+        .flatten()
+        .filter(|(room_id, _)| visible.contains(room_id.as_str()))
+        .map(|(room_id, users)| (room_id.clone(), users.clone()))
+        .collect();
+    for (room_id, users) in current {
+        if users.is_empty() {
+            typing.remove(&room_id);
+        } else {
+            typing.insert(room_id, users);
+        }
+    }
+    typing
 }
 
 /// One room of a response to render, and how.
@@ -763,19 +802,28 @@ struct ExtensionInputs<'a> {
     selection: &'a crate::sliding::Selection,
     /// The receipts the connection holds, by room.
     receipts: Option<&'a std::collections::HashMap<String, u64>>,
+    /// Who the connection holds as typing, by room.
+    typing: Option<&'a std::collections::HashMap<String, Vec<String>>>,
 }
 
+/// Who is typing in each room of the typing extension's scope, as the
+/// client holds it once it has the answer.
+type TypingCurrent = Vec<(String, Vec<String>)>;
+
 /// The `extensions` object of a sliding-sync response, the rooms whose
-/// receipts the client is current to once it has it, and whether any
-/// extension has news since the connection's previous response.
+/// receipts the client is current to once it has it, who it then holds as
+/// typing in the typing extension's rooms, and whether any extension has
+/// news since the connection's previous response.
 ///
 /// Each room extension speaks about its own scope (see
-/// [`crate::sliding::RoomExtension::scope`]). The account data and typing
-/// extensions answer for every room in theirs, changed or not: typing has
-/// no stream position to ask "since" from, and repeating a scope's worth is
-/// the answer that cannot silently drop one -- the same trade classic sync
-/// makes for room account data. So whether account data is news is asked
-/// of its stream marks rather than of what the extension sends. Receipts
+/// [`crate::sliding::RoomExtension::scope`]). The account data extension
+/// answers for every room in its scope, changed or not: repeating a
+/// scope's worth is the answer that cannot silently drop one -- the same
+/// trade classic sync makes for room account data. So whether account data
+/// is news is asked of its stream marks rather than of what the extension
+/// sends. Typing has no stream position to ask "since" from, so the
+/// connection holds who it last said was typing, and the extension sends
+/// the rooms where that changed. Receipts
 /// bump the stream too (`Rooms::mark_receipt`), and their extension is
 /// incremental: see [`receipts_extension`].
 fn sliding_extensions(
@@ -783,19 +831,21 @@ fn sliding_extensions(
     identity: &crate::accounts::Identity,
     extensions: &crate::sliding::Extensions,
     inputs: ExtensionInputs<'_>,
-) -> Result<(Value, Vec<String>, ExtensionNews), MatrixError> {
+) -> Result<(Value, Vec<String>, TypingCurrent, ExtensionNews), MatrixError> {
     let ExtensionInputs {
         since,
         position,
         to_device_since,
         selection,
         receipts,
+        typing,
     } = inputs;
     let mut out = serde_json::Map::new();
     let mut receipts_current = Vec::new();
+    let mut typing_current = Vec::new();
     let mut news = ExtensionNews::default();
     if !extensions.any() {
-        return Ok((Value::Object(out), receipts_current, news));
+        return Ok((Value::Object(out), receipts_current, typing_current, news));
     }
 
     if extensions.to_device.on() {
@@ -839,19 +889,47 @@ fn sliding_extensions(
         receipts_current = scope.into_iter().map(str::to_owned).collect();
     }
     if extensions.typing.on() {
+        // A room goes out when who is typing in it differs from what the
+        // connection holds, as Synapse sends it: so a room whose last
+        // typist stopped goes out once with `user_ids: []`, which is how a
+        // client learns to stop showing them (#902), and an unchanged room
+        // is not sent again.
         let mut rooms = serde_json::Map::new();
         for room_id in extensions
             .typing
             .scope(&selection.windows, &selection.subscribed)
         {
-            if let Some(event) = state.typing.event(room_id) {
-                rooms.insert(room_id.to_owned(), event);
+            let users = state.typing.active(room_id);
+            let held = typing
+                .and_then(|held| held.get(room_id))
+                .map_or(&[][..], Vec::as_slice);
+            if users != held {
+                rooms.insert(
+                    room_id.to_owned(),
+                    json!({ "type": "m.typing", "content": { "user_ids": users } }),
+                );
             }
+            typing_current.push((room_id.to_owned(), users));
         }
+        news.news |= !rooms.is_empty();
         out.insert("typing".to_owned(), json!({ "rooms": rooms }));
     }
 
-    Ok((Value::Object(out), receipts_current, news))
+    Ok((Value::Object(out), receipts_current, typing_current, news))
+}
+
+/// Whether typing in a room the connection may speak about differs from
+/// what it holds. A cheap, generous check, made before a long poll waits:
+/// it looks at the rooms the connection holds rather than the typing
+/// extension's exact scope, so it can say yes where the answer then finds
+/// no news, but never says no where there is some.
+fn typing_differs(typing: &crate::typing::Typing, held: &crate::sliding::Connection) -> bool {
+    held.typing
+        .iter()
+        .any(|(room_id, users)| typing.active(room_id) != *users)
+        || typing.rooms_active().into_iter().any(|(room_id, users)| {
+            held.rooms.contains_key(&room_id) && held.typing.get(&room_id) != Some(&users)
+        })
 }
 
 /// Whether the global account data, or that of a room in `scope`, changed
@@ -1095,34 +1173,34 @@ fn sliding_invite_entry(
         .stripped_state(room_id, &identity.user_id)
         .map_err(room_error)?;
     let mut entry = serde_json::Map::new();
-    if let Some(name) = events
+    let name = events
         .iter()
         .find(|event| event["type"] == "m.room.name")
-        .and_then(|event| event["content"]["name"].as_str())
-    {
+        .and_then(|event| crate::sliding::room_name(&event["content"]));
+    if let Some(name) = name {
         entry.insert("name".to_owned(), json!(name));
+    } else {
+        // Only a room with no name is named by its heroes (MSC4186).
+        let heroes: Vec<Value> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "m.room.member"
+                    && event["state_key"] != json!(identity.user_id)
+                    && event["content"]["membership"] == "join"
+            })
+            .filter_map(|event| {
+                Some(crate::sliding::hero_entry(
+                    event["state_key"].as_str()?,
+                    event["content"]["displayname"].as_str(),
+                    event["content"]["avatar_url"].as_str(),
+                ))
+            })
+            .take(5)
+            .collect();
+        if !heroes.is_empty() {
+            entry.insert("heroes".to_owned(), Value::Array(heroes));
+        }
     }
-    let heroes: Vec<Value> = events
-        .iter()
-        .filter(|event| {
-            event["type"] == "m.room.member"
-                && event["state_key"] != json!(identity.user_id)
-                && event["content"]["membership"] == "join"
-        })
-        .take(5)
-        .map(|event| {
-            let mut hero = serde_json::Map::new();
-            hero.insert("user_id".to_owned(), event["state_key"].clone());
-            if let Some(name) = event["content"]["displayname"].as_str() {
-                hero.insert("name".to_owned(), json!(name));
-            }
-            if let Some(avatar) = event["content"]["avatar_url"].as_str() {
-                hero.insert("avatar".to_owned(), json!(avatar));
-            }
-            Value::Object(hero)
-        })
-        .collect();
-    entry.insert("heroes".to_owned(), Value::Array(heroes));
     // The avatar a row shows for the invite, from the stripped state as the
     // name is: Synapse sends it, and a client otherwise has to dig it out of
     // `invite_state` itself.
@@ -1418,7 +1496,7 @@ fn sliding_room_entry(
         .rooms
         .state_event_unscoped(room_id, "m.room.name", "")
         .ok()
-        .and_then(|content| content["name"].as_str().map(str::to_owned));
+        .and_then(|content| crate::sliding::room_name(&content));
     let (timeline, changed_ids) = sliding_timeline(state, identity, room)?;
     let state_events = if let (crate::sliding::Need::Since { widened, .. }, Some(changed_ids)) =
         (room.need, &changed_ids)
@@ -1441,7 +1519,11 @@ fn sliding_room_entry(
         .state_event_unscoped(room_id, "m.room.avatar", "")
         .ok()
         .and_then(|content| content["url"].as_str().map(str::to_owned));
-    let heroes = crate::sliding::heroes(&roster.heroes, &identity.user_id);
+    let heroes = if name.is_none() {
+        crate::sliding::heroes(&roster.heroes, &identity.user_id)
+    } else {
+        Vec::new()
+    };
     let bump_stamp = state.rooms.last_activity(room_id).map_err(room_error)?;
     let unread = state
         .rooms

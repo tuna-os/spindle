@@ -18,7 +18,9 @@
 #   COMPLEMENT_INTEROP_HS     which homeserver it plays: hs2 (default), so
 #                             Spindle drives every test and the peer answers
 #                             federation, or hs1, the inverse, where the peer
-#                             drives and single-server tests exercise it alone
+#                             drives and single-server tests exercise it alone.
+#                             Any hsN works, because a test can deploy more than
+#                             two servers: hs3 is the peer beside two Spindles
 # Complement's own COMPLEMENT_BASE_IMAGE_hs1 / _hs2 overrides pass through
 # untouched for any other pairing. The suffix must be lowercase: upstream
 # stores it verbatim and looks it up by the blueprint's lowercase name, so
@@ -52,8 +54,8 @@ interop_hs=""
 if [[ -n "${COMPLEMENT_INTEROP_IMAGE:-}" ]]; then
     interop_hs="${COMPLEMENT_INTEROP_HS:-hs2}"
     interop_hs="${interop_hs,,}"
-    if [[ "$interop_hs" != hs1 && "$interop_hs" != hs2 ]]; then
-        echo "complement: COMPLEMENT_INTEROP_HS must be hs1 or hs2, not '$interop_hs'" >&2
+    if [[ ! "$interop_hs" =~ ^hs[1-9][0-9]*$ ]]; then
+        echo "complement: COMPLEMENT_INTEROP_HS must be hs1, hs2, hs3 and so on, not '$interop_hs'" >&2
         exit 2
     fi
     # Pulled here rather than left to the blueprint build, so a peer image

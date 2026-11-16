@@ -1236,6 +1236,104 @@ async fn the_typing_extension_says_who_is_typing() {
     );
 }
 
+/// Alice typing (or not) in `room`, with `timeout_ms` when she starts.
+async fn set_typing(harness: &Harness, alice: &str, room: &str, typing: bool, timeout_ms: u64) {
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/typing/@alice:example.org"),
+            alice,
+            &json!({ "typing": typing, "timeout": timeout_ms }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Bob's long poll on `pos` with the typing extension, given five seconds
+/// to answer: well inside its own timeout of thirty, so an answer means a
+/// change woke it. `meanwhile` runs while the poll waits.
+async fn typing_poll(
+    harness: &Arc<Harness>,
+    bob: &str,
+    pos: String,
+    meanwhile: impl std::future::Future<Output = ()>,
+) -> Value {
+    let mut poll = with_extensions(json!({ "typing": { "enabled": true } }));
+    poll["timeout"] = json!(30_000);
+    let waiting = {
+        let harness = Arc::clone(harness);
+        let bob = bob.to_owned();
+        tokio::spawn(async move { harness.sliding(&bob, Some(&pos), &poll).await })
+    };
+    meanwhile.await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll slept through a typing change")
+        .unwrap()
+}
+
+/// #902: when the last typist stops, the room goes out once with an empty
+/// `user_ids`, as Synapse sends it, and that wakes the long poll -- whether
+/// she stopped before the poll began, while it waited, or by letting her
+/// notice run out. A room whose typists did not change is not sent again.
+#[tokio::test]
+async fn a_room_whose_typists_stop_is_sent_empty_and_wakes_the_poll() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Typing").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let user_ids = |response: &Value| {
+        response["extensions"]["typing"]["rooms"][&room]["content"]["user_ids"].clone()
+    };
+
+    set_typing(&harness, &alice, &room, true, 30_000).await;
+    let enabled = with_extensions(json!({ "typing": { "enabled": true } }));
+    let first = harness.sliding(&bob, None, &enabled).await;
+    assert_eq!(user_ids(&first), json!(["@alice:example.org"]), "{first}");
+
+    // She stops before bob asks again: the poll answers at once.
+    set_typing(&harness, &alice, &room, false, 0).await;
+    let stopped = typing_poll(&harness, &bob, pos(&first), async {}).await;
+    assert_eq!(user_ids(&stopped), json!([]), "{stopped}");
+
+    // Nothing changed since: the room is not sent again.
+    let mut quiet = enabled.clone();
+    quiet["timeout"] = json!(200);
+    let again = harness.sliding(&bob, Some(&pos(&stopped)), &quiet).await;
+    assert!(
+        again["extensions"]["typing"]["rooms"].get(&room).is_none(),
+        "{again}"
+    );
+
+    // She starts and stops while bob waits.
+    let started = typing_poll(&harness, &bob, pos(&again), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        set_typing(&harness, &alice, &room, true, 30_000).await;
+    })
+    .await;
+    assert_eq!(
+        user_ids(&started),
+        json!(["@alice:example.org"]),
+        "{started}"
+    );
+    let stopped = typing_poll(&harness, &bob, pos(&started), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        set_typing(&harness, &alice, &room, false, 0).await;
+    })
+    .await;
+    assert_eq!(user_ids(&stopped), json!([]), "{stopped}");
+
+    // Her notice runs out while bob waits: nobody calls the typing route,
+    // and the poll still answers.
+    set_typing(&harness, &alice, &room, true, 300).await;
+    let typing = harness.sliding(&bob, Some(&pos(&stopped)), &quiet).await;
+    assert_eq!(user_ids(&typing), json!(["@alice:example.org"]), "{typing}");
+    let expired = typing_poll(&harness, &bob, pos(&typing), async {}).await;
+    assert_eq!(user_ids(&expired), json!([]), "{expired}");
+}
+
 /// An extension's `lists` and `rooms` say which rooms it speaks about: the
 /// windows of the lists it names and the subscriptions it names, `*` for
 /// all of them. And the scoping is sticky with the rest of the extension's
@@ -1329,8 +1427,11 @@ async fn an_extension_speaks_only_about_the_lists_and_rooms_it_names() {
         "only the subscription: {response}"
     );
 
-    // A request that restates nothing keeps the scopes: typing, which is
-    // repeated every time, is still about the first list alone.
+    // A request that restates nothing keeps the scopes: when alice stops
+    // typing in both rooms, typing speaks about the first list alone.
+    for room in [&one, &two] {
+        set_typing(&harness, &alice, room, false, 0).await;
+    }
     let next = harness
         .sliding(&bob, Some(&pos(&response)), &json!({}))
         .await;
@@ -1355,6 +1456,15 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
             "/_matrix/client/v3/profile/@bob:example.org/displayname",
             &bob,
             &json!({ "displayname": "Bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/avatar_url",
+            &bob,
+            &json!({ "avatar_url": "mxc://example.org/bob" }),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1395,10 +1505,21 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
         vec!["@bob:example.org", "@carol:example.org"],
         "{entry}"
     );
-    assert_eq!(heroes[0]["name"], json!("Bob"), "{entry}");
-    assert!(
-        heroes[1].get("name").is_none(),
-        "carol never set one: {entry}"
+    // MSC4186's `Hero` keys, the member event's own: ruma reads no others
+    // (#899).
+    assert_eq!(
+        heroes[0],
+        json!({
+            "user_id": "@bob:example.org",
+            "displayname": "Bob",
+            "avatar_url": "mxc://example.org/bob",
+        }),
+        "{entry}"
+    );
+    assert_eq!(
+        heroes[1],
+        json!({ "user_id": "@carol:example.org" }),
+        "carol never set a name or an avatar: {entry}"
     );
 
     // The bump stamp is the newest event's timestamp, so it moves when the
@@ -1504,6 +1625,68 @@ async fn an_invite_carries_the_room_avatar() {
 }
 
 #[tokio::test]
+async fn heroes_name_only_a_room_without_a_name() {
+    // MSC4186 sends heroes only for a room with no `m.room.name`, and
+    // Synapse leaves them out of a named room. An empty name is no name,
+    // as the spec's `m.room.name` says. The heroes come in the order the
+    // members joined, as Synapse's room summary orders them, so a client
+    // names the room alike on both servers.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let zoe = harness.register("zoe").await;
+    let bob = harness.register("bob").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/profile/@bob:example.org/displayname",
+            &bob,
+            &json!({ "displayname": "Bob" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    harness.invite(&room, &alice, "zoe").await;
+    harness.join(&room, &zoe).await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let name = |name: &'static str| {
+        let (harness, room, alice) = (&harness, &room, &alice);
+        async move {
+            let (status, body) = harness
+                .request(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+                    alice,
+                    &json!({ "name": name }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let response = harness.sliding(alice, None, &window()).await;
+            response["rooms"][room].clone()
+        }
+    };
+
+    let entry = name("the reading circle").await;
+    assert_eq!(entry["name"], json!("the reading circle"), "{entry}");
+    assert!(entry.get("heroes").is_none(), "{entry}");
+
+    let entry = name("").await;
+    assert!(entry.get("name").is_none(), "{entry}");
+    assert_eq!(
+        entry["heroes"],
+        json!([
+            { "user_id": "@zoe:example.org" },
+            { "user_id": "@bob:example.org", "displayname": "Bob" },
+        ]),
+        "{entry}"
+    );
+}
+
+#[tokio::test]
 async fn an_invite_is_a_room_in_the_list() {
     // MSC4186 has no invite section: an invited room is in the list like any
     // other, with the stripped state the invite is rendered from and no
@@ -1546,16 +1729,9 @@ async fn an_invite_is_a_room_in_the_list() {
         "an invitee gets no timeline: {entry}"
     );
     assert!(entry.get("joined_count").is_none(), "nor counts: {entry}");
-    let ids: Vec<&str> = entry["heroes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|hero| hero["user_id"].as_str())
-        .collect();
-    assert_eq!(
-        ids,
-        vec!["@alice:example.org"],
-        "the inviter is the hero: {entry}"
+    assert!(
+        entry.get("heroes").is_none(),
+        "a named room needs no heroes: {entry}"
     );
 
     // On an initial request the invite is there too, sorted with the rest.
