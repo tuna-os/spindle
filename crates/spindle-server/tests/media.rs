@@ -905,3 +905,25 @@ async fn the_thumbnail_pixel_budget_is_exact() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["errcode"], "M_TOO_LARGE");
 }
+
+/// Element X (matrix-rust-sdk) uses the authenticated media endpoints only
+/// when `/versions` carries v1.11 or this flag; the bare `org.matrix.msc3916`
+/// names the unstable prefix, which is not served.
+#[tokio::test]
+async fn versions_advertises_stable_authenticated_media() {
+    let harness = Harness::new();
+    let (status, versions) = harness
+        .call(
+            Request::builder()
+                .uri("/_matrix/client/versions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        versions["unstable_features"]["org.matrix.msc3916.stable"],
+        true
+    );
+    assert!(versions["unstable_features"]["org.matrix.msc3916"].is_null());
+}
