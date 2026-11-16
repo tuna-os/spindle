@@ -182,15 +182,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)
 
-        self.send_response(status, reason)
-        for k, v in resp_headers:
-            if k.lower() not in HOP_BY_HOP:
-                self.send_header(k, v)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(payload)
-
         if who is not None:
             req_json = _json_or_text(body)
             record(
@@ -214,6 +205,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "response": _json_or_text(payload),
                 }
             )
+
+        # A client that gave up on a long poll has closed its socket; the
+        # exchange is still worth recording, so it is written first.
+        try:
+            self.send_response(status, reason)
+            for k, v in resp_headers:
+                if k.lower() not in HOP_BY_HOP:
+                    self.send_header(k, v)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_DELETE = do_OPTIONS = do_HEAD = _proxy
 
