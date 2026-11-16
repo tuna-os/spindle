@@ -1418,6 +1418,92 @@ async fn a_room_entry_carries_what_a_row_is_drawn_from() {
 }
 
 #[tokio::test]
+async fn num_live_counts_the_events_new_since_the_previous_answer() {
+    // MSC4186 `num_live`: how many of the window's newest events happened
+    // since the previous response, so a client rings for a mention that is
+    // new and not for one it is shown again. Synapse sends 0 on a
+    // connection starting over.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let room = harness.named_room(&alice, "news").await;
+    harness.say(&room, &alice, "old", "t1").await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(first["rooms"][&room]["num_live"], json!(0), "{first}");
+
+    harness.say(&room, &alice, "new one", "t2").await;
+    harness.say(&room, &alice, "new two", "t3").await;
+    let next = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    let entry = &next["rooms"][&room];
+    assert_eq!(bodies(entry), vec!["new one", "new two"], "{entry}");
+    assert_eq!(entry["num_live"], json!(2), "{entry}");
+
+    // A longer timeline sends older events again, and they are not live.
+    harness.say(&room, &alice, "newest", "t4").await;
+    let mut longer = window();
+    longer["lists"]["main"]["timeline_limit"] = json!(4);
+    let expanded = harness.sliding(&alice, Some(&pos(&next)), &longer).await;
+    let entry = &expanded["rooms"][&room];
+    assert_eq!(
+        bodies(entry),
+        vec!["old", "new one", "new two", "newest"],
+        "{entry}"
+    );
+    assert_eq!(entry["num_live"], json!(1), "{entry}");
+}
+
+#[tokio::test]
+async fn a_room_m_direct_names_is_a_dm() {
+    // MSC4186 `is_dm`, from the user's `m.direct` account data as Synapse
+    // reads it, and sent only when true: absent is "not a DM".
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let dm = harness.named_room(&alice, "with bob").await;
+    let group = harness.named_room(&alice, "everyone").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            "/_matrix/client/v3/user/@alice:example.org/account_data/m.direct",
+            &alice,
+            &json!({ "@bob:example.org": [dm] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = harness.sliding(&alice, None, &window()).await;
+    assert_eq!(response["rooms"][&dm]["is_dm"], json!(true), "{response}");
+    assert!(
+        response["rooms"][&group].get("is_dm").is_none(),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn an_invite_carries_the_room_avatar() {
+    // MSC4186 sends an invite's avatar beside its name, from the stripped
+    // state, as Synapse does.
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "pictures").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.avatar/"),
+            &alice,
+            &json!({ "url": "mxc://example.org/room" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    harness.invite(&room, &alice, "bob").await;
+
+    let response = harness.sliding(&bob, None, &window()).await;
+    let entry = &response["rooms"][&room];
+    assert!(entry["invite_state"].is_array(), "{entry}");
+    assert_eq!(entry["avatar"], json!("mxc://example.org/room"), "{entry}");
+}
+
+#[tokio::test]
 async fn an_invite_is_a_room_in_the_list() {
     // MSC4186 has no invite section: an invited room is in the list like any
     // other, with the stripped state the invite is rendered from and no

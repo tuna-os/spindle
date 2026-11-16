@@ -753,6 +753,38 @@ pub fn heroes(candidates: &[crate::rooms::Hero], viewer: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The rooms an `m.direct` account data event names: the room IDs in its
+/// lists, whoever they are listed under. The content is what a client
+/// wrote, so anything that is not a list of strings is passed over.
+#[must_use]
+pub fn direct_rooms(content: &Value) -> HashSet<String> {
+    content
+        .as_object()
+        .into_iter()
+        .flat_map(|by_user| by_user.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// How many of `window`'s newest events are among `live`, counted back
+/// from the newest until the first that is not: MSC4186's "the last `N`
+/// events are live".
+#[must_use]
+pub fn live_tail<S: std::hash::BuildHasher>(window: &[Value], live: &HashSet<String, S>) -> usize {
+    window
+        .iter()
+        .rev()
+        .take_while(|event| {
+            event["event_id"]
+                .as_str()
+                .is_some_and(|event_id| live.contains(event_id))
+        })
+        .count()
+}
+
 /// Clip `ranges` to a list of `len` rooms, yielding the indices in view.
 ///
 /// Ranges are inclusive on both ends, as the MSC writes them. Out-of-bounds
@@ -793,6 +825,10 @@ pub struct Timeline {
     /// The window reaches back past what the connection already sent,
     /// because the timeline limit grew (MSC4186 `expanded_timeline`).
     pub expanded: bool,
+    /// How many of the newest events are new since the connection's
+    /// previous response (MSC4186 `num_live`). `None` when no timeline was
+    /// asked for, where Synapse leaves the field out.
+    pub num_live: Option<usize>,
 }
 
 /// What a room-list row is drawn from when the room has no name: the
@@ -809,6 +845,8 @@ pub struct Summary {
     /// The room's recency, comparable across rooms: the timestamp of its
     /// newest event. A client sorts its list by this without a timeline.
     pub bump_stamp: i64,
+    /// The user's `m.direct` account data names the room.
+    pub is_dm: bool,
 }
 
 /// The `rooms` entry for one room, from the pieces the caller fetched.
@@ -840,6 +878,14 @@ pub fn room_entry(
         // Synapse's spelling, which matrix-rust-sdk reads, and the MSC's.
         entry.insert("unstable_expanded_timeline".to_owned(), json!(true));
         entry.insert("expanded_timeline".to_owned(), json!(true));
+    }
+    if let Some(num_live) = timeline.num_live {
+        entry.insert("num_live".to_owned(), json!(num_live));
+    }
+    // Absent is "not a DM" (MSC4186), so only `true` is sent, as Synapse
+    // sends it.
+    if summary.is_dm {
+        entry.insert("is_dm".to_owned(), json!(true));
     }
     entry.insert("joined_count".to_owned(), json!(summary.joined_count));
     entry.insert(
@@ -1130,6 +1176,35 @@ mod tests {
                 .resume(&key(&newest.to_string()), &tokens[newest], now)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn the_rooms_m_direct_names() {
+        let content = json!({
+            "@b:x": ["!one:x", "!two:x"],
+            "@c:x": ["!two:x", 7, { "room": "!three:x" }],
+            "@d:x": "!four:x",
+        });
+        let rooms = direct_rooms(&content);
+        let mut rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
+        rooms.sort_unstable();
+        assert_eq!(rooms, vec!["!one:x", "!two:x"]);
+        assert!(direct_rooms(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn the_live_events_are_the_newest_ones_since_the_previous_answer() {
+        let window = vec![
+            json!({ "event_id": "$old" }),
+            json!({ "event_id": "$a" }),
+            json!({ "event_id": "$b" }),
+        ];
+        let live: HashSet<String> = ["$a".to_owned(), "$b".to_owned()].into();
+        assert_eq!(live_tail(&window, &live), 2);
+        assert_eq!(live_tail(&window, &HashSet::new()), 0);
+        // Counted from the newest: a live event behind an old one is not.
+        let gap: HashSet<String> = ["$old".to_owned()].into();
+        assert_eq!(live_tail(&window, &gap), 0);
     }
 
     #[test]
