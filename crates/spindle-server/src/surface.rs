@@ -149,12 +149,14 @@ pub const ROOM_VERSION_REQUIRES: &[&str] = &[
 pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // MSC4108 rendezvous for linking a new device through MAS.
     ("org.matrix.msc4108", true),
-    // MSC3916's authenticated media. The `/_matrix/client/v1/media/*`
-    // endpoints are served, and a client that checks this flag before
-    // attaching a token to its avatar and thumbnail fetches is doing the
-    // right thing. (The frozen unauthenticated `/media/v3` twins are served
-    // alongside for clients that never check.)
-    ("org.matrix.msc3916", true),
+    // MSC3916's authenticated media, under the MSC's flag for the *stable*
+    // `/_matrix/client/v1/media/*` endpoints, which are the ones served. The
+    // bare `org.matrix.msc3916` names the unstable-prefix endpoints, which
+    // are not, and matrix-rust-sdk (Element X) checks only this flag or
+    // v1.11: without it the client falls back to the frozen `/media/v3`
+    // twins, which never fetch remote media, so every remote avatar and
+    // thumbnail is a 404.
+    ("org.matrix.msc3916.stable", true),
     // MSC3266's room summary. Advertised because the endpoint is served under
     // the unstable prefix as well as at `/v1/room_summary`, and a client that
     // checks this flag before probing the unstable path is doing the right
