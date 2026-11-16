@@ -70,6 +70,9 @@ async fn hostile_redirects_are_refused_and_honest_ones_stored() {
         "ftp://evil.example/cb",
         "/relative",
         "https://a.example/with space",
+        // Goes to evil.example, and reads as if it went to element.example.
+        "https://element.example@evil.example/cb",
+        "https://element.example:x@evil.example/cb",
     ] {
         assert_eq!(
             server.uris(json!([bad])).await,

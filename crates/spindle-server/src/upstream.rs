@@ -548,7 +548,7 @@ fn check_redirect_url(redirect_url: Option<String>) -> Result<String, MatrixErro
 /// parser reads it (internationalised names in their ASCII form, so a
 /// look-alike cannot pass for the real one), or, for an app's own scheme,
 /// the scheme alone.
-fn destination_label(redirect_url: &str) -> String {
+pub(crate) fn destination_label(redirect_url: &str) -> String {
     let Ok(url) = reqwest::Url::parse(redirect_url) else {
         return String::new();
     };

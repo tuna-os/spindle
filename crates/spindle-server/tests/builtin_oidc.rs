@@ -460,6 +460,49 @@ async fn what_must_be_refused_is_refused() {
     assert_eq!(response.status().as_u16(), 400);
 }
 
+/// The status of the authorization page for a request with this scope and
+/// challenge.
+async fn page_status(server: &Instance, client_id: &str, scope: &str, challenge: &str) -> u16 {
+    let authorize = format!(
+        "http://{}/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}",
+        server.name,
+        client_id,
+        urlencode(REDIRECT),
+        urlencode(scope),
+        challenge,
+    );
+    let response = server.client.get(&authorize).send().await.unwrap();
+    response.status().as_u16()
+}
+
+/// A code holds the scope and the challenge of its request until it is
+/// redeemed or lapses, so a request with either too long to hold gets no
+/// login page.
+#[tokio::test]
+async fn a_request_too_long_to_hold_is_refused() {
+    let server = Instance::start(true).await;
+    let client_id = server.register_client(REDIRECT).await;
+    let challenge = pkce("a-code-verifier-of-sufficient-length-for-rfc7636");
+    assert_eq!(
+        page_status(&server, &client_id, STABLE_SCOPE, &challenge).await,
+        200,
+        "an ordinary request gets the login page"
+    );
+
+    let scope = format!("{STABLE_SCOPE} {}", "x".repeat(2000));
+    assert_eq!(
+        page_status(&server, &client_id, &scope, &challenge).await,
+        400,
+        "a scope that long is not one to hold"
+    );
+    let long_challenge = "A".repeat(200);
+    assert_eq!(
+        page_status(&server, &client_id, STABLE_SCOPE, &long_challenge).await,
+        400,
+        "nor is a challenge that long"
+    );
+}
+
 #[tokio::test]
 async fn an_unconfigured_server_has_no_provider_surface() {
     let server = Instance::start(false).await;

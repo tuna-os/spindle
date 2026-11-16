@@ -87,6 +87,18 @@ impl From<MatrixError> for OAuthError {
 /// worth of lifetime, not a credential.
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 
+/// The most codes one account may have waiting. A person signs a few
+/// clients in at a time. The limit is for each account and not for the
+/// server, so that one account cannot push out another person's sign-in.
+const MAX_CODES_PER_ACCOUNT: usize = 16;
+
+/// The most a `scope` and a `code_challenge` may be. A code holds both
+/// until it is redeemed or lapses, so neither may be the size of a form
+/// body. A real scope is the API scope and one device scope. RFC 7636
+/// allows a challenge of 128 characters, and an S256 challenge is 43.
+const MAX_SCOPE_BYTES: usize = 1024;
+const MAX_CODE_CHALLENGE_BYTES: usize = 128;
+
 /// The scopes that grant the client API: the stable spelling Matrix
 /// 1.15 settled on, and the MSC2967 draft spelling older clients still
 /// send. Element Web's bundled js-sdk moved from the second to the
@@ -133,6 +145,34 @@ impl BuiltinOidc {
             codes: Mutex::new(HashMap::new()),
             threepid: crate::threepid::Sessions::default(),
         }
+    }
+
+    /// Hold `pending` until `code` is redeemed or lapses.
+    ///
+    /// Redeeming a code is the only other thing that takes one out, so a
+    /// code that nobody redeems would stay for the life of the process.
+    /// Lapsed codes go here, when the next one arrives. Then the oldest of
+    /// this account go while it holds the most it may, so a signed-in
+    /// browser that asks for codes without end keeps only the newest.
+    fn keep_code(&self, code: String, pending: PendingCode, now: Instant) {
+        let mut codes = self
+            .codes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        codes.retain(|_, held| held.expires > now);
+        let mut theirs: Vec<(Instant, String)> = codes
+            .iter()
+            .filter(|(_, held)| held.localpart == pending.localpart)
+            .map(|(key, held)| (held.expires, key.clone()))
+            .collect();
+        if theirs.len() >= MAX_CODES_PER_ACCOUNT {
+            theirs.sort_unstable();
+            let excess = theirs.len() + 1 - MAX_CODES_PER_ACCOUNT;
+            for (_, oldest) in theirs.into_iter().take(excess) {
+                codes.remove(&oldest);
+            }
+        }
+        codes.insert(code, pending);
     }
 }
 
@@ -314,6 +354,7 @@ fn check_registration(request: &RegistrationRequest) -> Result<(), OAuthError> {
         if uri.len() > MAX_REDIRECT_URI_BYTES
             || uri.chars().any(|c| c.is_control() || c.is_whitespace())
             || !redirect_scheme_allowed(uri)
+            || carries_credentials(uri)
         {
             return Err(invalid("a redirect_uri is not acceptable"));
         }
@@ -348,6 +389,17 @@ fn redirect_scheme_allowed(uri: &str) -> bool {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "+.-".contains(c))
         }
     }
+}
+
+/// Whether a redirect has a user name or a password before its host.
+///
+/// `https://client.example@other.example/` goes to `other.example`. No
+/// honest client registers such a URI, and its only use is to put a
+/// trusted name in front of the person who reads it. The legacy SSO
+/// redirect refuses the same thing (`upstream.rs`).
+fn carries_credentials(uri: &str) -> bool {
+    reqwest::Url::parse(uri)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
 }
 
 fn load_client(state: &AppState, client_id: &str) -> Result<Option<ClientRecord>, MatrixError> {
@@ -468,6 +520,20 @@ fn check_authorize(state: &AppState, params: &AuthorizeParams) -> Result<(), OAu
             "PKCE with code_challenge_method=S256 is required",
         ));
     }
+    if params.code_challenge.len() > MAX_CODE_CHALLENGE_BYTES {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code_challenge is too long",
+        ));
+    }
+    if params.scope.len() > MAX_SCOPE_BYTES {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "scope is too long",
+        ));
+    }
     if !params
         .scope
         .split(' ')
@@ -544,13 +610,19 @@ fn client_name(state: &AppState, client_id: &str) -> Result<String, MatrixError>
 
 /// The host a code would be sent to, shown so the person can tell an
 /// impostor's registration from the client they meant.
-fn redirect_host(redirect_uri: &str) -> &str {
-    redirect_uri
-        .split_once("://")
-        .map_or(redirect_uri, |(_, rest)| rest)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
+///
+/// The host is the one the URL parser reads, because that is where the
+/// browser goes. The text after `://` is not: in
+/// `https://client.example@other.example/` it begins with a user name.
+/// Registration refuses such a URI now, but a row stored before it did
+/// is still shown here.
+fn redirect_host(redirect_uri: &str) -> String {
+    let label = crate::upstream::destination_label(redirect_uri);
+    if label.is_empty() {
+        redirect_uri.to_owned()
+    } else {
+        label
+    }
 }
 
 fn consent_page(
@@ -569,7 +641,7 @@ fn consent_page(
          <button type=\"submit\">Continue as {user}</button></form>\
          <p><a href=\"/oauth2/authorize?{other}\">Use a different account</a></p>",
         client = escape(client_name),
-        host = escape(redirect_host(&params.redirect_uri)),
+        host = escape(&redirect_host(&params.redirect_uri)),
         user = escape(&user_id),
         fields = params.hidden_fields(),
         csrf = hidden("csrf", &session.csrf),
@@ -623,7 +695,7 @@ fn login_page(
          <button type=\"submit\">Sign in</button></form>{upstream}{forgot}",
         server = escape(&state.config.server.name),
         client = escape(client_name),
-        host = escape(redirect_host(&params.redirect_uri)),
+        host = escape(&redirect_host(&params.redirect_uri)),
         notice = notice,
         fields = params.hidden_fields(),
         csrf = hidden("login_csrf", csrf),
@@ -734,21 +806,20 @@ async fn authorize(
     let device_id = device_id_of(&params.scope)
         .ok_or_else(|| MatrixError::internal("checked scope lost its device"))?;
     let code = random_hex(32);
-    oidc.codes
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            code.clone(),
-            PendingCode {
-                client_id: params.client_id.clone(),
-                redirect_uri: params.redirect_uri.clone(),
-                code_challenge: params.code_challenge.clone(),
-                scope: params.scope.clone(),
-                localpart,
-                device_id,
-                expires: Instant::now() + CODE_LIFETIME,
-            },
-        );
+    let now = Instant::now();
+    oidc.keep_code(
+        code.clone(),
+        PendingCode {
+            client_id: params.client_id.clone(),
+            redirect_uri: params.redirect_uri.clone(),
+            code_challenge: params.code_challenge.clone(),
+            scope: params.scope.clone(),
+            localpart,
+            device_id,
+            expires: now + CODE_LIFETIME,
+        },
+        now,
+    );
     let mut fragment_or_query = format!("code={}", urlencode(&code));
     if let Some(value) = &params.state {
         let _ = write!(fragment_or_query, "&state={}", urlencode(value));
@@ -1022,4 +1093,94 @@ pub(crate) fn base64url_unpadded(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(localpart: &str, expires: Instant) -> PendingCode {
+        PendingCode {
+            client_id: "oc_test".to_owned(),
+            redirect_uri: "https://element.example/callback".to_owned(),
+            code_challenge: String::new(),
+            scope: String::new(),
+            localpart: localpart.to_owned(),
+            device_id: "DEVICE".to_owned(),
+            expires,
+        }
+    }
+
+    #[test]
+    fn a_code_nobody_redeems_goes_when_it_lapses() {
+        let oidc = BuiltinOidc::new();
+        let start = Instant::now();
+        oidc.keep_code(
+            "abandoned".to_owned(),
+            pending("alice", start + CODE_LIFETIME),
+            start,
+        );
+        assert!(oidc.codes.lock().unwrap().contains_key("abandoned"));
+
+        // The next sign-in, by anybody, after the first code has lapsed.
+        let later = start + CODE_LIFETIME;
+        oidc.keep_code(
+            "the-next-one".to_owned(),
+            pending("bob", later + CODE_LIFETIME),
+            later,
+        );
+        let codes = oidc.codes.lock().unwrap();
+        assert!(!codes.contains_key("abandoned"), "a lapsed code stayed");
+        assert!(codes.contains_key("the-next-one"));
+        assert_eq!(codes.len(), 1);
+    }
+
+    #[test]
+    fn an_account_keeps_only_its_newest_codes() {
+        let oidc = BuiltinOidc::new();
+        let start = Instant::now();
+        oidc.keep_code(
+            "bobs-code".to_owned(),
+            pending("bob", start + CODE_LIFETIME),
+            start,
+        );
+        // One more than the account may hold, each a moment after the last.
+        let mut now = start;
+        for n in 0..=MAX_CODES_PER_ACCOUNT {
+            now += Duration::from_millis(1);
+            oidc.keep_code(
+                format!("alice-code-{n}"),
+                pending("alice", now + CODE_LIFETIME),
+                now,
+            );
+        }
+        let codes = oidc.codes.lock().unwrap();
+        let newest = format!("alice-code-{MAX_CODES_PER_ACCOUNT}");
+        assert!(!codes.contains_key("alice-code-0"), "the oldest stayed");
+        assert!(codes.contains_key("alice-code-1"));
+        assert!(codes.contains_key(&newest));
+        assert!(codes.contains_key("bobs-code"), "bob lost a code");
+        assert_eq!(codes.len(), MAX_CODES_PER_ACCOUNT + 1);
+    }
+
+    #[test]
+    fn a_redirect_is_named_by_the_host_the_browser_goes_to() {
+        assert_eq!(
+            redirect_host("https://element.example/callback"),
+            "element.example"
+        );
+        assert_eq!(
+            redirect_host("http://localhost:8080/callback"),
+            "localhost:8080"
+        );
+        assert_eq!(
+            redirect_host("https://element.example@evil.example/cb"),
+            "evil.example"
+        );
+
+        assert!(carries_credentials("https://a.example@b.example/cb"));
+        assert!(carries_credentials("https://a.example:x@b.example/cb"));
+        assert!(!carries_credentials("https://element.example/callback"));
+        assert!(!carries_credentials("io.element.android:/"));
+    }
 }
