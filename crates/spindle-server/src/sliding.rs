@@ -477,6 +477,11 @@ pub struct Connection {
     /// it holds them as of. Apart from [`Self::rooms`] because the receipts
     /// extension has its own scope.
     pub receipts: HashMap<String, u64>,
+    /// For each room whose account data the client holds, the stream
+    /// position it holds it as of; the empty string is the global account
+    /// data. Apart from [`Self::rooms`] because the account-data extension
+    /// has its own scope.
+    pub account_data: HashMap<String, u64>,
     /// For each room where the client holds someone as typing, who. The
     /// typing extension sends a room only when this differs from now, so
     /// a room whose typists all stopped goes out once with `user_ids: []`.
@@ -1041,6 +1046,7 @@ struct StoredPosition {
     params: Params,
     rooms: HashMap<String, StoredRoom>,
     receipts: HashMap<String, u64>,
+    account_data: HashMap<String, u64>,
     typing: HashMap<String, Vec<String>>,
     listed: usize,
 }
@@ -1082,6 +1088,7 @@ fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
                 params,
                 rooms,
                 receipts,
+                account_data,
                 typing,
                 listed,
             } = connection.as_ref();
@@ -1103,6 +1110,7 @@ fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
                 params: params.clone(),
                 rooms,
                 receipts: receipts.clone(),
+                account_data: account_data.clone(),
                 typing: typing.clone(),
                 listed: *listed,
             }
@@ -1145,6 +1153,7 @@ fn decode_positions(row: &[u8]) -> Option<Held> {
                 params: position.params,
                 rooms,
                 receipts: position.receipts,
+                account_data: position.account_data,
                 typing: position.typing,
                 listed: position.listed,
             };
@@ -1724,6 +1733,7 @@ mod tests {
             )]
             .into(),
             receipts: [(room_id.to_owned(), stream)].into(),
+            account_data: [(room_id.to_owned(), stream)].into(),
             typing: [(room_id.to_owned(), vec!["@typist:example.org".to_owned()])].into(),
             listed: 1,
         }
