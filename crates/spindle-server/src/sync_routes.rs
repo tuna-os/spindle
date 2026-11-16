@@ -497,7 +497,8 @@ fn sliding_answer(
     // into, and a stale order would make the client's window show the wrong
     // rooms — the exact bug sliding sync exists to avoid.
     let ordering = std::time::Instant::now();
-    let (ordered, invited) = sliding_room_order(state, identity)?;
+    let order = sliding_room_order(state, identity, previous, position)?;
+    let (ordered, invited, departed) = (&order.ordered, &order.invited, &order.departed);
     state
         .metrics
         .observe_sync_phase(crate::metrics::SyncPhase::SlidingOrder, ordering.elapsed());
@@ -514,10 +515,11 @@ fn sliding_answer(
         .iter()
         .map(|(room_id, _)| room_id.as_str())
         .collect();
-    let selection = crate::sliding::select(&params, &ordered, &visible);
+    let selection = crate::sliding::select(&params, ordered, &visible);
     let held_rooms = previous.map(|held| &held.rooms);
-    let plan = sliding_plan(state, identity, &selection, held_rooms, &invited, position)?;
-    let rooms_out = sliding_rooms(state, identity, plan, &invited, previous, position)?;
+    let kinds = order.kinds();
+    let plan = sliding_plan(state, identity, &selection, held_rooms, kinds, position)?;
+    let rooms_out = sliding_rooms(state, identity, plan, kinds, previous, position)?;
     let lists_out: serde_json::Map<String, Value> = params
         .lists
         .keys()
@@ -531,7 +533,7 @@ fn sliding_answer(
             since: previous.map(|held| held.stream),
             position,
             to_device_since,
-            selection: &selection,
+            selection: &without_departed(&selection, departed),
             receipts: previous.map(|held| &held.receipts),
             account_data: previous.map(|held| &held.account_data),
             typing: previous.map(|held| &held.typing),
@@ -557,6 +559,7 @@ fn sliding_answer(
             at: position,
             config: std::sync::Arc::clone(config),
             invite: invited.contains(room_id),
+            departed: departed.contains_key(room_id),
         };
         rooms.insert(room_id.clone(), sent);
     }
@@ -593,13 +596,9 @@ fn sliding_answer(
         && !news
         && extension_news.rooms_wake
     {
-        let joined = ordered
-            .iter()
-            .map(|(room_id, _)| room_id.as_str())
-            .filter(|room_id| !invited.contains(*room_id));
         news = state
             .rooms
-            .any_changed(joined, held.stream, position)
+            .any_changed(order.joined(), held.stream, position)
             .map_err(room_error)?;
     }
     let mut body = serde_json::Map::new();
@@ -644,6 +643,49 @@ fn held_typing(
     typing
 }
 
+/// Which rooms of the list are not joined ones, and render differently.
+#[derive(Clone, Copy)]
+struct RoomKinds<'a> {
+    /// Invites: stripped state only.
+    invited: &'a std::collections::HashSet<String>,
+    /// Rooms the user is out of, and how they came to be.
+    departed: &'a std::collections::HashMap<String, crate::rooms::Departure>,
+}
+
+/// `selection` without the rooms the user is out of, for the extensions:
+/// who is typing in a room, or what its receipts say, is not the business
+/// of somebody who left it.
+fn without_departed(
+    selection: &crate::sliding::Selection,
+    departed: &std::collections::HashMap<String, crate::rooms::Departure>,
+) -> crate::sliding::Selection {
+    let kept = |room_id: &String| !departed.contains_key(room_id);
+    crate::sliding::Selection {
+        windows: selection
+            .windows
+            .iter()
+            .map(|(name, rooms)| {
+                (
+                    name.clone(),
+                    rooms.iter().filter(|room| kept(room)).cloned().collect(),
+                )
+            })
+            .collect(),
+        subscribed: selection
+            .subscribed
+            .iter()
+            .filter(|room| kept(room))
+            .cloned()
+            .collect(),
+        wanted: selection
+            .wanted
+            .iter()
+            .filter(|(room_id, _)| kept(room_id))
+            .map(|(room_id, config)| (room_id.clone(), std::sync::Arc::clone(config)))
+            .collect(),
+    }
+}
+
 /// One room of a response to render, and how.
 type PlannedRoom = (
     String,
@@ -668,9 +710,10 @@ fn sliding_plan(
     identity: &crate::accounts::Identity,
     selection: &crate::sliding::Selection,
     held: Option<&std::collections::HashMap<String, crate::sliding::SentRoom>>,
-    invited: &std::collections::HashSet<String>,
+    kinds: RoomKinds<'_>,
     position: u64,
 ) -> Result<Vec<PlannedRoom>, MatrixError> {
+    let RoomKinds { invited, departed } = kinds;
     let needs: Vec<(
         &String,
         &std::sync::Arc<crate::sliding::RoomConfig>,
@@ -679,11 +722,19 @@ fn sliding_plan(
         .wanted
         .iter()
         .map(|(room_id, config)| {
-            let mut need = crate::sliding::Need::of(
-                held.and_then(|held| held.get(room_id)),
-                config,
-                invited.contains(room_id),
-            );
+            let held = held.and_then(|held| held.get(room_id));
+            // An invite the user refused is news about the invite the
+            // client holds, not a room to replace it with: Synapse sends
+            // the refusal without `initial`.
+            let refused = departed.contains_key(room_id) && held.is_some_and(|held| held.invite);
+            let mut need =
+                crate::sliding::Need::of(held, config, invited.contains(room_id) || refused);
+            // A room the client holds as one the user is out of, and that
+            // they are back in: in full, from the present, so the rejoin
+            // does not hand them what was said while they were out.
+            if held.is_some_and(|held| held.departed) && !departed.contains_key(room_id) {
+                need = crate::sliding::Need::Initial;
+            }
             // A partial-state room whose resync landed after the client
             // last held it (MSC3706) goes again in full: its filled roster
             // was never a timeline event, so only an initial rendering of
@@ -721,6 +772,20 @@ fn sliding_plan(
             position,
         ));
     }
+    // A room the user is out of says nothing after their departure, so it
+    // changed for them only if the departure itself is news to the client.
+    for (room_id, _, need) in &needs {
+        if let (Some(departure), crate::sliding::Need::Since { since, .. }) =
+            (departed.get(*room_id), need)
+            && changed.contains(room_id.as_str())
+            && !state
+                .rooms
+                .in_stream_range(room_id, departure.li, *since, position)
+                .map_err(room_error)?
+        {
+            changed.remove(room_id.as_str());
+        }
+    }
     Ok(needs
         .into_iter()
         .filter(|(room_id, _, need)| need.forced() || changed.contains(room_id.as_str()))
@@ -735,11 +800,12 @@ fn sliding_rooms(
     state: &AppState,
     identity: &crate::accounts::Identity,
     plan: Vec<PlannedRoom>,
-    invited: &std::collections::HashSet<String>,
+    kinds: RoomKinds<'_>,
     previous: Option<&crate::sliding::Connection>,
     position: u64,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
     let from = previous.map(|held| held.stream);
+    let RoomKinds { invited, departed } = kinds;
     // Every cold room about to be rendered is loaded first, several at once,
     // rather than one after another as the loop below reaches it: after a
     // restart a window of twenty cold rooms costs its slowest load, not the
@@ -767,21 +833,20 @@ fn sliding_rooms(
     let mut rooms_out = serde_json::Map::new();
     for (room_id, config, need) in plan {
         let is_dm = direct.contains(&room_id);
+        let render = RoomRender {
+            room_id: &room_id,
+            config: &config,
+            need: &need,
+            from,
+            position,
+            is_dm,
+        };
         let entry = if invited.contains(&room_id) {
             sliding_invite_entry(state, identity, &room_id, is_dm)?
+        } else if let Some(departure) = departed.get(&room_id) {
+            sliding_departed_entry(state, identity, &render, departure)?
         } else {
-            sliding_room_entry(
-                state,
-                identity,
-                &RoomRender {
-                    room_id: &room_id,
-                    config: &config,
-                    need: &need,
-                    from,
-                    position,
-                    is_dm,
-                },
-            )?
+            sliding_room_entry(state, identity, &render)?
         };
         rooms_out.insert(room_id, entry);
     }
@@ -1114,18 +1179,46 @@ fn receipts_extension(
     Ok((json!({ "rooms": rooms }), any))
 }
 
-/// One room's sliding-sync entry.
-/// `(rooms newest first with their recency, the invited ones among them)`.
-type SlidingRoomOrder = (Vec<(String, i64)>, std::collections::HashSet<String>);
+/// The sorted room list, and which of its rooms are not joined ones.
+struct SlidingRoomOrder {
+    /// Every room in the list, newest first, with its recency.
+    ordered: Vec<(String, i64)>,
+    /// The invites among them.
+    invited: std::collections::HashSet<String>,
+    /// The rooms among them the user is out of, and how they came to be.
+    departed: std::collections::HashMap<String, crate::rooms::Departure>,
+}
 
-/// The sorted room list: every joined room and every invite, newest
-/// activity first. Recomputed per request because it is what the ranges
-/// index into, and a stale order would make the client's window show the
-/// wrong rooms -- the exact bug sliding sync exists to avoid. The invited
-/// set comes back too: those entries render differently.
+impl SlidingRoomOrder {
+    /// The rooms of the list the user is joined to.
+    fn joined(&self) -> impl Iterator<Item = &str> {
+        self.ordered
+            .iter()
+            .map(|(room_id, _)| room_id.as_str())
+            .filter(|room_id| {
+                !self.invited.contains(*room_id) && !self.departed.contains_key(*room_id)
+            })
+    }
+
+    fn kinds(&self) -> RoomKinds<'_> {
+        RoomKinds {
+            invited: &self.invited,
+            departed: &self.departed,
+        }
+    }
+}
+
+/// The sorted room list: every joined room, every invite and the rooms the
+/// user is out of that MSC4186 lists, newest activity first. Recomputed per
+/// request because it is what the ranges index into, and a stale order
+/// would make the client's window show the wrong rooms -- the exact bug
+/// sliding sync exists to avoid. Which rooms are invites and which the
+/// user is out of comes back too: those entries render differently.
 fn sliding_room_order(
     state: &AppState,
     identity: &crate::accounts::Identity,
+    previous: Option<&crate::sliding::Connection>,
+    position: u64,
 ) -> Result<SlidingRoomOrder, MatrixError> {
     let joined = state.rooms.joined(&identity.user_id).map_err(room_error)?;
     // Invites are rooms in the list too (MSC4186), or a client has no way
@@ -1153,8 +1246,64 @@ fn sliding_room_order(
             .unwrap_or_else(|_| now_ms());
         ordered.push((room_id.clone(), activity));
     }
+    let departed = sliding_departed(state, identity, previous, position)?;
+    for (room_id, departure) in &departed {
+        // MSC4186 dates a room the user is out of by when they went, and
+        // Synapse sorts it by that event's position.
+        ordered.push((room_id.clone(), departure.ts));
+    }
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok((ordered, invited))
+    Ok(SlidingRoomOrder {
+        ordered,
+        invited,
+        departed,
+    })
+}
+
+/// The rooms `identity` is out of that the list holds (MSC4186): one they
+/// were kicked or banned from, which stays because they may not have seen
+/// it happen; and one they left themselves (or an invite they refused),
+/// only on a connection that holds it and only until it has been told of
+/// the departure. Synapse does the same: a self-leave is listed when it is
+/// newer than the connection's previous response. A room the user forgot
+/// is never listed.
+fn sliding_departed(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    previous: Option<&crate::sliding::Connection>,
+    position: u64,
+) -> Result<std::collections::HashMap<String, crate::rooms::Departure>, MatrixError> {
+    let mut departed = std::collections::HashMap::new();
+    for room_id in state
+        .rooms
+        .departed(&identity.user_id)
+        .map_err(room_error)?
+    {
+        let Some(departure) = state
+            .rooms
+            .departure_of(&identity.user_id, &room_id)
+            .map_err(room_error)?
+        else {
+            continue;
+        };
+        let news = match previous {
+            Some(held) if held.rooms.contains_key(&room_id) => state
+                .rooms
+                .in_stream_range(&room_id, departure.li, held.stream, position)
+                .map_err(room_error)?,
+            _ => false,
+        };
+        if !(news || departure.listed_for_good())
+            || state
+                .rooms
+                .is_forgotten(&identity.user_id, &room_id)
+                .map_err(room_error)?
+        {
+            continue;
+        }
+        departed.insert(room_id, departure);
+    }
+    Ok(departed)
 }
 
 /// Milliseconds since the epoch, for dating what has no event to date it.
@@ -1493,6 +1642,141 @@ fn sliding_state_delta(
         }
     }
     Ok(out)
+}
+
+/// The `required_state` of a room the user is out of, from `as_left`, its
+/// state at the departure. A client that holds the room is sent what
+/// changed since it last held it, up to the departure; one that does not,
+/// all it asks for.
+fn sliding_departed_state(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room: &RoomRender<'_>,
+    as_left: Vec<Value>,
+    window: &[Value],
+) -> Result<Vec<Value>, MatrixError> {
+    let wanted = lazy_members_expanded(&room.config.required_state, window);
+    let changed = match room.need {
+        crate::sliding::Need::Since { since, widened, .. } if widened.is_empty() => Some(
+            state
+                .rooms
+                .room_delta(room.room_id, *since, room.position, 0)
+                .map_err(room_error)?
+                .event_ids,
+        ),
+        _ => None,
+    };
+    Ok(as_left
+        .into_iter()
+        .filter(|event| {
+            crate::sliding::wants_state(
+                &wanted,
+                &identity.user_id,
+                event["type"].as_str().unwrap_or_default(),
+                event["state_key"].as_str().unwrap_or_default(),
+            )
+        })
+        .filter(|event| {
+            changed.as_ref().is_none_or(|changed| {
+                event["event_id"]
+                    .as_str()
+                    .is_some_and(|event_id| changed.contains(event_id))
+            })
+        })
+        .collect())
+}
+
+/// The `rooms` entry for a room the user is out of: its timeline and state
+/// as they stood at the departure, with the departure itself last in the
+/// timeline. That event is what tells a client the user is out; without
+/// it the room stayed joined in Element X for good (#898).
+///
+/// No heroes or member counts, as Synapse sends none for a room the user
+/// is not in, and no unread counts to badge it with.
+fn sliding_departed_entry(
+    state: &AppState,
+    identity: &crate::accounts::Identity,
+    room: &RoomRender<'_>,
+    departure: &crate::rooms::Departure,
+) -> Result<Value, MatrixError> {
+    let room_id = room.room_id;
+    let (since, expanded) = match room.need {
+        crate::sliding::Need::Since {
+            since,
+            expanded_timeline,
+            ..
+        } => ((!*expanded_timeline).then_some(*since), *expanded_timeline),
+        crate::sliding::Need::Initial => (None, false),
+    };
+    let limit = room.config.timeline_limit.min(50);
+    let (events, limited, prev_batch) = if limit == 0 {
+        (Vec::new(), false, None)
+    } else {
+        state
+            .rooms
+            .departed_window(
+                &identity.user_id,
+                room_id,
+                departure,
+                since,
+                room.position,
+                limit,
+            )
+            .map_err(room_error)?
+    };
+    let events = state
+        .rooms
+        .prune_erased_events(&identity.user_id, room_id, events)
+        .map_err(room_error)?;
+    let as_left = state
+        .rooms
+        .departed_state(&identity.user_id, room_id, departure)
+        .map_err(room_error)?;
+    let content = |event_type: &str| {
+        as_left
+            .iter()
+            .find(|event| event["type"] == event_type && event["state_key"] == "")
+            .map(|event| event["content"].clone())
+    };
+    let name =
+        content("m.room.name").and_then(|content| content["name"].as_str().map(str::to_owned));
+    let avatar =
+        content("m.room.avatar").and_then(|content| content["url"].as_str().map(str::to_owned));
+    let required_state = sliding_departed_state(state, identity, room, as_left, &events)?;
+    let mut entry = crate::sliding::room_entry(
+        crate::sliding::Summary {
+            name,
+            avatar,
+            joined_count: 0,
+            invited_count: 0,
+            heroes: Vec::new(),
+            bump_stamp: departure.ts,
+            is_dm: false,
+        },
+        required_state,
+        crate::sliding::Timeline {
+            events: events
+                .into_iter()
+                .map(|event| with_transaction_id(state, identity, event))
+                .collect(),
+            limited,
+            prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
+            expanded,
+            // Left out, as for no timeline: a room the user is out of has no
+            // live events for them.
+            num_live: None,
+        },
+        crate::sliding::Counts {
+            notification_count: 0,
+            highlight_count: 0,
+        },
+        *room.need == crate::sliding::Need::Initial,
+    );
+    if let Value::Object(fields) = &mut entry {
+        fields.remove("joined_count");
+        fields.remove("invited_count");
+    }
+    Ok(entry)
 }
 
 fn sliding_room_entry(

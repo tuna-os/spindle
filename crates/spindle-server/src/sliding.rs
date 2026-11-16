@@ -462,6 +462,11 @@ pub struct SentRoom {
     pub config: Arc<RoomConfig>,
     /// Whether it was sent as an invite: stripped state only.
     pub invite: bool,
+    /// Whether it was sent as a room the user is out of: its timeline and
+    /// state end at their departure. A room the user joins again goes in
+    /// full, not as what changed since, which would hand them what was
+    /// said while they were out.
+    pub departed: bool,
 }
 
 /// What a connection holds at one `pos`.
@@ -1061,6 +1066,8 @@ struct StoredRoom {
     config: usize,
     #[serde(rename = "i", skip_serializing_if = "std::ops::Not::not")]
     invite: bool,
+    #[serde(rename = "d", skip_serializing_if = "std::ops::Not::not")]
+    departed: bool,
 }
 
 /// The positions of one connection as a stored row, without its format
@@ -1095,11 +1102,17 @@ fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
             let rooms = rooms
                 .iter()
                 .map(|(room_id, sent)| {
-                    let SentRoom { at, config, invite } = sent;
+                    let SentRoom {
+                        at,
+                        config,
+                        invite,
+                        departed,
+                    } = sent;
                     let room = StoredRoom {
                         at: *at,
                         config: index_of(config),
                         invite: *invite,
+                        departed: *departed,
                     };
                     (room_id.clone(), room)
                 })
@@ -1144,6 +1157,7 @@ fn decode_positions(row: &[u8]) -> Option<Held> {
                         at: room.at,
                         config: Arc::clone(configs.get(room.config)?),
                         invite: room.invite,
+                        departed: room.departed,
                     };
                     Some((room_id, sent))
                 })
@@ -1566,6 +1580,7 @@ mod tests {
                 timeline_limit: 1,
             }),
             invite: false,
+            departed: false,
         };
         let config = |required: &[(&str, &str)], limit| RoomConfig {
             required_state: pairs(required),
@@ -1729,6 +1744,7 @@ mod tests {
                     at: stream,
                     config,
                     invite: false,
+                    departed: true,
                 },
             )]
             .into(),
@@ -1770,6 +1786,7 @@ mod tests {
             .expect("the position survives");
         assert_eq!(held.stream, 49);
         assert_eq!(held.rooms["!a:x"].at, 49);
+        assert!(held.rooms["!a:x"].departed);
         assert_eq!(
             held.rooms["!a:x"].config.required_state,
             pairs(&[("m.room.name", "")])

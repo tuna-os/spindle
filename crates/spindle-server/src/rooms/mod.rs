@@ -163,6 +163,7 @@ pub struct Hero {
 type Destinations = ([u8; 32], Arc<Vec<String>>);
 
 mod admin;
+mod departure;
 mod erasure;
 pub mod extremities;
 mod federation;
@@ -178,6 +179,7 @@ mod synapse_positions;
 mod unread;
 
 pub use admin::AdminTimelineEntry;
+pub use departure::{DepartedWindow, Departure};
 pub use federation::{JOIN_GAP_CAUSE, JOIN_HISTORY_EVENTS, PartialJoinState};
 pub use read::{ReadScope, RoomReader};
 pub use retention::{PassReport, RoomPolicy, TruncationReport};
@@ -240,6 +242,11 @@ pub struct Rooms {
     /// Continuwuity across two sittings. A sort key is one i64; it lives
     /// in memory and is refreshed by the append that changes it.
     last_activity: Mutex<HashMap<String, i64>>,
+    /// (user, room) -> how the user came to be out of the room, or `None`
+    /// if they are not or the room cannot say: see [`Self::departure_of`].
+    /// Dropped when the user's membership there changes, and not when the
+    /// room is evicted, because eviction changes nothing it answers.
+    departures: Mutex<HashMap<(String, String), Option<Departure>>>,
     /// room -> user -> the stream position allocated when that user last
     /// sent a receipt in that room. A receipt is not an event and writes
     /// no stream row, so nothing about the room moves when one lands --
@@ -638,6 +645,7 @@ impl Rooms {
             unread_index: Mutex::new(HashMap::new()),
             highlights: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(HashMap::new()),
+            departures: Mutex::new(HashMap::new()),
             receipt_marks: Mutex::new(HashMap::new()),
             state_render: Mutex::new(HashMap::new()),
             member_ids: Mutex::new(HashMap::new()),
@@ -7759,6 +7767,7 @@ impl Rooms {
         let (Some(user_id), Some(membership)) = (state_key, content["membership"].as_str()) else {
             return Ok(());
         };
+        self.forget_departure(user_id, room_id);
         spindle_store::Store::put(
             self.store.as_ref(),
             &spindle_core::keys::user_room(
