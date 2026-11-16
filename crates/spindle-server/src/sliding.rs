@@ -1041,6 +1041,7 @@ struct StoredPosition {
     params: Params,
     rooms: HashMap<String, StoredRoom>,
     receipts: HashMap<String, u64>,
+    typing: HashMap<String, Vec<String>>,
     listed: usize,
 }
 
@@ -1081,6 +1082,7 @@ fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
                 params,
                 rooms,
                 receipts,
+                typing,
                 listed,
             } = connection.as_ref();
             let rooms = rooms
@@ -1101,6 +1103,7 @@ fn encode_positions(held: &[(u64, Arc<Connection>)]) -> Vec<u8> {
                 params: params.clone(),
                 rooms,
                 receipts: receipts.clone(),
+                typing: typing.clone(),
                 listed: *listed,
             }
         })
@@ -1142,6 +1145,7 @@ fn decode_positions(row: &[u8]) -> Option<Held> {
                 params: position.params,
                 rooms,
                 receipts: position.receipts,
+                typing: position.typing,
                 listed: position.listed,
             };
             Some((position.number, Arc::new(connection)))
@@ -1674,6 +1678,7 @@ mod tests {
             )]
             .into(),
             receipts: [(room_id.to_owned(), stream)].into(),
+            typing: [(room_id.to_owned(), vec!["@typist:example.org".to_owned()])].into(),
             listed: 1,
         }
     }
@@ -1714,6 +1719,7 @@ mod tests {
             pairs(&[("m.room.name", "")])
         );
         assert_eq!(held.receipts["!a:x"], 49);
+        assert_eq!(held.typing["!a:x"], ["@typist:example.org"]);
         assert_eq!(held.listed, 1);
         assert!(held.params.extensions.typing.on());
         assert_eq!(held.params.lists["all"].ranges, vec![(0, 9)]);
