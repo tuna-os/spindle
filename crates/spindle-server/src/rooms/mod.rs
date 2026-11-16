@@ -466,6 +466,15 @@ pub struct SyncRoom {
     pub cached_state: bool,
 }
 
+/// One user's membership of a room before a stream range and at its end:
+/// see [`Rooms::membership_moves`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipMove {
+    pub user_id: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
 /// A room as MSC3266 describes it to someone who may not be in it.
 ///
 /// Everything optional is optional because the room may simply not have set
@@ -4228,6 +4237,20 @@ impl Rooms {
         self.membership_rooms(user_id, INVITE)
     }
 
+    /// Rooms this user is joined to, and rooms they have left or been
+    /// banned from, from one scan of their membership index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index cannot be read.
+    pub fn joined_and_departed(
+        &self,
+        user_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), RoomError> {
+        let memberships = self.memberships(user_id)?;
+        Ok((memberships.joined, memberships.departed))
+    }
+
     /// Current invites which are news in this sync window.
     ///
     /// Membership is a standing index: reading every current invite on every
@@ -5297,6 +5320,66 @@ impl Rooms {
             }
         }
         Ok(changed)
+    }
+
+    /// Each user whose member event in `room_id` falls in `(since, until]`,
+    /// with their membership before the range and at its end: `None` for
+    /// a user with no member event there then.
+    ///
+    /// For the device lists of `/sync`: a user who comes to share a room
+    /// with the syncing user, or stops, is a user whose keys the client
+    /// must start or stop tracking, and a display-name change is neither.
+    /// A quiet room costs one index scan and no load. The memberships come
+    /// from the membership-history index, a prefix scan per member who
+    /// moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the indexes or the room cannot be read.
+    pub fn membership_moves(
+        &self,
+        room_id: &str,
+        since: u64,
+        until: u64,
+    ) -> Result<Vec<MembershipMove>, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        let (Some(&first), Some(&last)) = (slice.iter().min(), slice.iter().max()) else {
+            return Ok(Vec::new());
+        };
+        let mut members = std::collections::BTreeSet::new();
+        self.with_room_read(room_id, |_, log| {
+            for &li in &slice {
+                if let Some(entry) = log.entry_at(li)
+                    && let Some(key) = &entry.state_key
+                    && key.event_type().as_str() == "m.room.member"
+                {
+                    members.insert(key.state_key().to_owned());
+                }
+            }
+            Ok(())
+        })?;
+        let mut moves = Vec::with_capacity(members.len());
+        for user_id in members {
+            let mut rows = self.member_history(room_id, &user_id)?;
+            if rows.is_empty() && self.membership_li(room_id, &user_id)?.is_some() {
+                self.backfill_member_history(room_id, &user_id)?;
+                rows = self.member_history(room_id, &user_id)?;
+            }
+            let at = |bound: i64| {
+                rows.iter()
+                    .take_while(|(li, _)| *li <= bound)
+                    .last()
+                    .map(|(_, membership)| membership.clone())
+            };
+            let before = at(first - 1);
+            let after = at(last);
+            moves.push(MembershipMove {
+                user_id,
+                before,
+                after,
+            });
+        }
+        Ok(moves)
     }
 
     /// Whether any of `rooms` had an event in `(since, until]`:

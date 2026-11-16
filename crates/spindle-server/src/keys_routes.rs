@@ -4,7 +4,7 @@
 use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
-use crate::routes::{limit_exceeded, visible_device_changes};
+use crate::routes::{device_list_updates, limit_exceeded};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get, routing::post};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -360,8 +360,10 @@ async fn key_changes(
     let to = resume(&query.to)?
         .position()
         .unwrap_or_else(|| state.rooms.stream_position());
-    let changed = visible_device_changes(&state, &identity, from, to)?;
-    Ok(Json(json!({ "changed": changed, "left": [] })))
+    let updates = device_list_updates(&state, &identity, from, to, None)?;
+    Ok(Json(
+        json!({ "changed": updates.changed, "left": updates.left }),
+    ))
 }
 
 // The postfix repetition is the spec's: these are the endpoint's three wire

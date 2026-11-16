@@ -4,8 +4,8 @@ use crate::AppState;
 use crate::auth::Authenticated;
 use crate::errors::MatrixError;
 use crate::routes::{
-    RoomRuleContext, account_data_error, raw, room_error, ruleset_of, visible_device_changes,
-    with_transaction_id,
+    DeviceListUpdates, RoomRuleContext, account_data_error, device_list_updates, raw, room_error,
+    ruleset_of, with_transaction_id,
 };
 use axum::{
     Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
@@ -978,9 +978,9 @@ fn e2ee_extension(
     since: Option<u64>,
     position: u64,
 ) -> Result<(Value, bool, bool), MatrixError> {
-    let changed = match since {
-        Some(since) => visible_device_changes(state, identity, since, position)?,
-        None => Vec::new(),
+    let updates = match since {
+        Some(since) => device_list_updates(state, identity, since, position, None)?,
+        None => DeviceListUpdates::default(),
     };
     let key_counts = state
         .devices
@@ -990,14 +990,14 @@ fn e2ee_extension(
         .devices
         .unused_fallback_algorithms(&identity.user_id, &identity.device_id)
         .map_err(|error| MatrixError::internal(&error.to_string()))?;
-    let any = !changed.is_empty();
+    let any = !updates.is_empty();
     let holds_keys = !unused_fallback.is_empty()
         || key_counts
             .values()
             .any(|count| count.as_u64().is_some_and(|count| count > 0));
     Ok((
         json!({
-            "device_lists": { "changed": changed, "left": [] },
+            "device_lists": { "changed": updates.changed, "left": updates.left },
             "device_one_time_keys_count": key_counts,
             "device_unused_fallback_key_types": unused_fallback,
         }),
@@ -1514,10 +1514,11 @@ fn sync_device_sections(
     identity: &crate::accounts::Identity,
     resume: crate::tokens::Resume,
     next_batch: u64,
+    known: crate::routes::KnownRooms<'_>,
 ) -> Result<
     (
         Vec<Value>,
-        Vec<String>,
+        DeviceListUpdates,
         serde_json::Map<String, Value>,
         Vec<String>,
     ),
@@ -1536,15 +1537,18 @@ fn sync_device_sections(
         .0;
     let device_changes = match resume {
         crate::tokens::Resume::From(since) => {
-            visible_device_changes(state, identity, since, next_batch)?
+            device_list_updates(state, identity, since, next_batch, Some(known))?
         }
-        crate::tokens::Resume::Start => Vec::new(),
+        crate::tokens::Resume::Start => DeviceListUpdates::default(),
         // The client believes this is an incremental sync, so it will not
         // re-query keys the way a fresh login does. Device changes made on
         // the old server between its last sync and the switch are in a
         // stream this server never saw; naming everyone it shares a room
         // with makes it re-query them, rather than encrypt to a stale list.
-        crate::tokens::Resume::Foreign => everyone_sharing_a_room(state, identity)?,
+        crate::tokens::Resume::Foreign => DeviceListUpdates {
+            changed: everyone_sharing_a_room(state, identity)?,
+            left: Vec::new(),
+        },
     };
     let key_counts = state
         .devices
@@ -1774,10 +1778,25 @@ fn sync_answer(
 
     let invite = sync_invite(state, identity, result.invited, filter);
     let knock = sync_knock(state, identity, result.knocked, filter);
+    // The read's departed rooms are those with events in the window, which
+    // is every departure the device lists can be told of.
+    let departed: Vec<String> = result
+        .left
+        .iter()
+        .map(|room| room.room_id.clone())
+        .collect();
     let leave = sync_leave(result.left, filter);
 
-    let (to_device, device_changes, key_counts, unused_fallback) =
-        sync_device_sections(state, identity, resume, result.next_batch)?;
+    let (to_device, device_changes, key_counts, unused_fallback) = sync_device_sections(
+        state,
+        identity,
+        resume,
+        result.next_batch,
+        crate::routes::KnownRooms {
+            joined: &result.joined,
+            departed: &departed,
+        },
+    )?;
 
     let global = sync_account_data(state, identity, filter, since, result.next_batch)?;
     let mut news = !join.is_empty()
@@ -1805,11 +1824,9 @@ fn sync_answer(
     );
     body.insert("rooms", raw(&rooms)?);
     body.insert("to_device", raw(&json!({ "events": to_device }))?);
-    // `left` is honestly empty until room departures update the watermark; a
-    // wrong name here would make clients drop sessions.
     body.insert(
         "device_lists",
-        raw(&json!({ "changed": device_changes, "left": [] }))?,
+        raw(&json!({ "changed": device_changes.changed, "left": device_changes.left }))?,
     );
     body.insert("device_one_time_keys_count", raw(&key_counts)?);
     body.insert("device_unused_fallback_key_types", raw(&unused_fallback)?);
