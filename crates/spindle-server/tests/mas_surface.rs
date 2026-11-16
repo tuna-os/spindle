@@ -32,6 +32,12 @@ impl Instance {
     /// `homeserver_secret`) is configured. The provider itself is never
     /// contacted: this surface is inbound.
     async fn start(managed: bool) -> Instance {
+        Self::start_with(managed.then_some(MAS_SECRET)).await
+    }
+
+    /// As [`Instance::start`], with this `homeserver_secret`, or with no
+    /// `[auth.delegated]` for `None`.
+    async fn start_with(secret: Option<&str>) -> Instance {
         let reg_dir = TempDir::new().unwrap();
         let reg_path = reg_dir.path().join("bridge.yaml");
         std::fs::write(
@@ -47,12 +53,12 @@ impl Instance {
         let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = TempDir::new().unwrap();
         let store = Arc::new(FjallStore::open(dir.path()).unwrap());
-        let auth = if managed {
+        let auth = if let Some(secret) = secret {
             format!(
                 "[auth.delegated]\nissuer = \"http://127.0.0.1:1/\"\n\
                  introspection_endpoint = \"http://127.0.0.1:1/introspect\"\n\
                  client_id = \"spindle\"\nclient_secret = \"hush\"\n\
-                 homeserver_secret = \"{MAS_SECRET}\"\n"
+                 homeserver_secret = \"{secret}\"\n"
             )
         } else {
             String::new()
@@ -153,6 +159,33 @@ async fn the_surface_is_the_secret_holders_alone() {
         )
         .await;
     assert_eq!(status, 403, "no token is not a better token");
+}
+
+/// An empty secret is one that anybody knows: a request with no credential
+/// presents it. A deployment that has one has no surface, as one with no
+/// secret has none.
+#[tokio::test]
+async fn an_empty_secret_admits_nobody() {
+    let server = Instance::start_with(Some("")).await;
+    let (status, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_synapse/mas/is_localpart_available?localpart=alice",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    let (status, body) = server
+        .request(
+            reqwest::Method::POST,
+            "/_synapse/mas/provision_user",
+            None,
+            Some(&json!({ "localpart": "mallory" })),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
 }
 
 #[tokio::test]

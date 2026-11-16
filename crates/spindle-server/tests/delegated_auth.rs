@@ -470,6 +470,8 @@ fn introspection_needs_some_credential() {
         .is_err()
     );
     assert!(spindle_server::Config::parse(&format!("{base}homeserver_secret = \"s\"\n")).is_ok());
+    // An empty secret is nothing to present.
+    assert!(spindle_server::Config::parse(&format!("{base}homeserver_secret = \"\"\n")).is_err());
     assert!(
         spindle_server::Config::parse(&format!("{base}client_id = \"x\"\nclient_secret = \"y\"\n"))
             .is_ok()

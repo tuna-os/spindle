@@ -1134,8 +1134,8 @@ pub struct DelegatedAuthConfig {
     pub client_secret: Option<String>,
     /// The token the provider presents when calling *us* — MAS's
     /// `matrix.secret`, guarding the `/_synapse/mas/*` provisioning
-    /// surface. Absent, that surface answers 404 and the provider
-    /// cannot manage accounts here.
+    /// surface. Absent or empty, that surface answers 404 and the
+    /// provider cannot manage accounts here.
     #[serde(default)]
     pub homeserver_secret: Option<String>,
     /// How many seconds one introspection verdict is trusted before the
@@ -1154,12 +1154,25 @@ const fn default_introspection_cache_ttl_secs() -> u64 {
 }
 
 impl DelegatedAuthConfig {
+    /// The secret the provider presents when it calls this server, if
+    /// there is one.
+    ///
+    /// An empty secret is one that anybody knows, and a request with no
+    /// credential presents it. It counts as no secret, as an empty
+    /// `registration.shared_secret` does.
+    #[must_use]
+    pub fn provider_secret(&self) -> Option<&str> {
+        self.homeserver_secret
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+    }
+
     /// Introspection has to present something. Half a client pair is a
     /// typo that would otherwise surface as every token being refused.
     fn validate(&self) -> Result<(), ConfigError> {
         match (&self.client_id, &self.client_secret) {
             (Some(_), Some(_)) => Ok(()),
-            (None, None) if self.homeserver_secret.is_some() => Ok(()),
+            (None, None) if self.provider_secret().is_some() => Ok(()),
             (None, None) => Err(ConfigError::Invalid {
                 field: "auth.delegated",
                 message: "introspection needs client_id and client_secret, or \
