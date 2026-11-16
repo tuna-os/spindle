@@ -5382,6 +5382,33 @@ impl Rooms {
         Ok(moves)
     }
 
+    /// The IDs of the events `room_id` had in the stream range
+    /// `(since, until]`, read from the room's log, with no bodies: what tells
+    /// a sliding-sync window's live events from the ones the client already
+    /// had (MSC4186 `num_live`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the index or the room cannot be read.
+    pub fn event_ids_between(
+        &self,
+        room_id: &str,
+        since: u64,
+        until: u64,
+    ) -> Result<HashSet<String>, RoomError> {
+        let slice = self.room_slice(room_id, since, until)?;
+        if slice.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.with_room_read(room_id, |_, log| {
+            Ok(slice
+                .iter()
+                .filter_map(|&li| log.entry_at(li))
+                .map(|entry| entry.event_id.as_str().to_owned())
+                .collect())
+        })
+    }
+
     /// Whether any of `rooms` had an event in `(since, until]`:
     /// [`Self::changed_rooms`] for a caller that needs only the answer, so
     /// it stops at the first room that did.

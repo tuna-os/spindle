@@ -517,7 +517,7 @@ fn sliding_answer(
     let selection = crate::sliding::select(&params, &ordered, &visible);
     let held_rooms = previous.map(|held| &held.rooms);
     let plan = sliding_plan(state, identity, &selection, held_rooms, &invited, position)?;
-    let rooms_out = sliding_rooms(state, identity, plan, &invited, position)?;
+    let rooms_out = sliding_rooms(state, identity, plan, &invited, previous, position)?;
     let lists_out: serde_json::Map<String, Value> = params
         .lists
         .keys()
@@ -721,14 +721,18 @@ fn sliding_plan(
         .collect())
 }
 
-/// The `rooms` object: each planned room's entry.
+/// The `rooms` object: each planned room's entry. `previous` is what the
+/// connection held, `None` for a connection starting over, and `position`
+/// the stream position this response answers at.
 fn sliding_rooms(
     state: &AppState,
     identity: &crate::accounts::Identity,
     plan: Vec<PlannedRoom>,
     invited: &std::collections::HashSet<String>,
+    previous: Option<&crate::sliding::Connection>,
     position: u64,
 ) -> Result<serde_json::Map<String, Value>, MatrixError> {
+    let from = previous.map(|held| held.stream);
     // Every cold room about to be rendered is loaded first, several at once,
     // rather than one after another as the loop below reaches it: after a
     // restart a window of twenty cold rooms costs its slowest load, not the
@@ -741,10 +745,23 @@ fn sliding_rooms(
         .cloned()
         .collect();
     state.rooms.warm_all(&cold, WINDOW_LOAD_PARALLELISM);
+    // MSC4186's `is_dm` is the user's `m.direct`, as Synapse reads it: the
+    // `is_direct` of a member event is on the invitee's alone.
+    let direct = if plan.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        state
+            .account_data
+            .get(&identity.user_id, "", "m.direct")
+            .map_err(|error| crate::routes::account_data_error(&error))?
+            .map(|content| crate::sliding::direct_rooms(&content))
+            .unwrap_or_default()
+    };
     let mut rooms_out = serde_json::Map::new();
     for (room_id, config, need) in plan {
+        let is_dm = direct.contains(&room_id);
         let entry = if invited.contains(&room_id) {
-            sliding_invite_entry(state, identity, &room_id)?
+            sliding_invite_entry(state, identity, &room_id, is_dm)?
         } else {
             sliding_room_entry(
                 state,
@@ -753,7 +770,9 @@ fn sliding_rooms(
                     room_id: &room_id,
                     config: &config,
                     need: &need,
+                    from,
                     position,
+                    is_dm,
                 },
             )?
         };
@@ -1147,6 +1166,7 @@ fn sliding_invite_entry(
     state: &AppState,
     identity: &crate::accounts::Identity,
     room_id: &str,
+    is_dm: bool,
 ) -> Result<Value, MatrixError> {
     let events = state
         .rooms
@@ -1180,6 +1200,20 @@ fn sliding_invite_entry(
         if !heroes.is_empty() {
             entry.insert("heroes".to_owned(), Value::Array(heroes));
         }
+    }
+    // The avatar a row shows for the invite, from the stripped state as the
+    // name is: Synapse sends it, and a client otherwise has to dig it out of
+    // `invite_state` itself.
+    if let Some(avatar) = events
+        .iter()
+        .find(|event| event["type"] == "m.room.avatar")
+        .and_then(|event| event["content"]["url"].as_str())
+        .filter(|url| !url.is_empty())
+    {
+        entry.insert("avatar".to_owned(), json!(avatar));
+    }
+    if is_dm {
+        entry.insert("is_dm".to_owned(), json!(true));
     }
     entry.insert("invite_state".to_owned(), Value::Array(events));
     entry.insert(
@@ -1285,12 +1319,16 @@ fn sliding_required_state(
 }
 
 /// One room entry to render: which room, with what config, how the client
-/// holds it, and the stream position the response answers at.
+/// holds it, the stream position of the connection's previous response
+/// (`None` for a connection starting over), the one this response answers
+/// at, and whether the user's `m.direct` names the room.
 struct RoomRender<'a> {
     room_id: &'a str,
     config: &'a crate::sliding::RoomConfig,
     need: &'a crate::sliding::Need,
+    from: Option<u64>,
     position: u64,
+    is_dm: bool,
 }
 
 /// A room entry's timeline, and for a room the client holds, the IDs of
@@ -1311,7 +1349,9 @@ fn sliding_timeline(
         room_id,
         config,
         need,
+        from,
         position,
+        ..
     } = *render;
     let limit = config.timeline_limit.min(50);
     let tail = || {
@@ -1353,6 +1393,37 @@ fn sliding_timeline(
         .rooms
         .prune_erased_events(&identity.user_id, room_id, events)
         .map_err(room_error)?;
+    // MSC4186 `num_live`: the window's newest events that are new since the
+    // connection's previous response. A client rings for a mention by it,
+    // and cannot tell from `initial` alone: a room that moves into view
+    // because of a mention arrives `initial` with older events around it.
+    // Synapse counts none on a connection starting over, as nothing came
+    // before it to be new since.
+    let num_live = if limit == 0 {
+        None
+    } else {
+        Some(match (from, need) {
+            (None, _) => 0,
+            // The window is the room's events since the client held it, and
+            // it held it no earlier than the previous response: every one
+            // of them is new.
+            (
+                Some(from),
+                crate::sliding::Need::Since {
+                    since,
+                    expanded_timeline: false,
+                    ..
+                },
+            ) if *since >= from => events.len(),
+            (Some(from), _) => {
+                let live = state
+                    .rooms
+                    .event_ids_between(room_id, from, position)
+                    .map_err(room_error)?;
+                crate::sliding::live_tail(&events, &live)
+            }
+        })
+    };
     let timeline = crate::sliding::Timeline {
         events: events
             .into_iter()
@@ -1361,6 +1432,7 @@ fn sliding_timeline(
         limited,
         prev_batch: prev_batch.map(|li| crate::tokens::Pagination(li).to_string()),
         expanded,
+        num_live,
     };
     Ok((timeline, changed_ids))
 }
@@ -1466,6 +1538,7 @@ fn sliding_room_entry(
             invited_count: roster.invited.len(),
             heroes,
             bump_stamp,
+            is_dm: room.is_dm,
         },
         state_events,
         timeline,
