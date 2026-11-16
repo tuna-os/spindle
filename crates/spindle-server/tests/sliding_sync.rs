@@ -1236,6 +1236,104 @@ async fn the_typing_extension_says_who_is_typing() {
     );
 }
 
+/// Alice typing (or not) in `room`, with `timeout_ms` when she starts.
+async fn set_typing(harness: &Harness, alice: &str, room: &str, typing: bool, timeout_ms: u64) {
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/typing/@alice:example.org"),
+            alice,
+            &json!({ "typing": typing, "timeout": timeout_ms }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Bob's long poll on `pos` with the typing extension, given five seconds
+/// to answer: well inside its own timeout of thirty, so an answer means a
+/// change woke it. `meanwhile` runs while the poll waits.
+async fn typing_poll(
+    harness: &Arc<Harness>,
+    bob: &str,
+    pos: String,
+    meanwhile: impl std::future::Future<Output = ()>,
+) -> Value {
+    let mut poll = with_extensions(json!({ "typing": { "enabled": true } }));
+    poll["timeout"] = json!(30_000);
+    let waiting = {
+        let harness = Arc::clone(harness);
+        let bob = bob.to_owned();
+        tokio::spawn(async move { harness.sliding(&bob, Some(&pos), &poll).await })
+    };
+    meanwhile.await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the long poll slept through a typing change")
+        .unwrap()
+}
+
+/// #902: when the last typist stops, the room goes out once with an empty
+/// `user_ids`, as Synapse sends it, and that wakes the long poll -- whether
+/// she stopped before the poll began, while it waited, or by letting her
+/// notice run out. A room whose typists did not change is not sent again.
+#[tokio::test]
+async fn a_room_whose_typists_stop_is_sent_empty_and_wakes_the_poll() {
+    let harness = Arc::new(Harness::new());
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Typing").await;
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    let user_ids = |response: &Value| {
+        response["extensions"]["typing"]["rooms"][&room]["content"]["user_ids"].clone()
+    };
+
+    set_typing(&harness, &alice, &room, true, 30_000).await;
+    let enabled = with_extensions(json!({ "typing": { "enabled": true } }));
+    let first = harness.sliding(&bob, None, &enabled).await;
+    assert_eq!(user_ids(&first), json!(["@alice:example.org"]), "{first}");
+
+    // She stops before bob asks again: the poll answers at once.
+    set_typing(&harness, &alice, &room, false, 0).await;
+    let stopped = typing_poll(&harness, &bob, pos(&first), async {}).await;
+    assert_eq!(user_ids(&stopped), json!([]), "{stopped}");
+
+    // Nothing changed since: the room is not sent again.
+    let mut quiet = enabled.clone();
+    quiet["timeout"] = json!(200);
+    let again = harness.sliding(&bob, Some(&pos(&stopped)), &quiet).await;
+    assert!(
+        again["extensions"]["typing"]["rooms"].get(&room).is_none(),
+        "{again}"
+    );
+
+    // She starts and stops while bob waits.
+    let started = typing_poll(&harness, &bob, pos(&again), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        set_typing(&harness, &alice, &room, true, 30_000).await;
+    })
+    .await;
+    assert_eq!(
+        user_ids(&started),
+        json!(["@alice:example.org"]),
+        "{started}"
+    );
+    let stopped = typing_poll(&harness, &bob, pos(&started), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        set_typing(&harness, &alice, &room, false, 0).await;
+    })
+    .await;
+    assert_eq!(user_ids(&stopped), json!([]), "{stopped}");
+
+    // Her notice runs out while bob waits: nobody calls the typing route,
+    // and the poll still answers.
+    set_typing(&harness, &alice, &room, true, 300).await;
+    let typing = harness.sliding(&bob, Some(&pos(&stopped)), &quiet).await;
+    assert_eq!(user_ids(&typing), json!(["@alice:example.org"]), "{typing}");
+    let expired = typing_poll(&harness, &bob, pos(&typing), async {}).await;
+    assert_eq!(user_ids(&expired), json!([]), "{expired}");
+}
+
 /// An extension's `lists` and `rooms` say which rooms it speaks about: the
 /// windows of the lists it names and the subscriptions it names, `*` for
 /// all of them. And the scoping is sticky with the rest of the extension's
@@ -1329,8 +1427,11 @@ async fn an_extension_speaks_only_about_the_lists_and_rooms_it_names() {
         "only the subscription: {response}"
     );
 
-    // A request that restates nothing keeps the scopes: typing, which is
-    // repeated every time, is still about the first list alone.
+    // A request that restates nothing keeps the scopes: when alice stops
+    // typing in both rooms, typing speaks about the first list alone.
+    for room in [&one, &two] {
+        set_typing(&harness, &alice, room, false, 0).await;
+    }
     let next = harness
         .sliding(&bob, Some(&pos(&response)), &json!({}))
         .await;
