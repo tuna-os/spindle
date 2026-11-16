@@ -669,6 +669,94 @@ async fn a_room_already_sent_is_sent_as_what_changed() {
     assert_eq!(entry["name"], "after", "{third}");
 }
 
+/// A room the client holds is told a summary field only when something in the
+/// range since moves it: sending them all again costs bandwidth and makes the
+/// client process the room every time.
+#[tokio::test]
+async fn an_incremental_entry_leaves_out_what_did_not_change() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let bob = harness.register("bob").await;
+    let carol = harness.register("carol").await;
+    let room = harness.named_room(&alice, "steady").await;
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.avatar/"),
+            &alice,
+            &json!({ "url": "mxc://example.org/room" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let unnamed = body["room_id"].as_str().unwrap().to_owned();
+    harness.invite(&unnamed, &alice, "bob").await;
+    harness.join(&unnamed, &bob).await;
+
+    let first = harness.sliding(&alice, None, &window()).await;
+    let entry = &first["rooms"][&room];
+    for field in ["name", "avatar", "joined_count", "invited_count", "bump_stamp"] {
+        assert!(entry.get(field).is_some(), "sent in full: {field}: {first}");
+    }
+    assert!(first["rooms"][&unnamed].get("heroes").is_some(), "{first}");
+
+    // A message moves the room's recency and nothing else.
+    harness.say(&room, &alice, "hello", "t1").await;
+    harness.say(&unnamed, &alice, "hello", "t2").await;
+    let second = harness.sliding(&alice, Some(&pos(&first)), &window()).await;
+    let entry = &second["rooms"][&room];
+    assert_eq!(entry["initial"], json!(false), "{second}");
+    assert!(entry.get("bump_stamp").is_some(), "{second}");
+    for field in ["name", "avatar", "joined_count", "invited_count", "heroes"] {
+        assert!(entry.get(field).is_none(), "{field} repeated: {second}");
+    }
+    assert!(
+        second["rooms"][&unnamed].get("heroes").is_none(),
+        "heroes repeated: {second}"
+    );
+
+    // A rename sends the name, and not the avatar or counts.
+    let (status, body) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.name"),
+            &alice,
+            &json!({ "name": "renamed" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let third = harness
+        .sliding(&alice, Some(&pos(&second)), &window())
+        .await;
+    let entry = &third["rooms"][&room];
+    assert_eq!(entry["name"], json!("renamed"), "{third}");
+    for field in ["avatar", "joined_count", "invited_count", "heroes"] {
+        assert!(entry.get(field).is_none(), "{field} repeated: {third}");
+    }
+
+    // A join sends the counts, and heroes for the room with no name.
+    harness.invite(&room, &alice, "bob").await;
+    harness.join(&room, &bob).await;
+    harness.invite(&unnamed, &alice, "carol").await;
+    let fourth = harness
+        .sliding(&alice, Some(&pos(&third)), &window())
+        .await;
+    let entry = &fourth["rooms"][&room];
+    assert_eq!(entry["joined_count"], json!(2), "{fourth}");
+    assert_eq!(entry["invited_count"], json!(0), "{fourth}");
+    assert!(entry.get("name").is_none(), "{fourth}");
+    assert!(entry.get("avatar").is_none(), "{fourth}");
+    assert!(entry.get("heroes").is_none(), "named room: {fourth}");
+    assert!(
+        fourth["rooms"][&unnamed].get("heroes").is_some(),
+        "{fourth}"
+    );
+    drop(carol);
+}
+
 /// A room out of view while it changed is caught up from where the client
 /// left it when it comes back, not from the previous request.
 #[tokio::test]

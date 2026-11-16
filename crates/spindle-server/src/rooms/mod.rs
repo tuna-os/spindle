@@ -453,6 +453,9 @@ pub struct RoomDelta {
     pub prev_batch: Option<i64>,
     /// Every event in the range, kept or not.
     pub event_ids: HashSet<String>,
+    /// Whether the range holds a membership event: what moves a room's
+    /// joined and invited counts and its heroes.
+    pub members_changed: bool,
 }
 
 /// One room's share of a sync response.
@@ -5683,6 +5686,20 @@ impl Rooms {
         // (#819). Only a room with events in the range can have either.
         let mut event_ids: HashSet<String> =
             ids.iter().map(|(_, event_id)| event_id.clone()).collect();
+        let members_changed = if slice.is_empty() {
+            false
+        } else {
+            self.with_room_read(room_id, |_, log| {
+                Ok(slice.iter().any(|&li| {
+                    log.entry_at(li).is_some_and(|entry| {
+                        entry
+                            .state_key
+                            .as_ref()
+                            .is_some_and(|key| key.event_type().as_str() == "m.room.member")
+                    })
+                }))
+            })?
+        };
         if !ids.is_empty() {
             event_ids.extend(self.state_delta_event_ids(room_id, since, until)?);
         }
@@ -5709,6 +5726,7 @@ impl Rooms {
             limited,
             prev_batch: first,
             event_ids: event_ids.into_iter().collect(),
+            members_changed,
         })
     }
 

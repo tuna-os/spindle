@@ -1395,8 +1395,10 @@ pub struct Timeline {
 pub struct Summary {
     pub name: Option<String>,
     pub avatar: Option<String>,
-    pub joined_count: usize,
-    pub invited_count: usize,
+    /// `None` leaves the count out: a room the client holds is told its
+    /// counts only when a membership event is in range.
+    pub joined_count: Option<usize>,
+    pub invited_count: Option<usize>,
     /// Up to five members other than the viewer, joined first. Empty for
     /// a room with a name: MSC4186 sends heroes only to name a room that
     /// has none, and Synapse leaves them out.
@@ -1404,8 +1406,9 @@ pub struct Summary {
     /// The room's recency, comparable across rooms: the timestamp of its
     /// newest event of a type MSC4186 counts as activity
     /// ([`crate::rooms::BUMP_EVENT_TYPES`]). A client sorts its list by this
-    /// without a timeline.
-    pub bump_stamp: i64,
+    /// without a timeline. `None` leaves it out: a room the client holds is
+    /// bumped only by an event in range.
+    pub bump_stamp: Option<i64>,
     /// The user's `m.direct` account data names the room.
     pub is_dm: bool,
 }
@@ -1429,8 +1432,12 @@ pub fn room_entry(
     if !summary.heroes.is_empty() {
         entry.insert("heroes".to_owned(), Value::Array(summary.heroes));
     }
-    entry.insert("invited_count".to_owned(), json!(summary.invited_count));
-    entry.insert("bump_stamp".to_owned(), json!(summary.bump_stamp));
+    if let Some(invited_count) = summary.invited_count {
+        entry.insert("invited_count".to_owned(), json!(invited_count));
+    }
+    if let Some(bump_stamp) = summary.bump_stamp {
+        entry.insert("bump_stamp".to_owned(), json!(bump_stamp));
+    }
     entry.insert("required_state".to_owned(), Value::Array(required_state));
     entry.insert("timeline".to_owned(), Value::Array(timeline.events));
     entry.insert("limited".to_owned(), json!(timeline.limited));
@@ -1450,7 +1457,9 @@ pub fn room_entry(
     if summary.is_dm {
         entry.insert("is_dm".to_owned(), json!(true));
     }
-    entry.insert("joined_count".to_owned(), json!(summary.joined_count));
+    if let Some(joined_count) = summary.joined_count {
+        entry.insert("joined_count".to_owned(), json!(joined_count));
+    }
     entry.insert(
         "notification_count".to_owned(),
         json!(unread.notification_count),
