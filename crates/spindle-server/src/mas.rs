@@ -62,7 +62,7 @@ fn admit(state: &AppState, headers: &HeaderMap) -> Result<(), MatrixError> {
         .auth
         .delegated
         .as_ref()
-        .and_then(|delegated| delegated.homeserver_secret.as_deref())
+        .and_then(crate::config::DelegatedAuthConfig::provider_secret)
     else {
         return Err(MatrixError::new(
             StatusCode::NOT_FOUND,

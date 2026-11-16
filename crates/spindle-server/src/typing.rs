@@ -147,6 +147,36 @@ impl Typing {
         let _ = tokio::time::timeout(timeout, notified).await;
     }
 
+    /// [`Self::wait`], but also until the next notice runs out.
+    ///
+    /// A notice expires by being read, with no timer and so no wake. A
+    /// long poll that sends a room's typists when they change must hear
+    /// of an expiry too, or the client shows the typist until the poll's
+    /// own timeout (#902). Only a notice not yet expired can end the wait,
+    /// so one that has run out does not wake it again and again.
+    pub async fn wait_or_expiry(&self, timeout: Duration) {
+        let notified = self.changed.notified();
+        let now = Instant::now();
+        let until_expiry = self
+            .next_expiry(now)
+            .map_or(timeout, |at| timeout.min(at.saturating_duration_since(now)));
+        let _ = tokio::time::timeout(until_expiry, notified).await;
+    }
+
+    /// The soonest moment after `now` at which a notice runs out.
+    fn next_expiry(&self, now: Instant) -> Option<Instant> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active
+            .values()
+            .flat_map(HashMap::values)
+            .copied()
+            .filter(|expiry| *expiry > now)
+            .min()
+    }
+
     /// Every room with someone still typing, each with its sorted typists.
     ///
     /// The whole-map read the appservice ephemeral push needs: it cannot

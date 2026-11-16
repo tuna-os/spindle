@@ -29,6 +29,7 @@ lint:
     ruff check scripts
     python3 scripts/actions-pinned.py
     python3 scripts/actions-pinned-test.py
+    python3 scripts/complement-interop-hs-test.py
 
 test *ARGS:
     cargo test --workspace --all-features {{ARGS}}

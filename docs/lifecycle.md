@@ -13,13 +13,21 @@ or dehydrated-device responses issue their tokens. The checkpoint survives
 mailbox drains and receipt-only activity. A restart must allocate future
 positions above tokens clients already hold, even when push is disabled.
 
-The server keeps the state of each MSC4186 connection in memory only. After a
-restart, or after one hour without a request, the server answers the `pos` of
-a client with `M_UNKNOWN_POS`. The client then starts its connection again,
-and the server sends one initial response for its visible window. To-device
-messages have their own acknowledgement token, which is not `pos`. Thus the
-client loses no messages. The data on disk does not change, so you do not need
-a migration.
+The server keeps the state of each MSC4186 connection in memory, and writes
+a copy to the store every 15 seconds and at a graceful stop (#897). After a
+restart, a client continues its connection with its `pos`, and its room list
+does not reload. A connection stays for seven days without a request.
+
+After seven days, the server answers `M_UNKNOWN_POS`. A crash can lose the
+positions of the last 15 seconds, and the server answers the same error for
+them. The client then starts its connection again, and the server sends one
+initial response for its visible window. To-device messages have their own
+acknowledgement token, which is not `pos`. Thus the client loses no
+messages.
+
+The copies are in two new keyspaces, so an upgrade needs no migration. A
+server from before #897 does not read them. A row in a format that the
+server cannot read counts as an unknown `pos`, not as an error.
 
 ## Backup
 
