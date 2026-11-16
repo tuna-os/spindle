@@ -138,9 +138,8 @@ verify the provenance of an image or a tarball.
 `backup` / `restore` / `verify-media`, `migrate`, `gc` (frees unused state).
 `import-mas` moves MAS accounts to the built-in provider. The release
 builds have it; from source, build with `--features mas-import`.
-`import-synapse` reads a Synapse PostgreSQL database. Build from source
-with `--features synapse-import` to get it; the release builds do not
-have it yet ([#826](https://github.com/tuna-os/spindle/issues/826)).
+`import-synapse` reads a Synapse PostgreSQL database. The release builds
+have it too; from source, build with `--features synapse-import`.
 See [docs/lifecycle.md](docs/lifecycle.md) and
 [docs/migration-workspace.md](docs/migration-workspace.md).
 

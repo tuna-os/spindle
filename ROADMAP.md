@@ -125,16 +125,17 @@ Recorded so that absence reads as a decision rather than an oversight:
 ## What the 2026-11 review found
 
 A review of the code and the documents on 2026-11-10 gave these work queues.
-They are the largest distances between Spindle and a server that a stranger
-can operate.
+They were the largest distances between Spindle and a server that a stranger
+can operate. Most of the issues closed on 2026-11-10. The "Still open" column
+gives the gaps that stay. The last column gives the issues that are closed.
 
-| Area | The gap | Issues |
-|---|---|---|
-| Durability outside the room log | Writes of one key do not sync. Restore is not atomic. The backup file is not synced, and a backup needs downtime | [#810](https://github.com/tuna-os/spindle/issues/810), [#811](https://github.com/tuna-os/spindle/issues/811), [#812](https://github.com/tuna-os/spindle/issues/812), [#813](https://github.com/tuna-os/spindle/issues/813), [#815](https://github.com/tuna-os/spindle/issues/815) |
-| Growth without a bound | Open rooms stay in memory. History and some replay tables have no retention. Garbage collection is offline | [#814](https://github.com/tuna-os/spindle/issues/814), [#816](https://github.com/tuna-os/spindle/issues/816), [#817](https://github.com/tuna-os/spindle/issues/817), [#818](https://github.com/tuna-os/spindle/issues/818), [#821](https://github.com/tuna-os/spindle/issues/821), [#833](https://github.com/tuna-os/spindle/issues/833) |
-| Sync and federation correctness | Clients do not get state that fork resolution changed. An incremental `/sync` has no limit. A refused event is not fetched again | [#819](https://github.com/tuna-os/spindle/issues/819), [#820](https://github.com/tuna-os/spindle/issues/820), [#822](https://github.com/tuna-os/spindle/issues/822), [#823](https://github.com/tuna-os/spindle/issues/823) |
-| Moderation and abuse | No media quarantine, no federation allow or deny list for the server, no CAPTCHA. Rate limits by source address do not work behind a proxy | [#827](https://github.com/tuna-os/spindle/issues/827), [#828](https://github.com/tuna-os/spindle/issues/828), [#829](https://github.com/tuna-os/spindle/issues/829), [#831](https://github.com/tuna-os/spindle/issues/831), [#832](https://github.com/tuna-os/spindle/issues/832) |
-| Deployment and product | No Compose file, systemd unit, Helm chart or packages. The Synapse importer is not in the release builds. Email pushers do not deliver, search has no index, and SPEC.md describes some mechanisms that are not built | [#825](https://github.com/tuna-os/spindle/issues/825), [#826](https://github.com/tuna-os/spindle/issues/826), [#824](https://github.com/tuna-os/spindle/issues/824), [#830](https://github.com/tuna-os/spindle/issues/830), [#834](https://github.com/tuna-os/spindle/issues/834) |
+| Area | Still open | Open issues | Closed issues |
+|---|---|---|---|
+| Durability outside the room log | Nothing | None | [#810](https://github.com/tuna-os/spindle/issues/810), [#811](https://github.com/tuna-os/spindle/issues/811), [#812](https://github.com/tuna-os/spindle/issues/812), [#813](https://github.com/tuna-os/spindle/issues/813), [#815](https://github.com/tuna-os/spindle/issues/815) |
+| Growth without a bound | Open rooms stay in memory. History has no retention. Garbage collection is offline | [#816](https://github.com/tuna-os/spindle/issues/816), [#817](https://github.com/tuna-os/spindle/issues/817), [#818](https://github.com/tuna-os/spindle/issues/818) | [#814](https://github.com/tuna-os/spindle/issues/814), [#821](https://github.com/tuna-os/spindle/issues/821), [#833](https://github.com/tuna-os/spindle/issues/833) |
+| Sync and federation correctness | Clients do not get state that fork resolution changed | [#819](https://github.com/tuna-os/spindle/issues/819) | [#820](https://github.com/tuna-os/spindle/issues/820), [#822](https://github.com/tuna-os/spindle/issues/822), [#823](https://github.com/tuna-os/spindle/issues/823) |
+| Moderation and abuse | No federation allow or deny list for the server, and no CAPTCHA | [#827](https://github.com/tuna-os/spindle/issues/827), [#829](https://github.com/tuna-os/spindle/issues/829) | [#828](https://github.com/tuna-os/spindle/issues/828), [#831](https://github.com/tuna-os/spindle/issues/831), [#832](https://github.com/tuna-os/spindle/issues/832) |
+| Deployment and product | Search has no index | [#830](https://github.com/tuna-os/spindle/issues/830) | [#825](https://github.com/tuna-os/spindle/issues/825), [#826](https://github.com/tuna-os/spindle/issues/826), [#824](https://github.com/tuna-os/spindle/issues/824), [#834](https://github.com/tuna-os/spindle/issues/834) |
 
 ## Risks to the headline claim
 
