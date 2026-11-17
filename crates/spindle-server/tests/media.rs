@@ -907,8 +907,9 @@ async fn the_thumbnail_pixel_budget_is_exact() {
 }
 
 /// Element X (matrix-rust-sdk) uses the authenticated media endpoints only
-/// when `/versions` carries v1.11 or this flag; the bare `org.matrix.msc3916`
-/// names the unstable prefix, which is not served.
+/// when `/versions` carries v1.11 or this flag. The bare `org.matrix.msc3916`
+/// stays unadvertised: the unstable prefix is served, but no client needs the
+/// flag to find it.
 #[tokio::test]
 async fn versions_advertises_stable_authenticated_media() {
     let harness = Harness::new();
@@ -957,4 +958,53 @@ async fn an_image_stored_as_octet_stream_is_thumbnailed_by_its_bytes() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["errcode"], "M_UNSUPPORTED");
+}
+
+/// Element X 26.11 asks for every image and avatar at MSC3916's unstable
+/// prefix, though `/versions` names `org.matrix.msc3916.stable`. With only the
+/// `v1` routes, each request was a 404 and every image failed to load. Each
+/// unstable twin serves what its `v1` route does.
+#[tokio::test]
+async fn the_unstable_msc3916_prefix_serves_what_v1_serves() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, uploaded) = harness
+        .upload(&alice, "image/png", Some("a.png"), &small_png())
+        .await;
+    let content_uri = uploaded["content_uri"].as_str().unwrap();
+    let (server, media_id) = content_uri
+        .strip_prefix("mxc://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let unstable = "/_matrix/client/unstable/org.matrix.msc3916/media";
+    for path in [
+        format!("{unstable}/config"),
+        format!("{unstable}/download/{server}/{media_id}"),
+        format!("{unstable}/download/{server}/{media_id}/a.png"),
+        format!(
+            "{unstable}/thumbnail/{server}/{media_id}?width=32&height=32&method=scale&animated=false"
+        ),
+    ] {
+        let (status, _, bytes) = harness
+            .raw(
+                Request::builder()
+                    .uri(&path)
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(!bytes.is_empty(), "{path}");
+    }
+    let (status, _, _) = harness
+        .raw(
+            Request::builder()
+                .uri(format!("{unstable}/download/{server}/{media_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "authenticated, as v1 is");
 }

@@ -75,6 +75,30 @@ pub fn routes(max_upload_bytes: usize) -> Router<AppState> {
             "/_matrix/media/v3/thumbnail/{server_name}/{media_id}",
             get(thumbnail_media_legacy),
         )
+        // MSC3916's unstable prefix: the same endpoints before v1.11 named
+        // them `v1`. Element X 26.11 still asks here, for every image and
+        // avatar, though `/versions` names `org.matrix.msc3916.stable`; with
+        // only the `v1` routes, every one of those requests was a 404.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3916/media/config",
+            get(media_config),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3916/media/preview_url",
+            get(preview_url),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}",
+            get(download_media),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}/{file_name}",
+            get(download_media_named),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3916/media/thumbnail/{server_name}/{media_id}",
+            get(thumbnail_media),
+        )
         .route(
             "/_matrix/federation/v1/media/thumbnail/{media_id}",
             get(federation_media_thumbnail),
