@@ -79,6 +79,14 @@ const NOTARY_QUERIES_PER_MINUTE: u32 = 120;
 /// document is a few hundred bytes; a notary's answer for one server with
 /// its history is a few kilobytes.
 const KEY_DOCUMENT_MAX_BYTES: usize = 256 * 1024;
+/// Origins named in one batched notary query ([`Federation::prefetch_keys`]).
+const NOTARY_BATCH: usize = 64;
+/// The largest answer to a batched notary query: a document each, with
+/// some history, for [`NOTARY_BATCH`] origins.
+const NOTARY_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Origins asked for their own keys at once by a prefetch: under
+/// [`MAX_CONCURRENT_KEY_FETCHES`], so other lookups keep a slot.
+const PREFETCH_CONCURRENCY: usize = 16;
 
 /// How long one key fetch, direct or notary, may take.
 const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1647,6 +1655,177 @@ impl Federation {
         Vec::new()
     }
 
+    /// Gather the keys of every server in `wanted` (origin to the key IDs
+    /// its signatures name) before a batch of events is checked one at a
+    /// time. Returns the origins that are settled: their keys are held, or
+    /// every source was asked and none had them. An origin that is not
+    /// settled was not asked to the end (a notary did not answer, or the
+    /// budget ran out), so a caller must not read its missing keys as a
+    /// verdict.
+    ///
+    /// One event at a time, a room of thousands of servers costs one
+    /// lookup each, in series: the origin, with a ten-second timeout for
+    /// every dead one, then a notary query each, which the per-minute
+    /// budget soon refuses. `#fedora:fedoraproject.org` did not resync in
+    /// an hour. Here the notaries are asked first, for
+    /// [`NOTARY_BATCH`] origins in one query, and only what they lack is
+    /// asked of the origins, [`PREFETCH_CONCURRENCY`] at a time.
+    ///
+    /// **Trust.** Asking a notary first, for a batch, trusts it no more
+    /// than the fallback does: every document must still carry the
+    /// origin's own signature, and a key the origin serves later is merged
+    /// beside it.
+    pub async fn prefetch_keys(
+        &self,
+        wanted: &BTreeMap<String, Vec<String>>,
+    ) -> std::collections::BTreeSet<String> {
+        use futures_util::stream::{self, StreamExt as _};
+        let mut settled = std::collections::BTreeSet::new();
+        let mut missing = Vec::new();
+        for (origin, key_ids) in wanted {
+            if origin == &self.server_name {
+                settled.insert(origin.clone());
+                continue;
+            }
+            let held = self
+                .key_record(origin)
+                .ok()
+                .flatten()
+                .is_some_and(|record| PeerKeys::from_record(origin, &record).knows_any(key_ids));
+            if held {
+                settled.insert(origin.clone());
+            } else {
+                missing.push(origin.clone());
+            }
+        }
+        if missing.is_empty() {
+            return settled;
+        }
+        let answered = self.prefetch_from_notaries(&missing).await;
+        // The origins themselves, for what the notaries lack.
+        let still: Vec<String> = missing
+            .into_iter()
+            .filter(|origin| {
+                let held = self
+                    .key_record(origin)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| {
+                        PeerKeys::from_record(origin, &record).knows_any(&wanted[origin])
+                    });
+                if held {
+                    settled.insert(origin.clone());
+                }
+                !held
+            })
+            .collect();
+        let asked: Vec<String> = stream::iter(still)
+            .map(|origin| async move {
+                if let Some(document) = self.direct_key_document(&origin, false).await {
+                    let now = now_millis();
+                    let mut record = self
+                        .key_record(&origin)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| json!({}));
+                    keyring::merge(&mut record, &document, keyring::Source::Direct, now);
+                    record["checked_at"] = json!(now);
+                    let _ = self.put_key_record(&origin, &record);
+                }
+                origin
+            })
+            .buffer_unordered(PREFETCH_CONCURRENCY)
+            .collect()
+            .await;
+        for origin in asked {
+            if self.notaries.is_empty() || answered.contains(&origin) {
+                settled.insert(origin);
+            }
+        }
+        settled
+    }
+
+    /// The batched half of [`Self::prefetch_keys`]: [`NOTARY_BATCH`]
+    /// origins a query, each document verified and merged as one from
+    /// [`Self::notary_key_documents`] is. Returns the origins a notary
+    /// answered for, whether or not it had their keys.
+    async fn prefetch_from_notaries(
+        &self,
+        missing: &[String],
+    ) -> std::collections::BTreeSet<String> {
+        let mut answered = std::collections::BTreeSet::new();
+        for notary in &self.notaries {
+            let Some(notary_keys) = self.notary_keys(notary).await else {
+                self.metrics
+                    .record_key_fetch(KeySource::Notary, KeyFetchResult::Error);
+                continue;
+            };
+            for chunk in missing.chunks(NOTARY_BATCH) {
+                let query = json!({
+                    "server_keys": chunk
+                        .iter()
+                        .filter(|origin| **origin != notary.server_name)
+                        .map(|origin| (origin.clone(), json!({})))
+                        .collect::<serde_json::Map<_, _>>(),
+                });
+                let answer = match self
+                    .query_notary_bounded(&notary.server_name, &query, NOTARY_BATCH_MAX_BYTES)
+                    .await
+                {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        tracing::debug!(notary = %notary.server_name, "batched notary query failed: {error}");
+                        self.metrics
+                            .record_key_fetch(KeySource::Notary, KeyFetchResult::Error);
+                        continue;
+                    }
+                };
+                self.metrics
+                    .record_key_fetch(KeySource::Notary, KeyFetchResult::Ok);
+                let now = now_millis();
+                for origin in chunk {
+                    answered.insert(origin.clone());
+                    let documents = answer["server_keys"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|document| document["server_name"].as_str() == Some(origin))
+                        .take(keyring::MAX_HISTORY);
+                    let mut record = None;
+                    for document in documents {
+                        match keyring::verify_notary_document(
+                            origin,
+                            &notary.server_name,
+                            &notary_keys,
+                            document,
+                        ) {
+                            Ok(document) => {
+                                let record = record.get_or_insert_with(|| {
+                                    self.key_record(origin)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| json!({}))
+                                });
+                                keyring::merge(record, &document, keyring::Source::Notary, now);
+                            }
+                            Err(error) => tracing::warn!(
+                                notary = %notary.server_name,
+                                %origin,
+                                "refused a key document a notary handed on: {error}"
+                            ),
+                        }
+                    }
+                    if let Some(mut record) = record {
+                        record["checked_at"] = json!(now);
+                        let _ = self.put_key_record(origin, &record);
+                    }
+                }
+            }
+        }
+        answered
+    }
+
     /// Whether the notaries may be asked about `origin` now: not asked
     /// about it within [`NOTARY_INTERVAL`], and the minute's budget not
     /// spent. Asking takes the turn.
@@ -1704,6 +1883,18 @@ impl Federation {
     /// Unsigned: the endpoint is public, and the answer is checked by its
     /// signatures, not by who we asked.
     async fn query_notary(&self, notary: &str, query: &Value) -> Result<Value, FederationError> {
+        self.query_notary_bounded(notary, query, KEY_DOCUMENT_MAX_BYTES)
+            .await
+    }
+
+    /// [`Self::query_notary`] with a size bound of its own: a batch names
+    /// many origins, and its answer is as large as their documents.
+    async fn query_notary_bounded(
+        &self,
+        notary: &str,
+        query: &Value,
+        maximum: usize,
+    ) -> Result<Value, FederationError> {
         let response = self
             .request(reqwest::Method::POST, notary, "/_matrix/key/v2/query")
             .await?
@@ -1719,7 +1910,7 @@ impl Federation {
                 response.status()
             )));
         }
-        let bytes = read_bounded(response, KEY_DOCUMENT_MAX_BYTES, "notary answer").await?;
+        let bytes = read_bounded(response, maximum, "notary answer").await?;
         serde_json::from_slice(&bytes)
             .map_err(|error| FederationError::Refused(format!("notary answer: {error}")))
     }

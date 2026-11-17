@@ -38,7 +38,7 @@ use serde_json::Value;
 
 use super::gap::fetch_state;
 use super::recovery::{
-    Endpoint, Failure, Peers, RecoveryGate, check_signed, identify, signing_keys,
+    Endpoint, Failure, Peers, RecoveryGate, Refusal, check_signed, identify, signing_keys,
 };
 use crate::federation::{Federation, PeerKeys};
 use crate::metrics::Metrics;
@@ -260,8 +260,9 @@ async fn resync_from(
     let room_id = record.room_id.as_str();
     let join_id = record.join_event_id.as_str();
     let State {
-        state_ids,
+        ids: state_ids,
         mut fetched,
+        dropped,
     } = state_at_join(peers, peer, record, version, keys).await?;
     // Every auth event the fetched bodies cite that is neither among them
     // nor held here: one `/event` each. Gathered over the whole batch, so
@@ -269,7 +270,9 @@ async fn resync_from(
     // are looked up once rather than once per member.
     let mut cited = BTreeSet::new();
     for body in fetched.values() {
-        cited.extend(auth_event_ids(body).filter(|id| !fetched.contains_key(*id)));
+        cited.extend(
+            auth_event_ids(body).filter(|id| !fetched.contains_key(*id) && !dropped.contains(*id)),
+        );
     }
     let mut rest = BTreeSet::new();
     for id in cited {
@@ -295,9 +298,12 @@ async fn resync_from(
 /// The state at the join as one peer answers it.
 struct State {
     /// The IDs of the state before the join, in the order `/state` gave.
-    state_ids: Vec<String>,
+    ids: Vec<String>,
     /// The bodies of state and auth chain this server lacked, verified.
     fetched: BTreeMap<String, Value>,
+    /// Member events left out because they do not verify, and those
+    /// they authorized. Never fetched again by `/event` for this attempt.
+    dropped: BTreeSet<String>,
 }
 
 /// One `/state` at the join, rather than `/state_ids` and then `/state`:
@@ -347,7 +353,7 @@ async fn state_at_join(
         .await?
     };
     let mut state_ids = Vec::with_capacity(state_len);
-    let mut wanted = Vec::new();
+    let mut unseen = Vec::new();
     let mut seen = BTreeSet::new();
     for (index, (identified, body)) in named.into_iter().enumerate() {
         let (id, canonical) =
@@ -368,15 +374,77 @@ async fn state_at_join(
                 "state event {id} belongs to another room"
             )));
         }
-        let public_keys = signing_keys(peers, version, &canonical, &body, keys)
-            .await
-            .map_err(|why| Failure::Invalid(format!("state event {id}: {why}")))?;
-        wanted.push(Unchecked {
-            id,
+        unseen.push((id, canonical, body));
+    }
+    let rules = spindle_core::rules_of(version)
+        .ok_or_else(|| Failure::Invalid("unknown room version".to_owned()))?;
+    let mut wanted_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, canonical, body) in &unseen {
+        let Ok(required) = ruma::signatures::required_server_signatures_to_verify_event(
             canonical,
-            body,
-            public_keys,
-        });
+            &rules.signatures,
+        ) else {
+            continue;
+        };
+        for server in required {
+            let ids = wanted_keys.entry(server.as_str().to_owned()).or_default();
+            for key_id in crate::federation::signing_key_ids(body, server.as_str()) {
+                if !ids.contains(&key_id) {
+                    ids.push(key_id);
+                }
+            }
+        }
+    }
+    let (fetched, dropped) =
+        verify_unseen(peers, room_id, version, unseen, &wanted_keys, keys).await?;
+    if !dropped.is_empty() {
+        tracing::info!(
+            room = room_id,
+            %peer,
+            dropped = dropped.len(),
+            "resync leaves out member events that do not verify"
+        );
+        state_ids.retain(|id| !dropped.contains(id));
+    }
+    Ok(State {
+        ids: state_ids,
+        fetched,
+        dropped,
+    })
+}
+
+/// Check the bodies a `/state` answer carried that this server lacked,
+/// with every signer's keys gathered first ([`Federation::prefetch_keys`]).
+/// Returns the verified bodies, and the member events left out because
+/// they do not verify, with those they authorized.
+async fn verify_unseen(
+    peers: &Peers<'_>,
+    room_id: &str,
+    version: &RoomVersionId,
+    unseen: Vec<(String, ruma::CanonicalJsonObject, Value)>,
+    wanted_keys: &BTreeMap<String, Vec<String>>,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>), Failure> {
+    let rules = spindle_core::rules_of(version)
+        .ok_or_else(|| Failure::Invalid("unknown room version".to_owned()))?;
+    let settled = peers.federation.prefetch_keys(wanted_keys).await;
+    let mut dropped = BTreeSet::new();
+    let mut wanted = Vec::new();
+    for (id, canonical, body) in unseen {
+        match signing_keys(peers, version, &canonical, &body, keys).await {
+            Ok(public_keys) => wanted.push(Unchecked {
+                id,
+                canonical,
+                body,
+                public_keys,
+            }),
+            // No keys after every source was asked: that member's server
+            // is gone, and its event never verifies here.
+            Err(_) if is_member(&body) && signers_settled(&canonical, &rules, &settled) => {
+                dropped.insert(id);
+            }
+            Err(why) => return Err(Failure::Invalid(format!("state event {id}: {why}"))),
+        }
     }
     let checked = {
         let (room_id, version) = (room_id.to_owned(), version.clone());
@@ -395,13 +463,67 @@ async fn state_at_join(
     };
     let mut fetched = BTreeMap::new();
     for (unchecked, verdict) in checked {
-        let body = verdict.map_err(|refusal| {
-            let why = refusal.explain(peers, keys, &unchecked.body, version);
-            Failure::Invalid(format!("state event {}: {why}", unchecked.id))
-        })?;
-        fetched.insert(unchecked.id, body);
+        match verdict {
+            Ok(body) => {
+                fetched.insert(unchecked.id, body);
+            }
+            // A member event with a bad or expired signature is left out
+            // of the state, as Synapse leaves it out. Refusing the whole
+            // state for it kept a room of thousands partial on every
+            // attempt, its roster never served.
+            Err(Refusal::Signature(_)) if is_member(&unchecked.body) => {
+                dropped.insert(unchecked.id);
+            }
+            Err(refusal) => {
+                let why = refusal.explain(peers, keys, &unchecked.body, version);
+                return Err(Failure::Invalid(format!(
+                    "state event {}: {why}",
+                    unchecked.id
+                )));
+            }
+        }
     }
-    Ok(State { state_ids, fetched })
+    // A member event authorized by a dropped one cannot be authorized
+    // here either (a join citing its invite, say): it goes too, until
+    // nothing left cites what went.
+    loop {
+        let cascade: Vec<String> = fetched
+            .iter()
+            .filter(|(_, body)| is_member(body))
+            .filter(|(_, body)| auth_event_ids(body).any(|cited| dropped.contains(cited)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if cascade.is_empty() {
+            break;
+        }
+        for id in cascade {
+            fetched.remove(&id);
+            dropped.insert(id);
+        }
+    }
+    Ok((fetched, dropped))
+}
+
+/// Whether `body` is a member event: the only kind a resync leaves out.
+/// Any other state that does not verify still refuses the whole answer,
+/// because a room without its power levels or join rules is not that room.
+fn is_member(body: &Value) -> bool {
+    body["type"] == "m.room.member"
+}
+
+/// Whether every server whose signature `canonical` needs was looked for
+/// to the end by [`Federation::prefetch_keys`].
+fn signers_settled(
+    canonical: &ruma::CanonicalJsonObject,
+    rules: &ruma::room_version_rules::RoomVersionRules,
+    settled: &BTreeSet<String>,
+) -> bool {
+    ruma::signatures::required_server_signatures_to_verify_event(canonical, &rules.signatures)
+        .is_ok_and(|required| {
+            required
+                .iter()
+                .all(|server| settled.contains(server.as_str()))
+        })
 }
 
 /// A body named and with its signers' keys gathered, not yet checked.
