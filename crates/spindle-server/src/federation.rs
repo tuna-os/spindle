@@ -2753,7 +2753,23 @@ impl Federation {
                 .bytes()
                 .await
                 .map_err(|error| FederationError::Refused(format!("media body: {error}")))?;
-            return parse_multipart_media(&content_type, &body);
+            let (content_type, filename, bytes) = match parse_multipart_media(&content_type, &body)?
+            {
+                MediaPart::Inline(content_type, filename, bytes) => (content_type, filename, bytes),
+                MediaPart::Location(location) => {
+                    self.media_at_location(destination, &location).await?
+                }
+            };
+            // No real avatar or attachment is zero bytes; an empty part is
+            // a peer that did not send the file. Cached, it would be served
+            // as the media, with no type to thumbnail, and never asked for
+            // again.
+            if bytes.is_empty() {
+                return Err(FederationError::Refused(format!(
+                    "{destination} sent media {media_id} with no bytes"
+                )));
+            }
+            return Ok((content_type, filename, bytes));
         }
         let status = response.status();
         // `M_TOO_LARGE` is the peer's answer, not its failure to answer: a
@@ -2804,6 +2820,58 @@ impl Federation {
             .bytes()
             .await
             .map_err(|error| FederationError::Refused(format!("legacy media body: {error}")))?;
+        Ok((content_type, filename, bytes.to_vec()))
+    }
+
+    /// The file a peer's media answer named by `Location` rather than
+    /// carried (spec v1.11): a plain `GET`, unsigned, because the URL is
+    /// usually a CDN and not a homeserver. [`Self::client`] still vets
+    /// the address it resolves to and every redirect after it, so a peer
+    /// cannot point this server at its own network.
+    async fn media_at_location(
+        &self,
+        destination: &str,
+        url: &str,
+    ) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
+        let parsed = reqwest::Url::parse(url).map_err(|error| {
+            FederationError::Refused(format!("{destination} named media at {url}: {error}"))
+        })?;
+        let scheme_ok =
+            parsed.scheme() == "https" || (self.insecure_http && parsed.scheme() == "http");
+        if !scheme_ok {
+            return Err(FederationError::Refused(format!(
+                "{destination} named media at a {} URL",
+                parsed.scheme()
+            )));
+        }
+        let response = self
+            .client
+            .get(parsed)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|error| FederationError::Refused(format!("media location: {error}")))?;
+        if !response.status().is_success() {
+            return Err(FederationError::Refused(format!(
+                "{destination}'s media location answered {}",
+                response.status()
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let filename = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok())
+            .and_then(disposition_filename);
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| FederationError::Refused(format!("media location body: {error}")))?;
         Ok((content_type, filename, bytes.to_vec()))
     }
 
@@ -3733,10 +3801,7 @@ fn disposition_filename(header: &str) -> Option<String> {
 /// second. Parsed by boundary split rather than a multipart crate — two
 /// known parts with known roles do not need a streaming parser, and the
 /// body is already bounded by the media size cap.
-fn parse_multipart_media(
-    content_type: &str,
-    body: &[u8],
-) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
+fn parse_multipart_media(content_type: &str, body: &[u8]) -> Result<MediaPart, FederationError> {
     let boundary = content_type
         .split(';')
         .find_map(|param| param.trim().strip_prefix("boundary="))
@@ -3776,6 +3841,7 @@ fn parse_multipart_media(
     let headers = String::from_utf8_lossy(headers);
     let mut content_type = "application/octet-stream".to_owned();
     let mut filename = None;
+    let mut location = None;
     for line in headers.lines() {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -3783,12 +3849,28 @@ fn parse_multipart_media(
         match name.trim().to_ascii_lowercase().as_str() {
             "content-type" => value.trim().clone_into(&mut content_type),
             "content-disposition" => filename = disposition_filename(value),
+            "location" => location = Some(value.trim().to_owned()),
             _ => {}
         }
     }
+    // The spec lets the file part name where the bytes are instead of
+    // carrying them. Read as a file, that part is empty: the bug that
+    // cached Beeper's avatars as zero bytes.
+    if let Some(location) = location {
+        return Ok(MediaPart::Location(location));
+    }
     // The part ends with the CRLF that precedes the next boundary.
     let content = content.strip_suffix(b"\r\n").unwrap_or(content);
-    Ok((content_type, filename, content.to_vec()))
+    Ok(MediaPart::Inline(content_type, filename, content.to_vec()))
+}
+
+/// The file part of a federation media answer.
+#[derive(Debug)]
+enum MediaPart {
+    /// The bytes themselves: `(content_type, filename, bytes)`.
+    Inline(String, Option<String>, Vec<u8>),
+    /// A URL to fetch the bytes from.
+    Location(String),
 }
 
 /// First position of `needle` in `haystack`, if any.
