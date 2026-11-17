@@ -4,8 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use spindle_core::keys::{Keyspace, keyspace_prefix};
-use spindle_core::{RoomLog, StateKey, StateKeyTable};
+use spindle_core::keys::{Keyspace, keyspace_prefix, room_prefix};
+use spindle_core::{RestoreError, RoomLog, StateKey, StateKeyTable};
+use spindle_store::codec::EntryRecord;
 use spindle_store::verify::verify_store;
 use spindle_store::{Durability, FjallStore, ReadView, Record, RoomStore, Store, StoreError};
 use tempfile::TempDir;
@@ -25,10 +26,33 @@ fn seed(store: &impl Store, room: &str, entries: usize) {
     }
 }
 
-/// A store whose state-node reads fail on demand, as a disk fault does.
+/// Rewrite the `which`-th stored log row of `room` (in index order).
+fn rewrite_log_row(
+    store: &FjallStore,
+    room: &str,
+    which: usize,
+    edit: impl FnOnce(&mut EntryRecord),
+) -> i64 {
+    let (key, value) = store
+        .scan_prefix(&room_prefix(Keyspace::Log, room))
+        .unwrap()
+        .into_iter()
+        .nth(which)
+        .unwrap();
+    let mut record = EntryRecord::decode(&value).unwrap();
+    edit(&mut record);
+    Store::put(store, &key, &record.encode()).unwrap();
+    record.li
+}
+
+/// A store whose state-node reads fail on demand, as a disk fault does, and
+/// which can list a room whose metadata is not there.
 struct FlakyReads {
     inner: FjallStore,
     failing: AtomicBool,
+    /// A room the metadata listing names but whose metadata cannot be read,
+    /// as when a room is deleted between the listing and its load.
+    ghost_room: Option<&'static str>,
 }
 
 const FAULT: &str = "injected read fault";
@@ -48,7 +72,13 @@ impl ReadView for FlakyReads {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>, StoreError> {
-        self.inner.scan_prefix(prefix)
+        let mut rows = self.inner.scan_prefix(prefix)?;
+        if let Some(ghost) = self.ghost_room
+            && prefix == keyspace_prefix(Keyspace::RoomMeta)
+        {
+            rows.push((room_prefix(Keyspace::RoomMeta, ghost), Vec::new()));
+        }
+        Ok(rows)
     }
 
     fn scan_from(&self, prefix: &[u8], start: &[u8]) -> Result<Vec<Record>, StoreError> {
@@ -130,6 +160,7 @@ fn a_read_error_is_reported_as_an_error_not_a_missing_node() {
     let store = FlakyReads {
         inner: FjallStore::open(dir.path()).unwrap(),
         failing: AtomicBool::new(false),
+        ghost_room: None,
     };
     seed(&store, "!a:example.org", 20);
     assert!(verify_store(&store).unwrap().is_intact());
@@ -146,4 +177,54 @@ fn a_read_error_is_reported_as_an_error_not_a_missing_node() {
         .load_runtime()
         .unwrap_err();
     assert!(error.to_string().contains(FAULT), "{error}");
+}
+
+/// A room whose stored chain value no longer links is the tamper signal
+/// (SPEC §13.3). Verify must fail it and name the index where it breaks,
+/// and leave the other rooms intact. The streaming restore refuses at the
+/// first break, so it arrives as the restore error and not as a count.
+#[test]
+fn a_broken_chain_fails_verify_and_names_the_index() {
+    let dir = TempDir::new().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    seed(&store, "!a:example.org", 5);
+    seed(&store, "!b:example.org", 5);
+    assert!(verify_store(&store).unwrap().is_intact());
+    let broken = rewrite_log_row(&store, "!a:example.org", 2, |record| {
+        record.chain = Some([0xAA; 32]);
+    });
+
+    let report = verify_store(&store).unwrap();
+    assert!(!report.is_intact(), "a broken chain must fail verify");
+    assert_eq!(report.rooms, 2);
+    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+    let (room, error) = &report.problems[0];
+    assert_eq!(room, "!a:example.org");
+    assert!(
+        matches!(error, StoreError::Restore(RestoreError::BrokenChain(li)) if *li == broken),
+        "{error}"
+    );
+}
+
+/// A room whose metadata cannot be read is a problem to name, not a room to
+/// skip: the listing found it, so the operator has to hear that it is empty.
+#[test]
+fn a_room_without_metadata_is_reported() {
+    let dir = TempDir::new().unwrap();
+    let store = FlakyReads {
+        inner: FjallStore::open(dir.path()).unwrap(),
+        failing: AtomicBool::new(false),
+        ghost_room: Some("!ghost:example.org"),
+    };
+    seed(&store, "!a:example.org", 5);
+
+    let report = verify_store(&store).unwrap();
+    assert_eq!(report.rooms, 2);
+    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+    let (room, error) = &report.problems[0];
+    assert_eq!(room, "!ghost:example.org");
+    assert!(
+        error.to_string().contains("the room has no metadata"),
+        "{error}"
+    );
 }
