@@ -152,7 +152,14 @@ def check_systemd() -> None:
         path.write_text(unit.replace("/usr/local/bin/spindle", str(stub)))
         result = run(["systemd-analyze", "verify", "--man=no", str(path)])
         # ConditionPathExists is a runtime condition, not a verify error.
-        problems = [l for l in (result.stdout + result.stderr).splitlines() if l.strip()]
+        # verify also loads the host's own units and reports what it dislikes
+        # in them (the runner's xfs_scrub units use the removed
+        # CPUAccounting=); only lines about this unit are ours to fail on.
+        problems = [
+            l
+            for l in (result.stdout + result.stderr).splitlines()
+            if l.strip() and (str(path) in l or "spindle.service" in l)
+        ]
         if problems:
             fail("systemd-analyze verify: " + "; ".join(problems))
     for needle in ("DynamicUser=yes", "StateDirectory=spindle", "ProtectSystem=strict"):
