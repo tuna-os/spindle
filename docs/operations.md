@@ -67,3 +67,5 @@ account-driven history growth. These deployment controls complement the
 server's caps; they are required for the release envelope, not implemented
 by the example configuration. Keep the federation listener under the same
 resource controls as the client listener.
+
+If a client fails to load images or members, see [the fault guide](troubleshooting.md).

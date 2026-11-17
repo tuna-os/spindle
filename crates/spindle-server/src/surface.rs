@@ -150,12 +150,12 @@ pub const UNSTABLE_FEATURES: &[(&str, bool)] = &[
     // MSC4108 rendezvous for linking a new device through MAS.
     ("org.matrix.msc4108", true),
     // MSC3916's authenticated media, under the MSC's flag for the *stable*
-    // `/_matrix/client/v1/media/*` endpoints, which are the ones served. The
-    // bare `org.matrix.msc3916` names the unstable-prefix endpoints, which
-    // are not, and matrix-rust-sdk (Element X) checks only this flag or
-    // v1.11: without it the client falls back to the frozen `/media/v3`
-    // twins, which never fetch remote media, so every remote avatar and
-    // thumbnail is a 404.
+    // `/_matrix/client/v1/media/*` endpoints. Without it matrix-rust-sdk
+    // (Element X) falls back to the frozen `/media/v3` twins, which never
+    // fetch remote media, so every remote avatar and thumbnail is a 404.
+    // The unstable-prefix twins are served too (`media_routes`): Element X
+    // 26.11 asks there despite this flag. The bare `org.matrix.msc3916` is
+    // still not advertised, because nothing needs it to find them.
     ("org.matrix.msc3916.stable", true),
     // MSC3266's room summary. Advertised because the endpoint is served under
     // the unstable prefix as well as at `/v1/room_summary`, and a client that

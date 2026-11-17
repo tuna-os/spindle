@@ -61,7 +61,7 @@ and the diff is the work the release brought.
 
 ## Served beyond the spec at this pin
 
-178 routes the pinned spec does not define: MSC surfaces under
+183 routes the pinned spec does not define: MSC surfaces under
 `unstable/`, the admin and MAS-compatibility APIs, and stable spellings
 newer than the pin. Each MSC route must be accounted for in
 `contrib/msc/ledger.toml`; `scripts/msc-ledger.py --check` enforces that.
@@ -75,6 +75,11 @@ newer than the pin. Each MSC route must be accounted for in
 - `/_matrix/client/unstable/org.matrix.msc2965/auth_metadata`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{}/events`
+- `/_matrix/client/unstable/org.matrix.msc3916/media/config`
+- `/_matrix/client/unstable/org.matrix.msc3916/media/download/{}/{}`
+- `/_matrix/client/unstable/org.matrix.msc3916/media/download/{}/{}/{}`
+- `/_matrix/client/unstable/org.matrix.msc3916/media/preview_url`
+- `/_matrix/client/unstable/org.matrix.msc3916/media/thumbnail/{}/{}`
 - `/_matrix/client/unstable/org.matrix.msc4108/rendezvous`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events`
 - `/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{}`

@@ -26,7 +26,7 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**327 routes implemented; 0 known gaps in scope.**
+**332 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
@@ -345,7 +345,7 @@ neither implemented nor counted.
 - `GET /_matrix/client/v3/register/available`
 - `POST /_matrix/client/v3/register/email/requestToken`
 
-### Server, discovery & operations — 55 implemented, 0 planned
+### Server, discovery & operations — 60 implemented, 0 planned
 
 - `GET /.well-known/matrix/client`
 - `GET /.well-known/matrix/server`
@@ -356,6 +356,11 @@ neither implemented nor counted.
 - `POST /_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy`
 - `GET/PUT/DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device`
 - `POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events`
+- `GET /_matrix/client/unstable/org.matrix.msc3916/media/config`
+- `GET /_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}`
+- `GET /_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}/{file_name}`
+- `GET /_matrix/client/unstable/org.matrix.msc3916/media/preview_url`
+- `GET /_matrix/client/unstable/org.matrix.msc3916/media/thumbnail/{server_name}/{media_id}`
 - `POST /_matrix/client/unstable/org.matrix.msc4108/rendezvous`
 - `GET/PUT /_matrix/client/v1/admin/lock/{user_id}`
 - `GET/PUT /_matrix/client/v1/admin/suspend/{user_id}`
