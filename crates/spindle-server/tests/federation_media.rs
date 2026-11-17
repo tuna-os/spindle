@@ -767,3 +767,155 @@ async fn the_remote_cap_never_evicts_quarantined_media() {
     assert!(!held(&ids[2]));
     assert!(held(&ids[3]), "the item just written stays");
 }
+
+/// A peer that is not a Spindle: it answers federation media the way a
+/// server with a CDN does, by naming where the bytes are rather than
+/// carrying them. The spec lets the file part of the `multipart/mixed`
+/// answer be a `Location` header and no body (v1.11, "Content
+/// repository"); Beeper's servers answer that way for avatars.
+///
+/// `served` counts the requests to each path, so a test can see whether
+/// the mirror asked again.
+struct RedirectingPeer {
+    name: String,
+    served: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+impl RedirectingPeer {
+    /// `media` is what `GET /cdn/{media_id}` serves; `empty_first`
+    /// answers the first federation request with an empty inline part,
+    /// the shape a cache poisoned by the old parser was left holding.
+    async fn start(media: Vec<u8>, empty_first: bool) -> RedirectingPeer {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        type Shared = (
+            String,
+            Arc<Vec<u8>>,
+            Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+            bool,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let served = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let count = |served: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
+                     path: String| {
+            let mut served = served.lock().unwrap();
+            let seen = served.entry(path).or_insert(0);
+            *seen += 1;
+            *seen
+        };
+        let state: Shared = (
+            name.clone(),
+            Arc::new(media),
+            Arc::clone(&served),
+            empty_first,
+        );
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/media/download/{media_id}",
+                axum::routing::get(
+                    move |State((name, _, served, empty_first)): State<Shared>,
+                          Path(media_id): Path<String>| async move {
+                        let seen = count(&served, format!("federation/{media_id}"));
+                        let file_part = if empty_first && seen == 1 {
+                            "Content-Type: application/octet-stream\r\n\r\n".to_owned()
+                        } else {
+                            format!("Location: http://{name}/cdn/{media_id}\r\n\r\n")
+                        };
+                        let body = format!(
+                            "--b0und\r\nContent-Type: application/json\r\n\r\n{{}}\r\n\
+                             --b0und\r\n{file_part}\r\n--b0und--\r\n"
+                        );
+                        ([("content-type", "multipart/mixed; boundary=b0und")], body)
+                            .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/cdn/{media_id}",
+                axum::routing::get(
+                    move |State((_, media, served, _)): State<Shared>,
+                          Path(media_id): Path<String>| async move {
+                        count(&served, format!("cdn/{media_id}"));
+                        (
+                            [
+                                ("content-type", "image/png"),
+                                ("content-disposition", "inline; filename=\"avatar.png\""),
+                            ],
+                            media.as_ref().clone(),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        RedirectingPeer { name, served }
+    }
+
+    fn served(&self, path: &str) -> usize {
+        self.served.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+}
+
+#[tokio::test]
+async fn a_location_answer_is_followed_to_the_bytes_and_they_thumbnail() {
+    let png = small_png();
+    let peer = RedirectingPeer::start(png.clone(), false).await;
+    let mirror = Instance::start().await;
+    let bob = mirror.register("bob").await;
+
+    let (status, content_type, bytes) = mirror.download(&bob, &peer.name, "avatar1").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        content_type, "image/png",
+        "the type comes from where the bytes are"
+    );
+    assert_eq!(
+        bytes, png,
+        "the bytes behind the Location, not the empty part"
+    );
+    assert_eq!(peer.served("cdn/avatar1"), 1);
+
+    // An avatar is shown as a thumbnail: that needs the real type and bytes.
+    let response = mirror
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/thumbnail/{}/avatar1?width=32&height=32&method=crop",
+            mirror.name, peer.name
+        ))
+        .header("authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    // Cached now: neither the peer nor its CDN is asked again.
+    let (status, _, bytes) = mirror.download(&bob, &peer.name, "avatar1").await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, png);
+    assert_eq!(peer.served("federation/avatar1"), 1);
+    assert_eq!(peer.served("cdn/avatar1"), 1);
+}
+
+#[tokio::test]
+async fn an_empty_file_part_is_not_cached_as_the_media() {
+    let png = small_png();
+    let peer = RedirectingPeer::start(png.clone(), true).await;
+    let mirror = Instance::start().await;
+    let bob = mirror.register("bob").await;
+
+    // The first answer carries no bytes and no Location. Nothing to cache:
+    // an empty file stored here would be served, unthumbnailable, forever.
+    let (status, _, _) = mirror.download(&bob, &peer.name, "avatar2").await;
+    assert_eq!(status, 404);
+
+    // So the next request asks again, and gets the real file.
+    let (status, content_type, bytes) = mirror.download(&bob, &peer.name, "avatar2").await;
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "image/png");
+    assert_eq!(bytes, png);
+    assert_eq!(peer.served("federation/avatar2"), 2);
+}

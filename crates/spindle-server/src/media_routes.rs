@@ -404,11 +404,18 @@ async fn cached_remote_media(
     user_id: &str,
 ) -> Result<String, MatrixError> {
     let cache_id = crate::media::Media::remote_id(server_name, media_id);
+    // An empty record is not a copy. Servers before the `Location` fix
+    // cached a CDN-hosted file as zero bytes, and federation no longer
+    // yields one, so an empty record is always that and is fetched again.
+    // Not one an admin has marked: the fetch writes a fresh record, and
+    // that would lift a quarantine or a protection.
     let cached = state
         .media
         .record(&cache_id)
         .map_err(|error| media_error(&error))?
-        .is_some();
+        .is_some_and(|record| {
+            record.size > 0 || record.quarantined_by.is_some() || record.protected_by.is_some()
+        });
     if !cached {
         // Only a fetch spends: a hit costs this server nothing, and the
         // budget exists for the fetch and the bytes it leaves behind.
