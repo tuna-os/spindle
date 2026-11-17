@@ -786,6 +786,15 @@ impl RedirectingPeer {
     /// answers the first federation request with an empty inline part,
     /// the shape a cache poisoned by the old parser was left holding.
     async fn start(media: Vec<u8>, empty_first: bool) -> RedirectingPeer {
+        Self::start_typed(media, empty_first, "image/png").await
+    }
+
+    /// [`Self::start`], with the CDN labelling the bytes `cdn_type`.
+    async fn start_typed(
+        media: Vec<u8>,
+        empty_first: bool,
+        cdn_type: &'static str,
+    ) -> RedirectingPeer {
         use axum::extract::{Path, State};
         use axum::response::IntoResponse;
         type Shared = (
@@ -839,7 +848,7 @@ impl RedirectingPeer {
                         count(&served, format!("cdn/{media_id}"));
                         (
                             [
-                                ("content-type", "image/png"),
+                                ("content-type", cdn_type),
                                 ("content-disposition", "inline; filename=\"avatar.png\""),
                             ],
                             media.as_ref().clone(),
@@ -918,4 +927,60 @@ async fn an_empty_file_part_is_not_cached_as_the_media() {
     assert_eq!(content_type, "image/png");
     assert_eq!(bytes, png);
     assert_eq!(peer.served("federation/avatar2"), 2);
+}
+
+#[tokio::test]
+async fn an_image_a_cdn_labels_octet_stream_is_stored_and_thumbnailed_as_an_image() {
+    let png = small_png();
+    // What Beeper's object store answers for every avatar.
+    let peer = RedirectingPeer::start_typed(png.clone(), false, "binary/octet-stream").await;
+    let mirror = Instance::start().await;
+    let bob = mirror.register("bob").await;
+
+    let (status, content_type, bytes) = mirror.download(&bob, &peer.name, "avatar3").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        content_type, "image/png",
+        "the bytes say what the label does not"
+    );
+    assert_eq!(bytes, png);
+
+    let response = mirror
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/thumbnail/{}/avatar3?width=32&height=32&method=crop",
+            mirror.name, peer.name
+        ))
+        .header("authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn bytes_that_are_no_image_stay_unthumbnailable_whatever_the_label() {
+    let peer = RedirectingPeer::start_typed(
+        b"just some bytes".to_vec(),
+        false,
+        "application/octet-stream",
+    )
+    .await;
+    let mirror = Instance::start().await;
+    let bob = mirror.register("bob").await;
+
+    let (status, content_type, _) = mirror.download(&bob, &peer.name, "blob1").await;
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "application/octet-stream");
+    let response = mirror
+        .client
+        .get(format!(
+            "http://{}/_matrix/client/v1/media/thumbnail/{}/blob1?width=32&height=32",
+            mirror.name, peer.name
+        ))
+        .header("authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400, "M_UNSUPPORTED, as before");
 }
