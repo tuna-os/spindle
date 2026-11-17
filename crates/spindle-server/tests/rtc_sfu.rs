@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use mock_sfu::{MockSfu, lk_hash, webhook_authorization};
+use mock_sfu::{
+    MockSfu, lk_hash, webhook_authorization, webhook_authorization_with, webhook_digest,
+};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
@@ -624,6 +626,32 @@ async fn delegation_is_held_then_released_by_sfu_events() {
         ),
         ("APIkey".to_owned(), "the bare key"),
     ] {
+        let (status, _) = harness.webhook(&authorization, &left).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+    }
+
+    // The SFU's own signature over this very body, but with no `exp`, or
+    // one long past: a captured webhook must not replay forever.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (claims, what) in [
+        (
+            json!({ "iss": "APIkey", "nbf": now, "sha256": webhook_digest(&left) }),
+            "a token with no exp",
+        ),
+        (
+            json!({ "iss": "APIkey", "sha256": webhook_digest(&left) }),
+            "a token with no window at all",
+        ),
+        (
+            json!({ "iss": "APIkey", "nbf": now - 7200, "exp": now - 3600,
+                    "sha256": webhook_digest(&left) }),
+            "an expired token",
+        ),
+    ] {
+        let authorization = webhook_authorization_with("not-the-signing-key", &claims);
         let (status, _) = harness.webhook(&authorization, &left).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
     }

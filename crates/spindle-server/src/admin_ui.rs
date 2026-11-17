@@ -15,7 +15,7 @@
 //! as if it came from any other admin tool.
 
 use axum::Router;
-use axum::http::header;
+use axum::http::{HeaderName, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 
@@ -34,14 +34,34 @@ pub fn routes() -> Router<AppState> {
         .route("/_spindle/admin/ui/styles.css", get(stylesheet))
 }
 
+/// The headers every console response carries.
+///
+/// The page takes an admin access token and keeps it in session storage,
+/// so it is the one page on the server whose script must be its own and
+/// whose frame must not be someone else's: the CSP admits this origin's
+/// script, stylesheet and API calls and nothing inline, and the page may
+/// not be framed (a clickjacked "Turn off" is the SFU switch). The
+/// script and stylesheet carry the same set, for `nosniff`.
+const CONSOLE_HEADERS: [(HeaderName, &str); 4] = [
+    (
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+         form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    ),
+    (header::X_FRAME_OPTIONS, "DENY"),
+    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    (header::REFERRER_POLICY, "no-referrer"),
+];
+
 /// `GET /_spindle/admin/ui` — the onboarding skeleton and SFU toggle page.
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index() -> impl IntoResponse {
+    (CONSOLE_HEADERS, Html(INDEX_HTML))
 }
 
 /// `GET /_spindle/admin/ui/app.js` — the console script.
 async fn script() -> impl IntoResponse {
     (
+        CONSOLE_HEADERS,
         [(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
@@ -53,6 +73,7 @@ async fn script() -> impl IntoResponse {
 /// `GET /_spindle/admin/ui/styles.css` — the console stylesheet.
 async fn stylesheet() -> impl IntoResponse {
     (
+        CONSOLE_HEADERS,
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLES_CSS,
     )

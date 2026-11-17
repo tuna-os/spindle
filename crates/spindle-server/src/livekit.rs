@@ -1167,7 +1167,7 @@ fn delegation_key(delay_id: &str) -> Vec<u8> {
 /// under the API secret, issued by the API key, inside its window (give or
 /// take [`WEBHOOK_CLOCK_SKEW_SECS`]), whose `sha256` claim is the body's
 /// SHA-256 in standard base64 -- `LiveKit`'s webhook signing, which its
-/// server SDKs verify the same way.
+/// server SDKs verify the same way. A token with no `exp` is refused.
 fn webhook_signed(livekit: &LivekitConfig, authorization: &str, body: &str, now: u64) -> bool {
     let token = authorization.trim();
     let token = token.strip_prefix("Bearer ").unwrap_or(token);
@@ -1198,7 +1198,11 @@ fn webhook_signed(livekit: &LivekitConfig, authorization: &str, body: &str, now:
     let digest = crate::signing::base64_unpadded(&sha2::Sha256::digest(body.as_bytes()));
     claims["iss"].as_str() == Some(livekit.key.as_str())
         && within("nbf", |nbf, now| nbf <= now + WEBHOOK_CLOCK_SKEW_SECS)
-        && within("exp", |exp, now| exp + WEBHOOK_CLOCK_SKEW_SECS >= now)
+        // `exp` is required: without it a captured webhook replays
+        // forever. `LiveKit`'s notifier always sets it.
+        && claims["exp"]
+            .as_u64()
+            .is_some_and(|exp| exp.saturating_add(WEBHOOK_CLOCK_SKEW_SECS) >= now)
         && claims["sha256"]
             .as_str()
             .is_some_and(|claimed| claimed.trim_end_matches('=') == digest)

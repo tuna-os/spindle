@@ -381,11 +381,16 @@ async fn a_stranger_server_gets_403_from_every_room_read() {
     for uri in [
         format!("/_matrix/federation/v1/state/{room}?event_id={head}"),
         format!("/_matrix/federation/v1/state_ids/{room}?event_id={head}"),
-        format!("/_matrix/federation/v1/event/{head}"),
     ] {
         let (status, body) = harness.federation_get(&stranger, &uri).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
     }
+    // `/event` names no room, so its refusal is the 404 of an event that
+    // does not exist: a 403 would say that this one does.
+    let (status, body) = harness
+        .federation_get(&stranger, &format!("/_matrix/federation/v1/event/{head}"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
 #[tokio::test]

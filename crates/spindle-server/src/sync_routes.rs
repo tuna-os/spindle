@@ -534,6 +534,7 @@ fn sliding_answer(
             position,
             to_device_since,
             selection: &without_departed(&selection, departed),
+            invited,
             receipts: previous.map(|held| &held.receipts),
             account_data: previous.map(|held| &held.account_data),
             typing: previous.map(|held| &held.typing),
@@ -872,6 +873,9 @@ struct ExtensionInputs<'a> {
     /// The to-device extension's token, from the request itself.
     to_device_since: Option<&'a str>,
     selection: &'a crate::sliding::Selection,
+    /// The rooms the user is only invited to. Receipts and typing in them
+    /// belong to the members; an invitee sees stripped state and no more.
+    invited: &'a std::collections::HashSet<String>,
     /// The receipts the connection holds, by room.
     receipts: Option<&'a std::collections::HashMap<String, u64>>,
     /// The account data the connection holds, by room, `""` for global.
@@ -917,10 +921,12 @@ fn sliding_extensions(
         position,
         to_device_since,
         selection,
+        invited,
         receipts,
         account_data,
         typing,
     } = inputs;
+
     let mut out = serde_json::Map::new();
     let mut current = HeldCurrent::default();
     let mut news = ExtensionNews::default();
@@ -958,9 +964,12 @@ fn sliding_extensions(
             .collect();
     }
     if extensions.receipts.on() {
-        let scope = extensions
-            .receipts
-            .scope(&selection.windows, &selection.subscribed);
+        let scope = joined_only(
+            extensions
+                .receipts
+                .scope(&selection.windows, &selection.subscribed),
+            invited,
+        );
         let (receipts, any) = receipts_extension(state, identity, &scope, receipts, position)?;
         news.news |= any;
         out.insert("receipts".to_owned(), receipts);
@@ -973,10 +982,12 @@ fn sliding_extensions(
         // client learns to stop showing them (#902), and an unchanged room
         // is not sent again.
         let mut rooms = serde_json::Map::new();
-        for room_id in extensions
-            .typing
-            .scope(&selection.windows, &selection.subscribed)
-        {
+        for room_id in joined_only(
+            extensions
+                .typing
+                .scope(&selection.windows, &selection.subscribed),
+            invited,
+        ) {
             let users = state.typing.active(room_id);
             let held = typing
                 .and_then(|held| held.get(room_id))
@@ -994,6 +1005,18 @@ fn sliding_extensions(
     }
 
     Ok((Value::Object(out), current, news))
+}
+
+/// Of an extension's scope, the rooms whose members' activity this user
+/// may see: an invite is not a membership.
+fn joined_only<'s>(
+    scope: std::collections::BTreeSet<&'s str>,
+    invited: &std::collections::HashSet<String>,
+) -> std::collections::BTreeSet<&'s str> {
+    scope
+        .into_iter()
+        .filter(|room_id| !invited.contains(*room_id))
+        .collect()
 }
 
 /// Whether typing in a room the connection may speak about differs from

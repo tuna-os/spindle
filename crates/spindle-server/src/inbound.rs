@@ -828,18 +828,23 @@ pub(crate) async fn event(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
-    // Resolve the room first: the in-room check needs it, and an event we
-    // do not hold gets the same 404 whether or not the asker could have
-    // seen it — nothing leaks through the error shape.
-    let Some(room_id) = state.rooms.room_of_event(&event_id).map_err(room_error)? else {
-        federation_origin(&state, &headers, "GET", &uri, None).await?;
-        return Err(MatrixError::new(
+    // An event we do not hold and one in a room the asker may not read
+    // get the same 404: a 403 for the second told any authenticated
+    // server which event IDs exist here, and in which kind of room.
+    let not_found = || {
+        MatrixError::new(
             StatusCode::NOT_FOUND,
             "M_NOT_FOUND",
             "no such event".to_owned(),
-        ));
+        )
     };
-    federation_room_origin(&state, &headers, "GET", &uri, None, &room_id).await?;
+    let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
+    let Some(room_id) = state.rooms.room_of_event(&event_id).map_err(room_error)? else {
+        return Err(not_found());
+    };
+    if origin_may_read_room(&state, &room_id, &origin).is_err() {
+        return Err(not_found());
+    }
     let event = state.rooms.pdu(&room_id, &event_id).map_err(room_error)?;
     let pdus = state
         .rooms
@@ -1491,17 +1496,20 @@ pub(crate) async fn federation_room_origin(
     room_id: &str,
 ) -> Result<String, MatrixError> {
     let origin = federation_origin(state, headers, method, uri, content).await?;
-    let joined = state
-        .rooms
-        .server_in_room(room_id, &origin)
-        .unwrap_or(false);
+    origin_may_read_room(state, room_id, &origin)?;
+    Ok(origin)
+}
+
+/// The room half of [`federation_room_origin`], for an already
+/// authenticated `origin`: a joined member, and admitted by the ACL.
+fn origin_may_read_room(state: &AppState, room_id: &str, origin: &str) -> Result<(), MatrixError> {
+    let joined = state.rooms.server_in_room(room_id, origin).unwrap_or(false);
     if !joined {
         return Err(MatrixError::forbidden(
             "your server has no joined member in that room",
         ));
     }
-    require_server_acl(state, room_id, &origin)?;
-    Ok(origin)
+    require_server_acl(state, room_id, origin)
 }
 
 /// Refuse `origin` if the room's `m.room.server_acl` denies it. A room

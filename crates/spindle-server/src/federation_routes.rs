@@ -669,6 +669,17 @@ async fn federation_hierarchy(
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
     let visible = |room: &str| -> Option<crate::rooms::RoomSummary> {
         let summary = state.rooms.summary(room).ok()?;
+        // A server the room's `m.room.server_acl` denies is not one of its
+        // servers, whatever its members' membership or the join rule says:
+        // the other room reads refuse it, and so does this one. A store
+        // error fails closed.
+        if !state
+            .rooms
+            .server_acl_permits(room, &origin)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         if state.rooms.server_in_room(room, &origin).unwrap_or(false) {
             return Some(summary);
         }
