@@ -35,6 +35,10 @@ struct Gate {
     asked: std::sync::Mutex<(Vec<String>, Vec<String>)>,
     refused: AtomicUsize,
     changed: tokio::sync::Notify,
+    /// A user whose member event `/state` answers with a signature that
+    /// does not verify: the event a resync meets when a server in a big
+    /// room lost or let expire the key it signed with.
+    corrupt: std::sync::Mutex<Option<String>>,
 }
 
 impl Gate {
@@ -93,7 +97,15 @@ impl Gate {
                 _ => changed.await,
             }
         }
-        let response = next.run(request).await;
+        let mut response = next.run(request).await;
+        let corrupt = self
+            .corrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(user) = corrupt.filter(|_| !ids) {
+            response = corrupt_member_signature(response, &user).await;
+        }
         self.served.fetch_add(1, Ordering::SeqCst);
         let mut asked = self
             .asked
@@ -103,6 +115,32 @@ impl Gate {
         drop(asked);
         response
     }
+}
+
+/// `response`, a `/state` answer, with `user`'s member event signed by
+/// nobody: every signature replaced by 64 zero bytes. The event ID is the
+/// hash of the event without its signatures, so the event keeps its ID and
+/// fails only the signature check.
+async fn corrupt_member_signature(
+    response: axum::response::Response,
+    user: &str,
+) -> axum::response::Response {
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let mut answer: Value = serde_json::from_slice(&bytes).unwrap();
+    let zero = "A".repeat(86);
+    for pdu in answer["pdus"].as_array_mut().unwrap() {
+        if pdu["type"] == "m.room.member" && pdu["state_key"] == user {
+            for keys in pdu["signatures"].as_object_mut().unwrap().values_mut() {
+                for signature in keys.as_object_mut().unwrap().values_mut() {
+                    *signature = json!(zero);
+                }
+            }
+        }
+    }
+    let body = answer.to_string();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::from(body))
 }
 
 /// One homeserver on a real TCP listener, named by its own address, whose
@@ -644,5 +682,36 @@ async fn a_resynced_room_shows_its_roster_without_its_history() {
     assert!(
         in_block("state").contains(&remote.user("bob")),
         "the filled roster is in the state block: {initial}"
+    );
+}
+
+#[tokio::test]
+async fn a_member_event_that_does_not_verify_is_left_out_and_the_rest_resync() {
+    let remote = Instance::start().await;
+    let local = Instance::start_with("gap_backfill = false").await;
+
+    let alice = remote.register("alice").await;
+    let room = remote.named_public_room(&alice).await;
+    for name in ["bob", "carol"] {
+        let token = remote.register(name).await;
+        let (status, body) = remote.join_via(&room, &token, &remote.name).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    // Carol's join reaches the joiner unverifiable. One such member of
+    // thousands kept #fedora:fedoraproject.org partial for good: the whole
+    // state was refused for it, on every attempt.
+    *remote.gate.corrupt.lock().unwrap() = Some(remote.user("carol"));
+
+    let zara = local.register("zara").await;
+    let (status, body) = local.join_via(&room, &zara, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    let members = tokio::time::timeout(Duration::from_secs(20), local.joined_members(&room, &zara))
+        .await
+        .expect("the resync completes without the event that does not verify");
+    assert!(members.contains(&remote.user("alice")), "{members:?}");
+    assert!(members.contains(&remote.user("bob")), "{members:?}");
+    assert!(
+        !members.contains(&remote.user("carol")),
+        "an event that does not verify is never seated: {members:?}"
     );
 }

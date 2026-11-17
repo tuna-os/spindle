@@ -911,3 +911,84 @@ async fn an_event_for_a_room_this_server_does_not_hold_is_refused_as_such() {
         "the request's own"
     );
 }
+
+/// A resync of a big room meets thousands of servers' keys at once. Asked
+/// one event at a time, each costs the origin (a ten-second timeout when it
+/// is dead) and then a notary query of its own; `prefetch_keys` asks the
+/// notary for many in one query and the origins only for what it lacks.
+#[tokio::test]
+async fn a_prefetch_asks_the_notary_in_batches_and_the_origins_only_for_the_rest() {
+    let notary = Notary::start(false).await;
+    // Every origin is down: a direct fetch can only fail, so a key held
+    // afterwards came from the notary.
+    let mut sockets = Vec::new();
+    let mut wanted = std::collections::BTreeMap::new();
+    let mut known = Vec::new();
+    for index in 0..100 {
+        let (name, socket) = dead_name();
+        sockets.push(socket);
+        let signer = pair("k");
+        if index < 90 {
+            notary.hold(key_document(
+                &name,
+                &[&signer],
+                &[],
+                now_millis() + 3_600_000,
+                &signer,
+            ));
+            known.push(name.clone());
+        }
+        wanted.insert(name, vec![key_id(&signer)]);
+    }
+
+    let directory = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+    let key = Arc::new(spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap());
+    let config = spindle_server::Config::parse(&format!(
+        "[server]\nname = \"example.org\"\n\
+         [federation]\ninsecure_http = true\nallow_internal = [\"127.0.0.0/8\"]\n\
+         trusted_key_servers = [\"{}\"]\n",
+        notary.name
+    ))
+    .unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let federation = spindle_server::federation::Federation::new(
+        Arc::clone(&store),
+        "example.org",
+        key,
+        true,
+        &["127.0.0.0/8".to_owned()],
+    )
+    .unwrap()
+    .with_metrics(Arc::clone(&metrics))
+    .with_trusted_key_servers(&config.federation.trusted_key_servers())
+    .unwrap();
+
+    let settled = federation.prefetch_keys(&wanted).await;
+
+    assert_eq!(
+        notary.queries.load(Ordering::SeqCst),
+        2,
+        "100 origins in batches of 64: two queries, not one each"
+    );
+    assert_eq!(
+        settled.len(),
+        100,
+        "the notary answered for every origin and the rest were asked themselves"
+    );
+    assert_eq!(
+        metrics.key_fetch_count(KeySource::Direct, KeyFetchResult::Error),
+        10,
+        "only the origins the notary lacked were asked directly"
+    );
+    // What the notary vouched for is held now: the per-event lookups that
+    // follow hit the cache.
+    for name in &known {
+        let keys = federation
+            .event_keys(name, None, &wanted[name], None, false)
+            .await
+            .unwrap();
+        assert!(!keys.is_empty(), "{name}'s keys are held");
+    }
+    drop(sockets);
+}
