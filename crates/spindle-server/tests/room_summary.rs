@@ -184,13 +184,17 @@ async fn a_private_room_is_refused_to_a_stranger_and_shown_to_a_member() {
     // createRoom sets join_rule: invite, so this room publishes nothing.
     let room = harness.create_room(&alice).await;
 
+    // Refused as a room that does not exist is refused, so the answer
+    // does not say which room IDs are real.
+    let (unknown_status, unknown) = harness.summary("!nope:example.org", None).await;
     let (status, body) = harness.summary(&room, None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!((status, &body), (unknown_status, &unknown));
 
     let (status, body) = harness.summary(&room, Some(&bob)).await;
     assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
+        (status, &body),
+        (unknown_status, &unknown),
         "a token is not membership: {body}"
     );
 

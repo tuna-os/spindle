@@ -2441,3 +2441,67 @@ async fn an_encryption_connection_answers_its_users_room_events() {
         "{response}"
     );
 }
+
+/// An invite is not a membership: the receipts and typing extensions
+/// say nothing about a room the caller is only invited to. Both answered
+/// for every room in the window, invites included, so an invitee who
+/// never joined watched who read what and who was typing.
+#[tokio::test]
+async fn receipts_and_typing_say_nothing_about_a_room_the_caller_is_only_invited_to() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let carol = harness.register("carol").await;
+    let bob = harness.register("bob").await;
+    let room = harness.named_room(&alice, "Members only").await;
+    harness.invite(&room, &alice, "carol").await;
+    harness.join(&room, &carol).await;
+    let (status, sent) = harness
+        .request(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/m1"),
+            &alice,
+            &json!({ "msgtype": "m.text", "body": "read me" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    let (status, body) = harness
+        .request(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room}/receipt/m.read/{event_id}"),
+            &carol,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    set_typing(&harness, &alice, &room, true, 30_000).await;
+    harness.invite(&room, &alice, "bob").await;
+
+    let enabled = with_extensions(json!({
+        "receipts": { "enabled": true },
+        "typing": { "enabled": true },
+    }));
+    // The invite is in bob's window, so the extensions' scope reaches it.
+    let response = harness.sliding(&bob, None, &enabled).await;
+    assert!(response["rooms"][&room].is_object(), "{response}");
+    assert!(
+        response["extensions"]["receipts"]["rooms"][&room].is_null(),
+        "an invitee was sent the room's receipts: {response}"
+    );
+    assert!(
+        response["extensions"]["typing"]["rooms"][&room].is_null(),
+        "an invitee was told who is typing: {response}"
+    );
+
+    // Once joined, both arrive.
+    harness.join(&room, &bob).await;
+    let response = harness.sliding(&bob, None, &enabled).await;
+    assert!(
+        response["extensions"]["receipts"]["rooms"][&room].is_object(),
+        "{response}"
+    );
+    assert!(
+        response["extensions"]["typing"]["rooms"][&room].is_object(),
+        "{response}"
+    );
+}

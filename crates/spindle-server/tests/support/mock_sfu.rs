@@ -120,21 +120,37 @@ pub fn base64_standard(bytes: &[u8], pad: bool) -> String {
 /// padded standard base64 (`sha256`) -- built here from `LiveKit`'s
 /// documented format, not from the server's verifier.
 pub fn webhook_authorization(key: &str, secret: &str, body: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    webhook_authorization_with(
+        secret,
+        &json!({
+            "iss": key,
+            "nbf": now,
+            "exp": now + 300,
+            "sha256": base64_standard(&<sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()), true),
+        }),
+    )
+}
+
+/// The webhook digest claim of `body`, as `LiveKit` writes it.
+pub fn webhook_digest(body: &str) -> String {
+    base64_standard(
+        &<sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()),
+        true,
+    )
+}
+
+/// An HS256 JWT under `secret` over exactly `claims`, for a test that
+/// needs a claim missing or out of its window.
+pub fn webhook_authorization_with(secret: &str, claims: &Value) -> String {
     let base64url = |bytes: &[u8]| {
         base64_standard(bytes, false)
             .replace('+', "-")
             .replace('/', "_")
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let claims = json!({
-        "iss": key,
-        "nbf": now,
-        "exp": now + 300,
-        "sha256": base64_standard(&<sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()), true),
-    });
     let signing_input = format!(
         "{}.{}",
         base64url(

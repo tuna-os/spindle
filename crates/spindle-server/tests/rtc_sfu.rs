@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use mock_sfu::{MockSfu, lk_hash, webhook_authorization};
+use mock_sfu::{
+    MockSfu, lk_hash, webhook_authorization, webhook_authorization_with, webhook_digest,
+};
 use serde_json::{Value, json};
 use spindle_store::FjallStore;
 use tempfile::TempDir;
@@ -628,6 +630,32 @@ async fn delegation_is_held_then_released_by_sfu_events() {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
     }
 
+    // The SFU's own signature over this very body, but with no `exp`, or
+    // one long past: a captured webhook must not replay forever.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (claims, what) in [
+        (
+            json!({ "iss": "APIkey", "nbf": now, "sha256": webhook_digest(&left) }),
+            "a token with no exp",
+        ),
+        (
+            json!({ "iss": "APIkey", "sha256": webhook_digest(&left) }),
+            "a token with no window at all",
+        ),
+        (
+            json!({ "iss": "APIkey", "nbf": now - 7200, "exp": now - 3600,
+                    "sha256": webhook_digest(&left) }),
+            "an expired token",
+        ),
+    ] {
+        let authorization = webhook_authorization_with("not-the-signing-key", &claims);
+        let (status, _) = harness.webhook(&authorization, &left).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+    }
+
     let both = json!({ "events": [
         { "event": "participant_joined",
           "participant": { "identity": format!("{}:{}", alice.user_id, alice.device_id) } },
@@ -913,4 +941,61 @@ fn base64url_decode(text: &str) -> Vec<u8> {
         out.extend_from_slice(&bytes[1..chunk.len()]);
     }
     out
+}
+
+/// Holds have no expiry and every SFU webhook reads them all, so one
+/// account cannot record them without a bound, under keys of any length,
+/// or over a hold another account recorded.
+#[tokio::test]
+async fn delegated_leave_holds_are_bounded_per_account() {
+    let harness = Harness::with(REMOTE);
+    let alice = harness.register("alice").await;
+    harness.make_admin(&alice);
+    let bob = harness.register("bob").await;
+    let room = harness.create_room(&alice).await;
+
+    let mut refused = 0;
+    for number in 0..100 {
+        let (status, body) = harness
+            .post(
+                DELEGATE,
+                Some(&alice.access_token),
+                json!({ "room_id": room, "delay_id": format!("hold-{number}") }),
+            )
+            .await;
+        match status {
+            StatusCode::OK => {}
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert!(refused > 0, "some hold past the cap was refused");
+    let (status, body) = harness.get(ADMIN, Some(&alice.access_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["held_delegations"].as_u64().unwrap() <= 64,
+        "holds stay within the cap: {body}"
+    );
+
+    let (status, body) = harness
+        .post(
+            DELEGATE,
+            Some(&bob.access_token),
+            json!({ "room_id": room, "delay_id": "x".repeat(1000) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = harness
+        .post(
+            DELEGATE,
+            Some(&bob.access_token),
+            json!({ "room_id": room, "delay_id": "hold-0" }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "alice's hold is not bob's: {body}"
+    );
 }

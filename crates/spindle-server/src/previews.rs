@@ -136,19 +136,7 @@ impl Previews {
                 "only http and https can be previewed".to_owned(),
             ));
         }
-        // A literal IP in the URL never touches DNS, so the resolver hook
-        // never sees it — vet it here, against the same judgement.
-        if let Ok(literal) = parsed
-            .host_str()
-            .unwrap_or_default()
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            && !self.client_allows(literal)
-        {
-            return Err(PreviewError::Refused(
-                "that address is not previewable".to_owned(),
-            ));
-        }
+        self.vet_literal(&parsed)?;
 
         let cache_key = cache_key(url);
         if let Some(bytes) = ReadView::get(self.store.as_ref(), &cache_key)
@@ -279,6 +267,26 @@ impl Previews {
             .collect())
     }
 
+    /// A literal IP in a URL never touches DNS, so the resolver hook never
+    /// sees it, and the redirect policy only sees redirects. Every URL this
+    /// module asks for first is judged here against the same allow-list:
+    /// the page's, and the `og:image` the page chose, which is the page
+    /// author's choice and not the user's.
+    fn vet_literal(&self, url: &reqwest::Url) -> Result<(), PreviewError> {
+        if let Ok(literal) = url
+            .host_str()
+            .unwrap_or_default()
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            && !self.client_allows(literal)
+        {
+            return Err(PreviewError::Refused(
+                "that address is not previewable".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn client_allows(&self, address: IpAddr) -> bool {
         is_global(address) || self.allowed.iter().any(|cidr| cidr.contains(address))
     }
@@ -320,6 +328,7 @@ impl Previews {
     }
 
     async fn rehost_image(&self, url: &reqwest::Url) -> Result<(String, u64), PreviewError> {
+        self.vet_literal(url)?;
         let response = self
             .client
             .get(url.clone())

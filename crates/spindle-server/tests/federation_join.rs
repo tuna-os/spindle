@@ -877,3 +877,94 @@ async fn a_join_that_does_not_ask_gets_every_member() {
         ]
     );
 }
+
+/// The countersignature on a restricted join is this server saying it saw
+/// the joiner in a room the join rule allows. A peer with one member in
+/// the allowed room gets an honest template for that member; rewriting it
+/// for another of its users, who is in no allowed room, must not get it
+/// signed, even though the rules alone would accept the result.
+#[tokio::test]
+async fn send_join_does_not_countersign_a_restricted_join_it_cannot_vouch_for() {
+    let peer = Peer::start().await;
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+
+    // The peer's bob joins the allowed room, the honest way.
+    let space = harness.public_room(&alice).await;
+    let (status, body) = harness.make_join(&peer, &space, &peer.user()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let join = peer.sign_event(&body["event"]);
+    let (status, body) = harness
+        .send_join(&peer, &space, &event_id_of(&join), &join)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = harness
+        .send("POST", "/_matrix/client/v3/createRoom", &alice, &json!({}))
+        .await;
+    let room = body["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = harness
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room}/state/m.room.join_rules"),
+            &alice,
+            &json!({
+                "join_rule": "restricted",
+                "allow": [{ "type": "m.room_membership", "room_id": space }],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Bob's template names alice as the authoriser.
+    let (status, body) = harness.make_join(&peer, &room, &peer.user()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut template = body["event"].clone();
+    assert_eq!(
+        template["content"]["join_authorised_via_users_server"],
+        json!("@alice:example.org"),
+        "{template}"
+    );
+
+    // The same event for mallory, who is in no room the rule allows.
+    let mallory = format!("@mallory:{}", peer.name);
+    assert_eq!(
+        harness.make_join(&peer, &room, &mallory).await.0,
+        StatusCode::FORBIDDEN,
+        "the honest door is shut to mallory"
+    );
+    template["sender"] = json!(mallory);
+    template["state_key"] = json!(mallory);
+    let join = peer.sign_event(&template);
+    let (status, body) = harness
+        .send_join(&peer, &room, &event_id_of(&join), &join)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a join this server cannot vouch for is not countersigned: {body}"
+    );
+
+    let (status, members) = harness
+        .send(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room}/joined_members"),
+            &alice,
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    assert!(
+        members["joined"].get(&mallory).is_none(),
+        "mallory did not get in: {members}"
+    );
+
+    // Bob's own join, from the same template, still goes through.
+    let (status, body) = harness.make_join(&peer, &room, &peer.user()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let join = peer.sign_event(&body["event"]);
+    let (status, body) = harness
+        .send_join(&peer, &room, &event_id_of(&join), &join)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

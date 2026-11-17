@@ -495,12 +495,21 @@ struct KeyQueryBatch {
     server_keys: BTreeMap<String, Value>,
 }
 
+/// The most names one notary query is answered for. The route takes no
+/// credentials and each name can cost a key fetch; the rest are simply
+/// absent, which is what the spec says of a server whose keys cannot be had.
+const MAX_NOTARY_QUERY_NAMES: usize = 32;
+
 /// `POST /_matrix/key/v2/query`
 async fn key_query_batch(
     State(state): State<AppState>,
     Json(request): Json<KeyQueryBatch>,
 ) -> Json<Value> {
-    let names: Vec<String> = request.server_keys.into_keys().collect();
+    let names: Vec<String> = request
+        .server_keys
+        .into_keys()
+        .take(MAX_NOTARY_QUERY_NAMES)
+        .collect();
     let server_keys = notary_documents(&state, &names).await;
     Json(json!({ "server_keys": server_keys }))
 }
@@ -660,6 +669,17 @@ async fn federation_hierarchy(
     let origin = federation_origin(&state, &headers, "GET", &uri, None).await?;
     let visible = |room: &str| -> Option<crate::rooms::RoomSummary> {
         let summary = state.rooms.summary(room).ok()?;
+        // A server the room's `m.room.server_acl` denies is not one of its
+        // servers, whatever its members' membership or the join rule says:
+        // the other room reads refuse it, and so does this one. A store
+        // error fails closed.
+        if !state
+            .rooms
+            .server_acl_permits(room, &origin)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         if state.rooms.server_in_room(room, &origin).unwrap_or(false) {
             return Some(summary);
         }

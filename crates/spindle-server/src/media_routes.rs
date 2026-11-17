@@ -446,7 +446,7 @@ async fn cached_remote_media(
         limit_write(state, Budget::RemoteMedia, user_id)?;
         let (content_type, filename, bytes) = state
             .federation
-            .remote_media_download(server_name, media_id)
+            .remote_media_download(server_name, media_id, state.media.max_upload_bytes())
             .await
             .map_err(|error| {
                 MatrixError::new(

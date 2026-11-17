@@ -699,3 +699,58 @@ async fn refreshing_a_stale_preview_does_not_leave_the_old_image_behind() {
     assert_eq!(uploads.len(), 1, "the first image's record was removed");
     assert_eq!(cache.held().0, 1);
 }
+
+/// The page chooses its `og:image`, so a page on an allowed address can
+/// name a literal private one. A literal never reaches the vetting
+/// resolver, so the image URL has to be judged as the page URL is.
+#[tokio::test]
+async fn an_og_image_cannot_point_the_fetch_at_a_private_literal() {
+    // The "internal service": alive, answers with an image type, counts hits.
+    let secret_hits = Arc::new(AtomicUsize::new(0));
+    let hits_in_route = Arc::clone(&secret_hits);
+    let secret_router = axum::Router::new().route(
+        "/secret.png",
+        axum::routing::get(move || {
+            let hits = Arc::clone(&hits_in_route);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ([("content-type", "image/png")], "internal bytes")
+            }
+        }),
+    );
+    let secret = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let secret_address = secret.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(secret, secret_router).await.unwrap();
+    });
+
+    // The attacker's page, on the one address the allow-list opens.
+    let page_router = axum::Router::new().route(
+        "/page",
+        axum::routing::get(move || async move {
+            axum::response::Html(format!(
+                r#"<head><meta property="og:title" content="bait"/>
+                <meta property="og:image" content="http://{secret_address}/secret.png"></head>"#
+            ))
+        }),
+    );
+    let page = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let page_address = page.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(page, page_router).await.unwrap();
+    });
+
+    let harness = Harness::new("\"127.0.0.1\"");
+    let token = harness.register().await;
+    let (status, og) = harness
+        .preview(&token, &format!("http://{page_address}/page"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{og}");
+    assert_eq!(og["og:title"], json!("bait"));
+    assert_eq!(
+        secret_hits.load(Ordering::SeqCst),
+        0,
+        "the og:image target was never contacted"
+    );
+    assert!(og.get("og:image").is_none(), "{og}");
+}

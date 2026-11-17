@@ -262,7 +262,7 @@ async fn outbound_requests_to_a_denied_destination_open_no_socket() {
     assert!(denied.peer_keys("peer.example").await.is_err());
     assert!(
         denied
-            .remote_media_download("peer.example", "abc")
+            .remote_media_download("peer.example", "abc", 1024)
             .await
             .is_err()
     );

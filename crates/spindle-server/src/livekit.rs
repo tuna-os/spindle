@@ -105,6 +105,11 @@ const SFU_SWITCH_KEY: &[u8; 15] = b"rtc/sfu/enabled";
 /// One held delegated leave, recorded by the delegation probe and consumed
 /// by the SFU webhook when the participant drops off the media.
 const DELEGATION_PREFIX: &str = "rtc/sfu/delegation/";
+/// The longest `delay_id` a hold is recorded under. A delay ID is a short
+/// random token, and this one is also a store key.
+const MAX_DELAY_ID_LEN: usize = 255;
+/// Holds one account may have recorded and not yet released.
+const MAX_HOLDS_PER_USER: usize = 64;
 
 /// The largest minter request body: a token request names a room and a
 /// device, not an upload.
@@ -941,6 +946,10 @@ async fn delegate_delayed_leave_builtin(
     if request.delay_id.is_empty() {
         return Err(MatrixError::missing_param("delay_id"));
     }
+    // The delay ID is the store key; nothing near this long is one.
+    if request.delay_id.len() > MAX_DELAY_ID_LEN {
+        return Err(MatrixError::bad_json("`delay_id` is too long".to_owned()));
+    }
     let room = if request.room_id.is_empty() {
         request.room.clone()
     } else {
@@ -990,6 +999,33 @@ fn put_hold(
     room_id: &str,
     delay_id: &str,
 ) -> Result<(), MatrixError> {
+    // Holds have no expiry and every SFU webhook reads all of them, so one
+    // account may keep only a few. A hold another account recorded under
+    // the same delay is not this caller's to replace.
+    let key = delegation_key(delay_id);
+    let mut held_by_user = 0;
+    for (existing, value) in state
+        .store
+        .scan_prefix(DELEGATION_PREFIX.as_bytes())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?
+    {
+        let Ok(hold) = serde_json::from_slice::<Value>(&value) else {
+            continue;
+        };
+        let ours = hold["user_id"] == user_id;
+        if existing == key {
+            if !ours {
+                return Err(MatrixError::forbidden(
+                    "that delay is held for another user",
+                ));
+            }
+        } else if ours {
+            held_by_user += 1;
+        }
+    }
+    if held_by_user >= MAX_HOLDS_PER_USER {
+        return Err(MatrixError::limit_exceeded(0));
+    }
     let record = json!({
         "user_id": user_id,
         "device_id": device_id,
@@ -1000,7 +1036,7 @@ fn put_hold(
     state
         .store
         .put(
-            delegation_key(delay_id).as_slice(),
+            key.as_slice(),
             serde_json::to_vec(&record)
                 .map_err(|error| MatrixError::internal(&error.to_string()))?
                 .as_slice(),
@@ -1131,7 +1167,7 @@ fn delegation_key(delay_id: &str) -> Vec<u8> {
 /// under the API secret, issued by the API key, inside its window (give or
 /// take [`WEBHOOK_CLOCK_SKEW_SECS`]), whose `sha256` claim is the body's
 /// SHA-256 in standard base64 -- `LiveKit`'s webhook signing, which its
-/// server SDKs verify the same way.
+/// server SDKs verify the same way. A token with no `exp` is refused.
 fn webhook_signed(livekit: &LivekitConfig, authorization: &str, body: &str, now: u64) -> bool {
     let token = authorization.trim();
     let token = token.strip_prefix("Bearer ").unwrap_or(token);
@@ -1162,7 +1198,11 @@ fn webhook_signed(livekit: &LivekitConfig, authorization: &str, body: &str, now:
     let digest = crate::signing::base64_unpadded(&sha2::Sha256::digest(body.as_bytes()));
     claims["iss"].as_str() == Some(livekit.key.as_str())
         && within("nbf", |nbf, now| nbf <= now + WEBHOOK_CLOCK_SKEW_SECS)
-        && within("exp", |exp, now| exp + WEBHOOK_CLOCK_SKEW_SECS >= now)
+        // `exp` is required: without it a captured webhook replays
+        // forever. `LiveKit`'s notifier always sets it.
+        && claims["exp"]
+            .as_u64()
+            .is_some_and(|exp| exp.saturating_add(WEBHOOK_CLOCK_SKEW_SECS) >= now)
         && claims["sha256"]
             .as_str()
             .is_some_and(|claimed| claimed.trim_end_matches('=') == digest)

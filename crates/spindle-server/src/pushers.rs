@@ -3,8 +3,10 @@
 //! Stored and served here; driven by `push::deliver_loop`, which reads the
 //! registrations back for every event a user's rules say to notify about.
 //! What a client registers is kept faithfully, per user and per
-//! `(app_id, pushkey)`; the one thing that removes a registration behind
-//! the client's back is its gateway reporting the pushkey `rejected`.
+//! `(app_id, pushkey)`. Two things remove a registration behind the
+//! client's back: its gateway reporting the pushkey `rejected`, and the end
+//! of the session that made it (`Accounts::delete_device` and
+//! `Accounts::logout_everywhere`).
 
 use std::sync::Arc;
 

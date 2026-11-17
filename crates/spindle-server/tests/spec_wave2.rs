@@ -637,3 +637,108 @@ fn an_events_auth_chain_reaches_the_create_event() {
         .collect();
     assert_eq!(ids.len(), chain.len(), "each event once");
 }
+
+/// A server the room's `m.room.server_acl` denies is not one of its
+/// servers: the space hierarchy describes neither a denied space nor a
+/// denied child to it, as every other federation room read refuses it.
+/// `/hierarchy` checked only the join rules and membership.
+#[tokio::test]
+async fn the_hierarchy_honours_the_server_acl() {
+    let server = Harness::new();
+    let peer = Peer::start().await;
+    let alice = server.register("alice").await;
+    let space = server
+        .create_room(
+            &alice,
+            &json!({
+                "creation_content": { "type": "m.space" },
+                "preset": "public_chat",
+                "name": "the commons",
+            }),
+        )
+        .await;
+    let open = server
+        .create_room(&alice, &json!({ "preset": "public_chat", "name": "open" }))
+        .await;
+    let (status, body) = server
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{space}/state/m.space.child/{open}"),
+            Some(&alice),
+            Some(&json!({ "via": ["example.org"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hierarchy = format!("/_matrix/federation/v1/hierarchy/{space}");
+    let (status, body) = server.peer_json(&peer, &hierarchy).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["children"][0]["room_id"], open, "{body}");
+
+    // The peer's name is `127.0.0.1:port`; the ACL matches the host.
+    let deny = json!({ "allow": ["*"], "deny": ["127.0.0.1"] });
+    let (status, body) = server
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{open}/state/m.room.server_acl"),
+            Some(&alice),
+            Some(&deny),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = server.peer_json(&peer, &hierarchy).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["children"], json!([]), "{body}");
+    assert_eq!(body["inaccessible_children"], json!([open]), "{body}");
+
+    let (status, body) = server
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{space}/state/m.room.server_acl"),
+            Some(&alice),
+            Some(&deny),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = server.peer_json(&peer, &hierarchy).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// Federation `GET /event` answers an event in a room the asking server
+/// is not in the way it answers an event that does not exist. A 403 for
+/// the first and a 404 for the second told any server which event IDs
+/// were real.
+#[tokio::test]
+async fn federation_event_does_not_say_which_events_exist() {
+    let server = Harness::new();
+    let peer = Peer::start().await;
+    let alice = server.register("alice").await;
+    let closed = server
+        .create_room(&alice, &json!({ "preset": "private_chat" }))
+        .await;
+    let (status, body) = server
+        .send(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{closed}/send/m.room.message/m1"),
+            Some(&alice),
+            Some(&json!({ "msgtype": "m.text", "body": "here" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let real = body["event_id"].as_str().unwrap().to_owned();
+
+    let (real_status, real_body) = server
+        .peer_json(&peer, &format!("/_matrix/federation/v1/event/{real}"))
+        .await;
+    let (absent_status, absent_body) = server
+        .peer_json(
+            &peer,
+            "/_matrix/federation/v1/event/$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .await;
+    assert_eq!(absent_status, StatusCode::NOT_FOUND, "{absent_body}");
+    assert_eq!(
+        (real_status, &real_body),
+        (absent_status, &absent_body),
+        "a real event in a room the peer is not in"
+    );
+}

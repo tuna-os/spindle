@@ -1548,13 +1548,10 @@ async fn room_summary(
     let open =
         matches!(summary.join_rule.as_deref(), Some("public" | "knock")) || summary.world_readable;
     if !open && membership.is_none() {
-        // M_FORBIDDEN rather than M_NOT_FOUND: the room ID came from
-        // somewhere, so pretending it does not exist tells a caller who
-        // already has the ID nothing it did not know, and misleads a caller
-        // who mistyped one.
-        return Err(MatrixError::forbidden(format!(
-            "{room_id} does not publish a summary"
-        )));
+        // The same answer as a room this server does not hold, as Synapse
+        // gives it ("Room not found or is not accessible"). A 403 here and
+        // a 404 there told anyone, without a token, which room IDs exist.
+        return Err(room_error(crate::rooms::RoomError::UnknownRoom(room_id)));
     }
 
     let mut body = serde_json::Map::new();

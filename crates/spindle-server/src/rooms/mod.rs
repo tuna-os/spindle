@@ -1539,7 +1539,8 @@ impl Rooms {
     ///
     /// # Errors
     ///
-    /// Returns [`RoomError`] if the store refuses the writes.
+    /// Returns [`RoomError::Forbidden`] if the user is already joined to the
+    /// room, and [`RoomError`] if the store refuses the writes.
     pub fn record_pending_invite(
         &self,
         user_id: &str,
@@ -1548,6 +1549,15 @@ impl Rooms {
         event_id: &str,
         invite_state: &[Value],
     ) -> Result<(), RoomError> {
+        // A joined user cannot be invited: the rules refuse that invite in
+        // every room version. An out-of-band record that overwrote the
+        // `join` row would move the room to the user's invites and make
+        // every membership check here treat them as gone.
+        if self.is_joined(user_id, room_id)? {
+            return Err(RoomError::Forbidden(format!(
+                "{user_id} is already joined to {room_id}"
+            )));
+        }
         let stream_write = self.reserve_stream_id();
         let stream_id = stream_write.id();
         spindle_store::Store::put(
@@ -2100,20 +2110,7 @@ impl Rooms {
         if matches!(membership(user_id, room_id).as_deref(), Some(JOIN | INVITE)) {
             return Ok(None);
         }
-        // An `allow` entry naming a room this server does not hold reads as
-        // "not joined" rather than as an error: we genuinely cannot see it,
-        // and guessing that the joiner is in it would forge the vouching.
-        let vouched = rules["allow"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|entry| {
-                entry["type"].as_str() == Some("m.room_membership")
-                    && entry["room_id"]
-                        .as_str()
-                        .is_some_and(|allowed| joined(user_id, allowed))
-            });
-        if !vouched {
+        if !self.joined_to_an_allowed_room(rules, user_id) {
             return Ok(None);
         }
 
@@ -2176,6 +2173,76 @@ impl Rooms {
             }
         });
         Ok(fallback)
+    }
+
+    /// Whether `user_id` is joined, here, to a room the join rule `rules`
+    /// (its content) allows. The one question a restricted join puts to a
+    /// server, which the auth rules cannot ask.
+    fn joined_to_an_allowed_room(&self, rules: &Value, user_id: &str) -> bool {
+        // An `allow` entry naming a room this server does not hold reads as
+        // "not joined" rather than as an error: we genuinely cannot see it,
+        // and guessing that the joiner is in it would forge the vouching.
+        rules["allow"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry["type"].as_str() == Some("m.room_membership")
+                    && entry["room_id"]
+                        .as_str()
+                        .is_some_and(|allowed| self.is_joined(user_id, allowed).unwrap_or(false))
+            })
+    }
+
+    /// Whether this server may countersign a restricted join of `user_id`
+    /// to `room_id`: the question `make_join` answers when it puts a
+    /// nomination in the template, asked again when the signed join comes
+    /// back. The countersignature is this server's claim that it saw the
+    /// joiner in an allowed room, and a joining server can write a
+    /// nomination into an event without ever asking for a template.
+    ///
+    /// True for a joiner the room has already invited or joined, because
+    /// the rules admit that join on the room's own state and the signature
+    /// adds nothing to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] if the room or its join rule cannot be read.
+    pub fn may_vouch_for_restricted_join(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<bool, RoomError> {
+        self.with_room_read(room_id, |rooms, log| {
+            let authorization = rooms.rules_in(log, room_id)?.authorization;
+            if !(authorization.restricted_join_rule || authorization.knock_restricted_join_rule) {
+                return Ok(false);
+            }
+            let Some(rules) = current_state_id(log, &StateKey::new("m.room.join_rules", ""))
+                .and_then(|id| rooms.read_event(room_id, &EventId::new(id.as_str())).ok())
+            else {
+                return Ok(false);
+            };
+            let rules = &rules["content"];
+            if !matches!(
+                rules["join_rule"].as_str(),
+                Some("restricted" | "knock_restricted")
+            ) {
+                return Ok(false);
+            }
+            let current = spindle_store::ReadView::get(
+                rooms.store.as_ref(),
+                &spindle_core::keys::user_room(
+                    spindle_core::keys::Keyspace::Membership,
+                    user_id,
+                    room_id,
+                ),
+            )?;
+            if matches!(current.as_deref(), Some(JOIN | INVITE)) {
+                return Ok(true);
+            }
+            Ok(rooms.joined_to_an_allowed_room(rules, user_id))
+        })
     }
 
     /// Mint a room: its create event, and the ID that event implies.

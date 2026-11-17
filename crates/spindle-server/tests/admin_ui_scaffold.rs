@@ -168,3 +168,44 @@ async fn unknown_console_path_stays_an_honest_404() {
         "the 404 must carry its errcode: {body}"
     );
 }
+
+/// The console takes an admin access token, so it may not be framed and
+/// runs only this origin's script: a CSP with `frame-ancestors 'none'`
+/// and no inline script, and `X-Frame-Options: DENY` for browsers that
+/// predate it. The page sent neither, so any site could frame it and
+/// clickjack the SFU switch.
+#[tokio::test]
+async fn console_cannot_be_framed_and_runs_only_its_own_script() {
+    let harness = Harness::fresh();
+    for uri in [CONSOLE, SCRIPT, STYLES] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let csp = header("content-security-policy");
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp:?}");
+        assert!(csp.contains("script-src 'self'"), "{uri}: {csp:?}");
+        assert!(!csp.contains("unsafe-inline"), "{uri}: {csp:?}");
+        assert_eq!(header("x-frame-options"), "DENY", "{uri}");
+        assert_eq!(header("x-content-type-options"), "nosniff", "{uri}");
+    }
+    // The page itself must still work under that policy: nothing inline.
+    let (_, _, page) = harness.get(CONSOLE).await;
+    assert!(!page.contains("<style"), "inline style is blocked");
+    assert!(!page.contains(" style="), "inline style is blocked");
+    assert!(
+        !page.contains("<script>"),
+        "inline script is blocked: every script has a src"
+    );
+}

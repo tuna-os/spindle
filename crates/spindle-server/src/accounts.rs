@@ -1023,6 +1023,11 @@ impl<'a, S: Store> Accounts<'a, S> {
                 }
             }
         }
+        // A pusher is a standing delivery of the user's events to a URL a
+        // session chose. With every session gone, no session that still
+        // exists vouches for any of them, and one registered with a stolen
+        // token would otherwise outlive the theft's cleanup.
+        self.remove_pushers(localpart, None)?;
         self.durable()?;
         Ok(())
     }
@@ -1067,7 +1072,25 @@ impl<'a, S: Store> Accounts<'a, S> {
                 }
             }
         }
+        // The device's pushers go with it, for the reason in
+        // `logout_everywhere`: every logout and device removal ends here.
+        self.remove_pushers(localpart, Some(device_id))?;
         self.durable()?;
+        Ok(())
+    }
+
+    /// Delete the user's pushers: the ones `device_id` registered, or all.
+    fn remove_pushers(&self, localpart: &str, device_id: Option<&str>) -> Result<(), AccountError> {
+        let prefix = keys::pusher_prefix(&self.user_id(localpart));
+        for (key, raw) in self.store.scan_prefix(&prefix)? {
+            let of_device = device_id.is_none_or(|device_id| {
+                serde_json::from_slice::<serde_json::Value>(&raw)
+                    .is_ok_and(|pusher| pusher["device_id"] == device_id)
+            });
+            if of_device {
+                self.store.delete(&key)?;
+            }
+        }
         Ok(())
     }
 }
