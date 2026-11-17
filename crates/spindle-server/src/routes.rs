@@ -526,13 +526,23 @@ pub(crate) fn record_invite(
     body: &Value,
     signed: &Value,
 ) -> Result<(), MatrixError> {
-    if state
-        .rooms
-        .receive_remote(room_id, event_id, signed)
-        .is_ok()
-    {
-        state.rooms.wake_sync_waiters();
-        return Ok(());
+    match state.rooms.receive_remote(room_id, event_id, signed) {
+        Ok(()) => {
+            state.rooms.wake_sync_waiters();
+            return Ok(());
+        }
+        // Held, with a local member, so our copy is current: a refusal by
+        // the rules is the verdict on this invite, not a reason to record
+        // it out of band. Recording it anyway would show the user an
+        // invite the room's power levels or bans never allowed.
+        Err(error @ crate::rooms::RoomError::Forbidden(_)) if has_local_member(state, room_id) => {
+            return Err(room_error(error));
+        }
+        // Not held, the out-of-band case the pending record exists for; or
+        // a gap (parents not here yet) or a stale copy, where it still
+        // stands in. `record_pending_invite` refuses to let it replace a
+        // `join` in any of them.
+        Err(_) => {}
     }
     // The invite itself goes in, in place of any copy the inviter sent: a
     // client renders an invite from the user's own `invite` membership,
@@ -558,6 +568,21 @@ pub(crate) fn record_invite(
         .map_err(room_error)?;
     state.rooms.wake_sync_waiters();
     Ok(())
+}
+
+/// Whether one of this server's users is joined to `room_id`: the test for
+/// "our copy of the room is live", the same one the local join path uses.
+fn has_local_member(state: &AppState, room_id: &str) -> bool {
+    state
+        .rooms
+        .joined_member_ids(room_id)
+        .map(|ids| {
+            ids.iter().any(|id| {
+                id.split_once(':').map(|(_, domain)| domain)
+                    == Some(state.config.server.name.as_str())
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn directory_error(error: &crate::directory::DirectoryError) -> MatrixError {

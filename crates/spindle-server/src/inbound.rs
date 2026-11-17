@@ -1243,26 +1243,8 @@ pub(crate) async fn invite(
 
     // The version check comes first: an event from a room version this
     // server does not speak cannot be reasoned about, let alone signed.
-    //
-    // The question here is *can we speak this*, not *is this our default*,
-    // and the difference is not pedantry. An invite is for a remote room
-    // this server has no state for, so there is nothing to look the version
-    // up from -- the body's `room_version` is the only statement of it, and
-    // the spec puts it there for exactly that reason. Comparing it against
-    // one hardcoded version happened to behave identically only because the
-    // supported list has one entry, and would start silently refusing
-    // invites the moment it had two.
     let offered = body["room_version"].as_str().unwrap_or_default();
-    if !crate::surface::supports_room_version(offered) {
-        return Err(MatrixError::new(
-            StatusCode::BAD_REQUEST,
-            "M_INCOMPATIBLE_ROOM_VERSION",
-            format!(
-                "this server speaks room versions {}",
-                crate::surface::ROOM_VERSIONS.join(", ")
-            ),
-        ));
-    }
+    check_invite_version(&state, &room_id, offered)?;
     let event = body["event"].clone();
     let is_invite = event["type"] == json!("m.room.member")
         && event["content"]["membership"] == json!("invite")
@@ -1312,6 +1294,7 @@ pub(crate) async fn invite(
     let sender = event["sender"].as_str().unwrap_or_default();
     limit_write_on(&state, Budget::Invited, sender, &target)?;
 
+    let sent_at = event["origin_server_ts"].as_u64();
     let Ok(ruma::CanonicalJsonValue::Object(mut canonical)) =
         ruma::CanonicalJsonValue::try_from(event)
     else {
@@ -1323,15 +1306,22 @@ pub(crate) async fn invite(
     // server speaks -- because the hash is version-dependent.
     let version = ruma::RoomVersionId::try_from(offered)
         .map_err(|error| MatrixError::bad_json(format!("room_version: {error}")))?;
+    // The same shape and bounds every other inbound PDU is held to:
+    // required fields, at most 20 parents and 10 auth events. An invite is
+    // an event in someone's room, and this one can enter a log we hold.
+    let pdu =
+        spindle_core::Pdu::from_remote(version.clone(), canonical.clone()).map_err(|error| {
+            MatrixError::bad_json(format!("the invite is not a valid event: {error:?}"))
+        })?;
     // The path names the event the inviter computed; disagreement means the
     // two servers are not looking at the same event.
-    let named = spindle_core::version::event_id(&canonical, &version)
-        .map_err(|error| MatrixError::bad_json(format!("the invite cannot be named: {error}")))?;
+    let named = pdu.event_id().as_str();
     if named != event_id {
         return Err(MatrixError::bad_json(format!(
             "the event is {named}, not {event_id}"
         )));
     }
+    verify_invite_signature(&state, &origin, &canonical, &version, sent_at).await?;
     if spindle_core::version::hash_and_sign(
         &state.config.server.name,
         state.key.pair(),
@@ -1362,6 +1352,79 @@ pub(crate) async fn invite(
     )?;
 
     Ok(Json(json!({ "event": signed })))
+}
+
+/// Whether an invite's stated room version is one this server can sign
+/// under, and the right one for the room.
+///
+/// The question is *can we speak this*, not *is this our default*, and the
+/// difference is not pedantry. An invite is usually for a remote room this
+/// server has no state for, so there is nothing to look the version up
+/// from -- the body's `room_version` is the only statement of it, and the
+/// spec puts it there for exactly that reason. Comparing it against one
+/// hardcoded version happened to behave identically only because the
+/// supported list had one entry, and would start silently refusing invites
+/// the moment it had two.
+///
+/// For a room this server does hold, the room's create event already said,
+/// and an invite named under another version's rules would enter our log
+/// under an ID that is not its hash in this room.
+fn check_invite_version(state: &AppState, room_id: &str, offered: &str) -> Result<(), MatrixError> {
+    if !crate::surface::supports_room_version(offered) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            format!(
+                "this server speaks room versions {}",
+                crate::surface::ROOM_VERSIONS.join(", ")
+            ),
+        ));
+    }
+    if let Ok(held) = state.rooms.room_version(room_id)
+        && held.as_str() != offered
+    {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            format!("that room is version {held}, not {offered}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check the inviting server's own signature on an invite before this
+/// server adds its co-signature beside it.
+///
+/// The request being signed by the origin says nothing about the event it
+/// carries, and other servers check the event on its own: a co-signed event
+/// with no valid sender signature is one we vouched for and nobody made.
+async fn verify_invite_signature(
+    state: &AppState,
+    origin: &str,
+    canonical: &ruma::CanonicalJsonObject,
+    version: &ruma::RoomVersionId,
+    sent_at: Option<u64>,
+) -> Result<(), MatrixError> {
+    let keys = state.federation.peer_keys(origin).await.map_err(|error| {
+        tracing::debug!("cannot fetch {origin} keys: {error}");
+        MatrixError::new(
+            StatusCode::UNAUTHORIZED,
+            "M_UNAUTHORIZED",
+            "the origin's keys cannot be verified".to_owned(),
+        )
+    })?;
+    let enforce = spindle_core::rules_of(version).is_some_and(|rules| rules.enforce_key_validity);
+    let key_map = keys.map_for(sent_at, enforce);
+    if matches!(
+        spindle_core::version::verify(&key_map, canonical, version),
+        Ok(ruma::signatures::Verified::All)
+    ) {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden(
+            "the invite does not carry a valid signature from its sender's server",
+        ))
+    }
 }
 
 /// Authenticate a federation request, or answer 401 with no gradient.
@@ -1569,6 +1632,21 @@ pub(crate) async fn send_join_common(
             if nominee.split_once(':').map(|(_, domain)| domain)
                 == Some(state.config.server.name.as_str()) =>
         {
+            // The rules check only that the nominee is joined and may
+            // invite; whether the joiner is in a room the join rule allows
+            // is ours to decide, so it is decided here, before anything is
+            // signed. `make_join` asked the same question, but a joining
+            // server need not have asked for a template at all.
+            let joiner = join["state_key"].as_str().unwrap_or_default();
+            if !state
+                .rooms
+                .may_vouch_for_restricted_join(&room_id, joiner)
+                .map_err(room_error)?
+            {
+                return Err(MatrixError::forbidden(
+                    "this server cannot vouch for that join: the user is in no room the join rule allows",
+                ));
+            }
             key_map.vouch(
                 state.config.server.name.clone(),
                 state.key.key_id(),

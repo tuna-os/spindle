@@ -786,3 +786,234 @@ async fn a_federated_join_carries_the_invite_it_accepts() {
     );
     assert_eq!(join["unsigned"]["prev_sender"], json!(alice_id), "{join}");
 }
+
+/// An invite signed as `inviter`'s user, under `version`, as a server
+/// that skips every check a well-behaved one makes before it sends.
+fn hostile_invite(
+    signer: &ForeignInviter,
+    sender_server: &str,
+    room: &str,
+    target: &str,
+    prev_events: &[String],
+    auth_events: &[String],
+) -> (String, Value) {
+    let version = ruma::RoomVersionId::V11;
+    let mut event = canonical(&json!({
+        "type": "m.room.member",
+        "room_id": room,
+        "sender": format!("@mallory:{sender_server}"),
+        "state_key": target,
+        "content": { "membership": "invite" },
+        "origin_server_ts": 1_700_000_000_000_u64,
+        "depth": 4,
+        "auth_events": auth_events,
+        "prev_events": prev_events,
+    }));
+    spindle_core::version::hash_and_sign(sender_server, signer.key.pair(), &mut event, &version)
+        .unwrap();
+    let event_id = spindle_core::version::event_id(&event, &version).unwrap();
+    (event_id, serde_json::to_value(&event).unwrap())
+}
+
+/// The IDs of a room's creation events, as a member reads them.
+async fn creation_ids(local: &Instance, token: &str, room: &str) -> Value {
+    let (status, history) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{history}");
+    history
+}
+
+fn id_of(history: &Value, kind: &str, key: &str) -> String {
+    history["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == json!(kind) && event["state_key"] == json!(key))
+        .unwrap_or_else(|| panic!("no {kind} in {history}"))["event_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// An invite that cannot enter a room this server holds is not an
+/// out-of-band invite, and it must never replace the invitee's `join`:
+/// that row is what every membership check on this server reads.
+#[tokio::test]
+async fn an_invite_that_fails_ingest_does_not_unjoin_a_member_of_a_held_room() {
+    let attacker = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+    let room = local.named_room(&bob, "bob's room").await;
+
+    // No parents and no auth events: `ingest` cannot place it, whoever sent it.
+    let (event_id, event) = hostile_invite(&attacker, &attacker.name, &room, &bob_id, &[], &[]);
+    let body = json!({ "room_version": "11", "event": event, "invite_room_state": [] });
+    let (status, answer) = attacker
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "an invite for a joined user is refused: {answer}"
+    );
+
+    let sync = local.sync(&bob).await;
+    assert!(
+        sync["rooms"]["join"][&room].is_object(),
+        "bob is still joined to his own room: {sync}"
+    );
+    assert!(
+        sync["rooms"]["invite"][&room].is_null(),
+        "and no invite replaced the join: {sync}"
+    );
+    let (status, body) = local
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "bob can still read the room: {body}");
+}
+
+/// In a room this server holds and is in, the rules' refusal of an invite
+/// is the answer. Recording it out of band anyway would show the invitee
+/// an invite that the room's power levels never allowed.
+#[tokio::test]
+async fn an_invite_the_rules_refuse_in_a_held_room_is_not_recorded() {
+    let attacker = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let carol = local.register("carol").await;
+    let carol_id = format!("@carol:{}", local.name);
+    let room = local.named_room(&bob, "bob's room").await;
+
+    // Real parents and auth events, so the event reaches the rules, and a
+    // sender who is not in the room, so the rules refuse it.
+    let history = creation_ids(&local, &bob, &room).await;
+    let head = history["chunk"][0]["event_id"].as_str().unwrap().to_owned();
+    let auth = [
+        id_of(&history, "m.room.create", ""),
+        id_of(&history, "m.room.power_levels", ""),
+        id_of(&history, "m.room.join_rules", ""),
+    ];
+    let (event_id, event) =
+        hostile_invite(&attacker, &attacker.name, &room, &carol_id, &[head], &auth);
+    let body = json!({ "room_version": "11", "event": event, "invite_room_state": [] });
+    let (status, answer) = attacker
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(status, 403, "the rules' refusal stands: {answer}");
+
+    let sync = local.sync(&carol).await;
+    assert!(
+        sync["rooms"]["invite"][&room].is_null(),
+        "carol is shown no invite the room never made: {sync}"
+    );
+}
+
+/// An invite is a PDU, held to a PDU's bounds: at most twenty parents,
+/// like every event that arrives by any other door.
+#[tokio::test]
+async fn an_invite_naming_more_parents_than_a_pdu_may_is_refused() {
+    let inviter = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+    let room = format!("!elsewhere:{}", inviter.name);
+
+    let parents: Vec<String> = (0..21).map(|n| format!("$parent{n}")).collect();
+    let (event_id, event) = hostile_invite(&inviter, &inviter.name, &room, &bob_id, &parents, &[]);
+    let body = json!({ "room_version": "11", "event": event, "invite_room_state": [] });
+    let (status, answer) = inviter
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "an oversized invite is not co-signed: {answer}"
+    );
+
+    let sync = local.sync(&bob).await;
+    assert!(
+        sync["rooms"]["invite"][&room].is_null(),
+        "and it is not recorded: {sync}"
+    );
+}
+
+/// For a room this server holds, the room's own create event states its
+/// version; a body naming another is not describing this room.
+#[tokio::test]
+async fn an_invite_naming_another_version_than_a_held_room_is_refused() {
+    let inviter = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    local.register("carol").await;
+    let carol_id = format!("@carol:{}", local.name);
+    let room = local.named_room(&bob, "bob's room").await;
+
+    let (_, event) = hostile_invite(&inviter, &inviter.name, &room, &carol_id, &[], &[]);
+    // Named as a v10 room would name it, so the path agrees with the body
+    // and only the room's own version can tell the two apart.
+    let event_id =
+        spindle_core::version::event_id(&canonical(&event), &ruma::RoomVersionId::V10).unwrap();
+    let body = json!({ "room_version": "10", "event": event, "invite_room_state": [] });
+    let (status, answer) = inviter
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["errcode"],
+        json!("M_INCOMPATIBLE_ROOM_VERSION"),
+        "{answer}"
+    );
+}
+
+/// The co-signature goes beside the inviter's, so the inviter's must hold:
+/// an event signed with a key its server does not publish is not co-signed.
+#[tokio::test]
+async fn an_invite_its_senders_server_did_not_sign_is_refused() {
+    let inviter = ForeignInviter::start().await;
+    let impostor = ForeignInviter::start().await;
+    let local = Instance::start().await;
+    let bob = local.register("bob").await;
+    let bob_id = format!("@bob:{}", local.name);
+    let room = format!("!elsewhere:{}", inviter.name);
+
+    // Named as the inviter's event, signed with somebody else's key.
+    let (event_id, event) = hostile_invite(&impostor, &inviter.name, &room, &bob_id, &[], &[]);
+    let body = json!({ "room_version": "11", "event": event, "invite_room_state": [] });
+    let (status, answer) = inviter
+        .put(
+            &local.name,
+            &format!("/_matrix/federation/v2/invite/{room}/{event_id}"),
+            &body,
+        )
+        .await;
+    assert_eq!(status, 403, "{answer}");
+
+    let sync = local.sync(&bob).await;
+    assert!(sync["rooms"]["invite"][&room].is_null(), "{sync}");
+}
