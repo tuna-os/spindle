@@ -39,6 +39,10 @@ struct Gate {
     /// does not verify: the event a resync meets when a server in a big
     /// room lost or let expire the key it signed with.
     corrupt: std::sync::Mutex<Option<String>>,
+    /// An event `/state` leaves out of its auth chain and `/event` refuses
+    /// with 403, as a resident does for an event its history visibility
+    /// does not let the asker see.
+    hidden: std::sync::Mutex<Option<String>>,
 }
 
 impl Gate {
@@ -69,6 +73,31 @@ impl Gate {
         next: axum::middleware::Next,
     ) -> axum::response::Response {
         let path = request.uri().path();
+        let hidden = self
+            .hidden
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hidden) = &hidden {
+            let asked = path
+                .strip_prefix("/_matrix/federation/v1/event/")
+                .map(|id| {
+                    form_urlencoded::parse(format!("x={id}").as_bytes())
+                        .next()
+                        .unwrap()
+                        .1
+                        .into_owned()
+                });
+            if asked.as_deref() == Some(hidden.as_str()) {
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(json!({
+                        "errcode": "M_FORBIDDEN",
+                        "error": "Server is not allowed to see event.",
+                    })),
+                ));
+            }
+        }
         let ids = path.starts_with("/_matrix/federation/v1/state_ids/");
         let gated = ids || path.starts_with("/_matrix/federation/v1/state/");
         if !gated {
@@ -106,6 +135,9 @@ impl Gate {
         if let Some(user) = corrupt.filter(|_| !ids) {
             response = corrupt_member_signature(response, &user).await;
         }
+        if let Some(hidden) = hidden.filter(|_| !ids) {
+            response = without_auth_event(response, &hidden).await;
+        }
         self.served.fetch_add(1, Ordering::SeqCst);
         let mut asked = self
             .asked
@@ -138,6 +170,35 @@ async fn corrupt_member_signature(
             }
         }
     }
+    let body = answer.to_string();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::from(body))
+}
+
+/// `response`, a `/state` answer, with `hidden` taken out of its auth
+/// chain.
+async fn without_auth_event(
+    response: axum::response::Response,
+    hidden: &str,
+) -> axum::response::Response {
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let mut answer: Value = serde_json::from_slice(&bytes).unwrap();
+    let id_of = |event: &Value| -> String {
+        let canonical = ruma::CanonicalJsonValue::try_from(event.clone()).unwrap();
+        let ruma::CanonicalJsonValue::Object(object) = canonical else {
+            unreachable!()
+        };
+        format!(
+            "${}",
+            ruma::signatures::reference_hash(&object, &ruma::RoomVersionId::V11.rules().unwrap())
+                .unwrap()
+        )
+    };
+    answer["auth_chain"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|event| id_of(event) != hidden);
     let body = answer.to_string();
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     axum::response::Response::from_parts(parts, axum::body::Body::from(body))
@@ -714,4 +775,79 @@ async fn a_member_event_that_does_not_verify_is_left_out_and_the_rest_resync() {
         !members.contains(&remote.user("carol")),
         "an event that does not verify is never seated: {members:?}"
     );
+}
+
+#[tokio::test]
+async fn a_member_whose_auth_event_the_resident_refuses_is_left_out_and_the_rest_resync() {
+    let remote = Instance::start().await;
+    let local = Instance::start_with("gap_backfill = false").await;
+
+    let alice = remote.register("alice").await;
+    let room = remote.named_public_room(&alice).await;
+    let bob = remote.register("bob").await;
+    let (status, body) = remote.join_via(&room, &bob, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    // Carol is invited, then joins: her join cites her invite, which is no
+    // longer state, so only the auth chain carries it.
+    let carol = remote.register("carol").await;
+    let (status, body) = remote
+        .request(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room}/invite"),
+            Some(&alice),
+            Some(&json!({ "user_id": remote.user("carol") })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let invite = body_event_id(&remote, &room, &alice, &remote.user("carol"), "invite").await;
+    let (status, body) = remote.join_via(&room, &carol, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    // The resident leaves the invite out and refuses to hand it on, as
+    // fedoraproject.org's resident did on every attempt.
+    *remote.gate.hidden.lock().unwrap() = Some(invite);
+
+    let zara = local.register("zara").await;
+    let (status, body) = local.join_via(&room, &zara, &remote.name).await;
+    assert_eq!(status, 200, "{body}");
+    let members = tokio::time::timeout(Duration::from_secs(20), local.joined_members(&room, &zara))
+        .await
+        .expect("the resync completes without the member it cannot authorize");
+    assert!(members.contains(&remote.user("alice")), "{members:?}");
+    assert!(members.contains(&remote.user("bob")), "{members:?}");
+    assert!(
+        !members.contains(&remote.user("carol")),
+        "a join whose invite could not be had is never seated: {members:?}"
+    );
+}
+
+/// The ID of `user`'s member event with `membership` in `room`, read from
+/// the room's history as `token` sees it.
+async fn body_event_id(
+    instance: &Instance,
+    room: &str,
+    token: &str,
+    user: &str,
+    membership: &str,
+) -> String {
+    let (status, body) = instance
+        .request(
+            reqwest::Method::GET,
+            &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["type"] == "m.room.member"
+                && event["state_key"] == user
+                && event["content"]["membership"] == membership
+        })
+        .and_then(|event| event["event_id"].as_str())
+        .unwrap()
+        .to_owned()
 }

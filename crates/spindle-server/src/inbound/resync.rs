@@ -260,9 +260,9 @@ async fn resync_from(
     let room_id = record.room_id.as_str();
     let join_id = record.join_event_id.as_str();
     let State {
-        ids: state_ids,
+        ids: mut state_ids,
         mut fetched,
-        dropped,
+        mut dropped,
     } = state_at_join(peers, peer, record, version, keys).await?;
     // Every auth event the fetched bodies cite that is neither among them
     // nor held here: one `/event` each. Gathered over the whole batch, so
@@ -281,7 +281,24 @@ async fn resync_from(
         }
     }
     if !rest.is_empty() {
-        fetched.extend(fetch_state(peers, peer, room_id, version, rest, join_id, keys).await?);
+        let (more, refused) =
+            fetch_auth(peers, peer, room_id, version, rest, join_id, keys).await?;
+        fetched.extend(more);
+        if !refused.is_empty() {
+            // Only a member event may go without what it cites. Any other
+            // state that cites a refused event fails the attempt, when
+            // `retain_remote_auth` finds the event missing.
+            let before = dropped.len();
+            dropped.extend(refused);
+            leave_out_dependents(&mut fetched, &mut dropped);
+            tracing::info!(
+                room = room_id,
+                %peer,
+                refused = dropped.len() - before,
+                "resync leaves out member events whose auth events the peer refuses"
+            );
+            state_ids.retain(|id| !dropped.contains(id));
+        }
     }
     if !fetched.is_empty() {
         peers
@@ -486,6 +503,14 @@ async fn verify_unseen(
     // A member event authorized by a dropped one cannot be authorized
     // here either (a join citing its invite, say): it goes too, until
     // nothing left cites what went.
+    leave_out_dependents(&mut fetched, &mut dropped);
+    Ok((fetched, dropped))
+}
+
+/// Move every member event in `fetched` that cites an event in `dropped`
+/// into `dropped`, until none is left: an event authorized by one that is
+/// left out cannot be authorized here either.
+fn leave_out_dependents(fetched: &mut BTreeMap<String, Value>, dropped: &mut BTreeSet<String>) {
     loop {
         let cascade: Vec<String> = fetched
             .iter()
@@ -501,7 +526,51 @@ async fn verify_unseen(
             dropped.insert(id);
         }
     }
-    Ok((fetched, dropped))
+}
+
+/// The auth events in `rest`, from `peer`, leaving out those it refuses.
+///
+/// A resident may refuse `/event` for an auth event that its own `/state`
+/// cited and left out: `403 Server is not allowed to see event`, because
+/// of the event's history visibility. `#fedora:fedoraproject.org` did
+/// this on every attempt, so its resync never finished. The whole batch is
+/// asked first. If the peer refuses, each event is asked alone, and the
+/// ones it refuses are returned as unavailable. Any other failure fails
+/// the attempt, because it is not a verdict on the event.
+async fn fetch_auth(
+    peers: &Peers<'_>,
+    peer: &str,
+    room_id: &str,
+    version: &RoomVersionId,
+    rest: BTreeSet<String>,
+    join_id: &str,
+    keys: &mut HashMap<String, PeerKeys>,
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>), Failure> {
+    match fetch_state(peers, peer, room_id, version, rest.clone(), join_id, keys).await {
+        Ok(fetched) => return Ok((fetched, BTreeSet::new())),
+        Err(Failure::Peer {
+            forbidden: true, ..
+        }) => {}
+        Err(failure) => return Err(failure),
+    }
+    let mut fetched = BTreeMap::new();
+    let mut refused = BTreeSet::new();
+    for id in rest {
+        if fetched.contains_key(&id) {
+            continue;
+        }
+        let one = BTreeSet::from([id.clone()]);
+        match fetch_state(peers, peer, room_id, version, one, join_id, keys).await {
+            Ok(more) => fetched.extend(more),
+            Err(Failure::Peer {
+                forbidden: true, ..
+            }) => {
+                refused.insert(id);
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    Ok((fetched, refused))
 }
 
 /// Whether `body` is a member event: the only kind a resync leaves out.
