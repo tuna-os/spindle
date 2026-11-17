@@ -683,6 +683,15 @@ impl Media {
             .map_or(0, |record| u64::try_from(record.size).unwrap_or(u64::MAX));
         let hash = blake3::hash(bytes).to_hex().to_string();
         self.blobs.put(&hash, bytes).await?;
+        // Object stores label what they hold `application/octet-stream`
+        // unless told otherwise, and some peers' CDNs are not told: every
+        // Beeper avatar arrives so. Served under that type, an image is
+        // neither shown nor thumbnailed. The bytes say what it is.
+        let content_type = if is_generic_type(content_type) {
+            sniffed_image_type(bytes).unwrap_or(content_type)
+        } else {
+            content_type
+        };
         let record = MediaRecord {
             hash,
             content_type: content_type.to_owned(),
@@ -893,7 +902,11 @@ impl Media {
         crop: bool,
     ) -> Result<(String, Vec<u8>), MediaError> {
         let record = self.record_or_pending(media_id)?;
-        if !record.content_type.starts_with("image/") || record.content_type == "image/svg+xml" {
+        let generic = is_generic_type(&record.content_type);
+        if !generic
+            && (!record.content_type.starts_with("image/")
+                || record.content_type == "image/svg+xml")
+        {
             return Err(MediaError::Unsupported(record.content_type));
         }
         let (width, height) = normalize_dimensions(width, height);
@@ -918,6 +931,11 @@ impl Media {
                 media_id: media_id.to_owned(),
                 hash: record.hash.clone(),
             })?;
+        // A type that says nothing is judged by the bytes: records cached
+        // before `put_remote` sniffed still say `application/octet-stream`.
+        if generic && sniffed_image_type(&source).is_none() {
+            return Err(MediaError::Unsupported(record.content_type));
+        }
         let bytes = self
             .decode_thumbnail(&record.hash, source, width, height, crop)
             .await?;
@@ -1420,6 +1438,29 @@ impl std::fmt::Display for MediaError {
 }
 
 impl std::error::Error for MediaError {}
+
+/// Whether `content_type` names no type at all: what a store answers for
+/// bytes it was not told the type of.
+fn is_generic_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "" | "application/octet-stream" | "binary/octet-stream"
+    )
+}
+
+/// The type of a raster image, read from its first bytes, or `None` for
+/// anything else. SVG is never sniffed: it is a document, not a picture,
+/// and is not thumbnailed.
+fn sniffed_image_type(bytes: &[u8]) -> Option<&'static str> {
+    let mime = image::guess_format(bytes).ok()?.to_mime_type();
+    (mime.starts_with("image/") && mime != "image/svg+xml").then_some(mime)
+}
 
 #[cfg(test)]
 mod tests {

@@ -927,3 +927,34 @@ async fn versions_advertises_stable_authenticated_media() {
     );
     assert!(versions["unstable_features"]["org.matrix.msc3916"].is_null());
 }
+
+/// A record whose type says nothing is thumbnailed by what its bytes are.
+/// Remote media cached before the store sniffed types still says
+/// `application/octet-stream`; an upload so labelled reaches the same
+/// check, and so stands in for it here.
+#[tokio::test]
+async fn an_image_stored_as_octet_stream_is_thumbnailed_by_its_bytes() {
+    let harness = Harness::new();
+    let alice = harness.register("alice").await;
+    let (_, image) = harness
+        .upload(&alice, "application/octet-stream", None, &small_png())
+        .await;
+    let (status, body) = harness
+        .thumbnail_of(&alice, image["content_uri"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, other) = harness
+        .upload(
+            &alice,
+            "application/octet-stream",
+            None,
+            b"%PDF-1.7 not a picture",
+        )
+        .await;
+    let (status, body) = harness
+        .thumbnail_of(&alice, other["content_uri"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_UNSUPPORTED");
+}
