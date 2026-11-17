@@ -166,7 +166,7 @@ async fn a_peers_too_large_is_final_and_the_legacy_endpoint_is_not_tried() {
     );
 
     let outcome = federation
-        .remote_media_download("gateway.venue", "bigfile")
+        .remote_media_download("gateway.venue", "bigfile", 1024 * 1024)
         .await;
     match outcome {
         Err(spindle_server::federation::FederationError::Answered { status, body }) => {

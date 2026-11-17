@@ -202,3 +202,99 @@ async fn a_name_with_a_port_or_a_literal_skips_discovery() {
     assert_eq!(wk.hits.load(Ordering::SeqCst), 0);
     assert_eq!(target.hits.load(Ordering::SeqCst), 1);
 }
+
+/// Serve `head`, then `chunks` chunks of 64 KiB of `a`, then `tail`, at
+/// `path`, with no `Content-Length`, counting the chunks actually pulled
+/// from the stream: a reader that stops early stops the stream with it.
+async fn serve_stream(
+    path: &'static str,
+    head: &'static [u8],
+    chunks: usize,
+    tail: &'static [u8],
+) -> Counted {
+    use futures_util::StreamExt;
+    use futures_util::stream;
+    const CHUNK: usize = 64 * 1024;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        path,
+        get({
+            let pulled = Arc::clone(&pulled);
+            move || {
+                let pulled = Arc::clone(&pulled);
+                async move {
+                    let chunk = |bytes: axum::body::Bytes| Ok::<_, std::io::Error>(bytes);
+                    let filler = stream::iter(0..chunks).map(move |_| {
+                        pulled.fetch_add(1, Ordering::SeqCst);
+                        chunk(axum::body::Bytes::from(vec![b'a'; CHUNK]))
+                    });
+                    let body = stream::iter([chunk(axum::body::Bytes::from_static(head))])
+                        .chain(filler)
+                        .chain(stream::iter([chunk(axum::body::Bytes::from_static(tail))]));
+                    (
+                        [("content-type", "application/json")],
+                        axum::body::Body::from_stream(body),
+                    )
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Counted { port, hits: pulled }
+}
+
+/// A peer's answer is read up to a bound and no further. The profile
+/// lookup is reachable with no credentials at all, so a peer that answers
+/// with an endless body must cost this server the bound, not the body.
+#[tokio::test]
+async fn an_oversized_profile_answer_is_refused_not_buffered() {
+    // 32 MiB of valid JSON, which an unbounded read would accept.
+    let stub = serve_stream(
+        "/_matrix/federation/v1/query/profile",
+        b"{\"displayname\":\"",
+        512,
+        b"\"}",
+    )
+    .await;
+    let dir = TempDir::new().unwrap();
+    // A name with a port skips discovery and goes straight to the stub.
+    let federation = federation(&dir, 1, &["127.0.0.0/8"]);
+    let error = federation
+        .remote_query_profile(&format!("127.0.0.1:{}", stub.port), USER)
+        .await
+        .expect_err("a 32 MiB profile is not a profile");
+    assert!(error.to_string().contains("too large"), "{error}");
+    assert!(
+        stub.hits.load(Ordering::SeqCst) < 256,
+        "the read stopped near the bound, not at the end of the body: {} chunks",
+        stub.hits.load(Ordering::SeqCst)
+    );
+}
+
+/// The `.well-known` fetch is reached by any request naming an unknown
+/// origin, so its body is bounded while it is read, not checked after.
+#[tokio::test]
+async fn an_oversized_well_known_is_not_read_to_the_end() {
+    let wk = serve_stream(
+        "/.well-known/matrix/server",
+        b"{\"m.server\":\"",
+        512,
+        b"\"}",
+    )
+    .await;
+    let dir = TempDir::new().unwrap();
+    let federation = federation(&dir, wk.port, &["127.0.0.0/8"]);
+    // The answer is refused either way; what differs is how much of it
+    // this server took in before it said so.
+    let _ = federation.remote_query_profile("localhost", USER).await;
+    assert!(
+        wk.hits.load(Ordering::SeqCst) < 256,
+        "the read stopped near the bound, not at the end of the body: {} chunks",
+        wk.hits.load(Ordering::SeqCst)
+    );
+}

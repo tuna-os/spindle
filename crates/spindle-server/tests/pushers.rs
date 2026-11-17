@@ -275,3 +275,84 @@ impl Harness {
         .await
     }
 }
+
+impl Harness {
+    async fn login(&self, username: &str) -> String {
+        let (status, body) = self
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_matrix/client/v3/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "type": "m.login.password",
+                            "identifier": { "type": "m.id.user", "user": username },
+                            "password": "hunter2",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["access_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn post_empty(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        self.call(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+    }
+}
+
+/// A pusher is a standing delivery of the user's events to a URL that a
+/// session chose. One set with a stolen token must not outlive the owner
+/// logging every session out.
+#[tokio::test]
+async fn logging_out_everywhere_takes_the_pushers_with_the_sessions() {
+    let harness = Harness::new();
+    let stolen = harness.register("alice").await;
+    let (status, body) = harness.set(&stolen, &http_pusher("KEY1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .post_empty("/_matrix/client/v3/logout/all", &stolen)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let fresh = harness.login("alice").await;
+    assert!(
+        harness.list(&fresh).await.is_empty(),
+        "a pusher registered by an ended session keeps receiving the user's events"
+    );
+}
+
+/// Logging one session out takes that session's pushers and no others.
+#[tokio::test]
+async fn logging_one_session_out_takes_only_its_own_pushers() {
+    let harness = Harness::new();
+    let keeper = harness.register("alice").await;
+    let (status, body) = harness.set(&keeper, &http_pusher("KEEP")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let leaver = harness.login("alice").await;
+    let (status, body) = harness.set(&leaver, &http_pusher("GONE")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.list(&keeper).await.len(), 2);
+
+    let (status, body) = harness
+        .post_empty("/_matrix/client/v3/logout", &leaver)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let left: Vec<Value> = harness.list(&keeper).await;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["pushkey"], json!("KEEP"), "{left:?}");
+}

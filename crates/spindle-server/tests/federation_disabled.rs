@@ -79,7 +79,7 @@ async fn disabled_federation_opens_no_socket_even_to_a_listed_peer() {
     assert!(disabled.peer_keys("other.example").await.is_err());
     assert!(
         disabled
-            .remote_media_download("other.example", "media")
+            .remote_media_download("other.example", "media", 1024)
             .await
             .is_err()
     );

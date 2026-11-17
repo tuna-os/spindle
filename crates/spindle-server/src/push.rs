@@ -64,6 +64,10 @@ const BATCH_LIMIT: usize = 256;
 /// is down; a dropped notification's row goes with it.
 const QUEUE_CAP: usize = 10_000;
 
+/// The most of a gateway's answer that is read. The answer is a list of
+/// rejected pushkeys, and a gateway is any URL a client registered.
+const GATEWAY_ANSWER_MAX_BYTES: usize = 64 * 1024;
+
 /// Attempts at one notification before it is dropped. With the retry
 /// base doubling to 64× that is the better part of two minutes at the
 /// default base, which is longer than any ring and long enough for a
@@ -195,12 +199,18 @@ impl Gateway {
             })?;
         let status = response.status();
         if status.is_success() {
-            let answer: Value = response
-                .bytes()
-                .await
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or(Value::Null);
+            // Only `rejected` is read from the answer, so a gateway that
+            // sends more than a small object is treated like one whose
+            // answer does not parse.
+            let answer: Value = crate::federation::read_bounded(
+                response,
+                GATEWAY_ANSWER_MAX_BYTES,
+                "gateway answer",
+            )
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
             return Ok(answer["rejected"]
                 .as_array()
                 .map(|keys| {

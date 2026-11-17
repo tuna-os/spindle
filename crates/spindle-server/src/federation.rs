@@ -117,6 +117,27 @@ const WELL_KNOWN_FAILURE: Duration = Duration::from_secs(5 * 60);
 /// The most of a `.well-known/matrix/server` body read. The document is
 /// one short JSON object; anything larger is not one.
 const WELL_KNOWN_MAX_BYTES: usize = 64 * 1024;
+/// The most `.well-known` answers remembered at once.
+const DELEGATIONS_MAX: usize = 10_000;
+/// The most read of a peer's answer that is one event or one small object:
+/// a join, knock or leave template, an invite, a profile, an alias. A
+/// peer's answer is read to a bound and no further, because `bytes()` keeps
+/// whatever a peer sends, and a gzip body can grow a thousandfold.
+const SMALL_JSON_MAX_BYTES: usize = 1024 * 1024;
+/// A `send_knock` answer: the stripped state of the room knocked on.
+const KNOCK_STATE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// A `send_join` answer carries a room's whole state and auth chain: the
+/// same bound the state resync gives `/state`.
+const SEND_JOIN_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// The cap `signed_json` applies when its caller names none: key queries,
+/// key claims, device lists, and an application service's proxied request.
+const SIGNED_JSON_DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// The body of a refusal, read only to quote it in a log line or to find
+/// an `errcode`.
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+/// What a multipart media answer may carry beyond the media itself: its
+/// boundaries and the JSON metadata part.
+const MULTIPART_SLACK_BYTES: usize = 64 * 1024;
 
 pub struct Federation {
     store: Arc<FjallStore>,
@@ -366,9 +387,15 @@ impl Discovery {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Bounded: a stranger can name any number of servers, and each
-        // one is an entry.
-        if delegations.len() > 10_000 {
+        // one is an entry that the peer may keep alive for 48 hours. When
+        // dropping the expired ones does not make room, the cache starts
+        // over: a refetch per name, not memory without a bound. The same
+        // rule `hierarchy_cache` follows.
+        if delegations.len() >= DELEGATIONS_MAX && !delegations.contains_key(name) {
             delegations.retain(|_, (_, until)| *until > now);
+            if delegations.len() >= DELEGATIONS_MAX {
+                delegations.clear();
+            }
         }
         delegations.insert(name.to_owned(), (delegated.clone(), now + ttl));
         delegated
@@ -499,19 +526,9 @@ impl Discovery {
             )));
         }
         let ttl = well_known_ttl(response.headers().get(reqwest::header::CACHE_CONTROL));
-        if response
-            .content_length()
-            .is_some_and(|length| length > WELL_KNOWN_MAX_BYTES as u64)
-        {
-            return Err(FederationError::Refused("well-known: too large".to_owned()));
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("well-known body: {error}")))?;
-        if body.len() > WELL_KNOWN_MAX_BYTES {
-            return Err(FederationError::Refused("well-known: too large".to_owned()));
-        }
+        // Read to the bound and no further: `Content-Length` is the peer's
+        // to omit, and a gzip body is checked after decoding, by size.
+        let body = read_bounded(response, WELL_KNOWN_MAX_BYTES, "well-known").await?;
         Ok((parse_well_known(&body)?, ttl))
     }
 }
@@ -754,6 +771,25 @@ impl Federation {
     /// never touches DNS, so this is the only place it can be vetted.
     /// Synchronous and free of the store, so the outbox can address a
     /// transaction while it plans and resolve it after it lets go.
+    /// Whether `name` is one this server would never fetch keys for: not
+    /// a server name, or one [`Self::address`] refuses before any I/O.
+    /// Repeats `address`'s refusals; a name refused here never reaches
+    /// `address`, so the allow/deny refusal is counted here instead.
+    fn not_a_key_origin(&self, name: &str) -> bool {
+        if name.len() > 255 || ruma::ServerName::parse(name).is_err() {
+            return true;
+        }
+        if !self.enabled {
+            return true;
+        }
+        if !self.server_permitted(name) {
+            self.metrics
+                .record_federation_listed(crate::metrics::ListedDirection::Outbound);
+            return true;
+        }
+        !self.peers.contains_key(name) && self.discovery().vetted_url(name).is_err()
+    }
+
     fn address(&self, name: &str) -> Result<Address, FederationError> {
         // Every outbound request is addressed here, so this is the one
         // switch that keeps a dark copy of a live server off the network:
@@ -1451,7 +1487,13 @@ impl Federation {
     /// failed too recently to be asked again -- or, with `recent_success`,
     /// answered too recently.
     async fn direct_key_document(&self, origin: &str, recent_success: bool) -> Option<Value> {
-        if origin.len() > 255 || ruma::ServerName::parse(origin).is_err() {
+        // A name this server would refuse to contact costs no fetch, so it
+        // must not take a throttle entry either: decided here, before a
+        // slot or an entry is spent. Otherwise one unauthenticated notary
+        // query listing thousands of private literals fills the negative
+        // cache, and every other origin's key fetch is refused until it
+        // drains.
+        if self.not_a_key_origin(origin) {
             return None;
         }
         let Ok(_slot) = self.key_fetch_slots.try_acquire() else {
@@ -1574,7 +1616,10 @@ impl Federation {
     /// are dropped. The first notary that hands on anything credible ends
     /// the search.
     async fn notary_key_documents(&self, origin: &str, want: &Want<'_>) -> Vec<Value> {
-        if self.notaries.is_empty() || origin == self.server_name {
+        // The same judgement before a notary turn is spent: invented or
+        // unreachable names would otherwise use up the per-minute budget
+        // that origins this server does talk to depend on.
+        if self.notaries.is_empty() || origin == self.server_name || self.not_a_key_origin(origin) {
             return Vec::new();
         }
         if !self.notary_turn(origin) {
@@ -1917,7 +1962,7 @@ impl Federation {
 }
 
 /// A response body, refused past `maximum` bytes rather than read whole.
-async fn read_bounded(
+pub(crate) async fn read_bounded(
     mut response: reqwest::Response,
     maximum: usize,
     what: &str,
@@ -1978,14 +2023,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("make_join: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "make_join body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("make_join body: {error}")))?;
         if !status.is_success() {
             return Err(peer_refusal(destination, "make_join", status, body));
         }
@@ -2028,14 +2068,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("make_knock: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("make_knock body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("make_knock body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "make_knock body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("make_knock body: {error}")))?;
         if !status.is_success() {
             return Err(peer_refusal(destination, "make_knock", status, body));
         }
@@ -2078,14 +2113,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("send_knock: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("send_knock body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("send_knock body: {error}")))
-            })?;
+        let bytes = read_bounded(response, KNOCK_STATE_MAX_BYTES, "send_knock body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("send_knock body: {error}")))?;
         if !status.is_success() {
             return Err(peer_refusal(destination, "send_knock", status, body));
         }
@@ -2106,7 +2136,7 @@ impl Federation {
         body: Option<&Value>,
         what: &'static str,
     ) -> Result<Value, FederationError> {
-        self.signed_json_bounded(destination, uri, body, what, None)
+        self.signed_json_bounded(destination, uri, body, what, SIGNED_JSON_DEFAULT_MAX_BYTES)
             .await
     }
 
@@ -2116,7 +2146,7 @@ impl Federation {
         uri: &str,
         body: Option<&Value>,
         what: &'static str,
-        maximum: Option<usize>,
+        maximum: usize,
     ) -> Result<Value, FederationError> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let authorization = self.sign_request(method, uri, destination, body)?;
@@ -2128,42 +2158,14 @@ impl Federation {
                 .body(body.to_string()),
             None => self.request(reqwest::Method::GET, destination, uri).await?,
         };
-        let mut response = request
+        let response = request
             .header("authorization", authorization)
             .timeout(Duration::from_secs(30))
             .send()
             .await
             .map_err(|error| FederationError::Refused(format!("{what}: {error}")))?;
         let status = response.status();
-        let bytes: axum::body::Bytes = if let Some(maximum) = maximum {
-            if response
-                .content_length()
-                .is_some_and(|length| length > maximum as u64)
-            {
-                return Err(FederationError::Refused(format!(
-                    "{what} response is too large"
-                )));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?
-            {
-                if chunk.len() > maximum.saturating_sub(bytes.len()) {
-                    return Err(FederationError::Refused(format!(
-                        "{what} response is too large"
-                    )));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            bytes.into()
-        } else {
-            response
-                .bytes()
-                .await
-                .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?
-        };
+        let bytes = read_bounded(response, maximum, &format!("{what} response")).await?;
         let answer: Value = serde_json::from_slice(&bytes)
             .map_err(|error| FederationError::Refused(format!("{what} body: {error}")))?;
         if !status.is_success() {
@@ -2187,7 +2189,7 @@ impl Federation {
         uri: &str,
         body: Option<&Value>,
     ) -> Result<Value, FederationError> {
-        self.signed_json_bounded(destination, uri, body, "msc3995 hub", Some(4 * 1024 * 1024))
+        self.signed_json_bounded(destination, uri, body, "msc3995 hub", 4 * 1024 * 1024)
             .await
     }
 
@@ -2224,7 +2226,7 @@ impl Federation {
                 &uri,
                 Some(&body),
                 "get_missing_events",
-                Some(16 * 1024 * 1024),
+                16 * 1024 * 1024,
             )
             .await?;
         let events = response["events"].as_array().ok_or_else(|| {
@@ -2272,7 +2274,7 @@ impl Federation {
             path_segment(room_id),
         );
         let response = self
-            .signed_json_bounded(destination, &uri, None, "backfill", Some(32 * 1024 * 1024))
+            .signed_json_bounded(destination, &uri, None, "backfill", 32 * 1024 * 1024)
             .await?;
         let pdus = response["pdus"].as_array().ok_or_else(|| {
             FederationError::Refused("backfill response has no pdus array".to_owned())
@@ -2301,7 +2303,7 @@ impl Federation {
     ) -> Result<Value, FederationError> {
         let uri = format!("/_matrix/federation/v1/event/{}", path_segment(event_id));
         let response = self
-            .signed_json_bounded(destination, &uri, None, "event", Some(16 * 1024 * 1024))
+            .signed_json_bounded(destination, &uri, None, "event", 16 * 1024 * 1024)
             .await?;
         let pdus = response["pdus"]
             .as_array()
@@ -2330,13 +2332,7 @@ impl Federation {
             path_segment(event_id)
         );
         let response = self
-            .signed_json_bounded(
-                destination,
-                &uri,
-                None,
-                "event_auth",
-                Some(16 * 1024 * 1024),
-            )
+            .signed_json_bounded(destination, &uri, None, "event_auth", 16 * 1024 * 1024)
             .await?;
         let events = response["auth_chain"]
             .as_array()
@@ -2365,7 +2361,7 @@ impl Federation {
             path_segment(room_id),
         );
         let response = self
-            .signed_json_bounded(destination, &uri, None, "state_ids", Some(16 * 1024 * 1024))
+            .signed_json_bounded(destination, &uri, None, "state_ids", 16 * 1024 * 1024)
             .await?;
         for field in ["pdu_ids", "auth_chain_ids"] {
             if !response[field]
@@ -2401,7 +2397,7 @@ impl Federation {
             path_segment(room_id),
         );
         let response = self
-            .signed_json_bounded(destination, &uri, None, "state", Some(max_bytes))
+            .signed_json_bounded(destination, &uri, None, "state", max_bytes)
             .await?;
         for field in ["pdus", "auth_chain"] {
             if !response[field]
@@ -2497,14 +2493,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("query/directory: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("directory body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("directory body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "directory body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("directory body: {error}")))?;
         if !status.is_success() {
             return Err(FederationError::Refused(format!(
                 "{destination} refused query/directory: {status} {body}"
@@ -2553,7 +2544,7 @@ impl Federation {
         );
         let fetched = tokio::time::timeout(
             HIERARCHY_TIMEOUT,
-            self.signed_json_bounded(server, &uri, None, "hierarchy", Some(HIERARCHY_MAX_BYTES)),
+            self.signed_json_bounded(server, &uri, None, "hierarchy", HIERARCHY_MAX_BYTES),
         )
         .await
         .unwrap_or_else(|_| {
@@ -2603,14 +2594,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("query/profile: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("profile body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("profile body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "profile body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("profile body: {error}")))?;
         if !status.is_success() {
             return Err(FederationError::Refused(format!(
                 "{destination} refused query/profile: {status} {body}"
@@ -2712,14 +2698,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("send_join: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SEND_JOIN_MAX_BYTES, "send_join body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("send_join body: {error}")))?;
         if !status.is_success() {
             return Err(peer_refusal(destination, "send_join", status, body));
         }
@@ -2764,14 +2745,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("invite: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("invite body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("invite body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "invite body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("invite body: {error}")))?;
         if !status.is_success() {
             return Err(FederationError::Refused(format!(
                 "{destination} refused invite: {status} {body}"
@@ -2804,14 +2780,9 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("make_leave: {error}")))?;
         let status = response.status();
-        let body: Value = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("make_leave body: {error}")))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| FederationError::Refused(format!("make_leave body: {error}")))
-            })?;
+        let bytes = read_bounded(response, SMALL_JSON_MAX_BYTES, "make_leave body").await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| FederationError::Refused(format!("make_leave body: {error}")))?;
         if !status.is_success() {
             return Err(FederationError::Refused(format!(
                 "{destination} refused make_leave: {status} {body}"
@@ -2850,7 +2821,9 @@ impl Federation {
             .map_err(|error| FederationError::Refused(format!("send_leave: {error}")))?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
+            let body = read_bounded(response, ERROR_BODY_MAX_BYTES, "send_leave error")
+                .await
+                .unwrap_or_default();
             return Err(FederationError::Refused(format!(
                 "{destination} refused send_leave: {status} {}",
                 String::from_utf8_lossy(&body)
@@ -2894,10 +2867,7 @@ impl Federation {
             .await
             .map_err(|error| FederationError::Refused(format!("fed_proxy: {error}")))?;
         let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("fed_proxy body: {error}")))?;
+        let bytes = read_bounded(response, SIGNED_JSON_DEFAULT_MAX_BYTES, "fed_proxy body").await?;
         Ok((status, serde_json::from_slice(&bytes).ok()))
     }
 
@@ -2922,6 +2892,7 @@ impl Federation {
         &self,
         destination: &str,
         media_id: &str,
+        max_bytes: usize,
     ) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
         let uri = format!("/_matrix/federation/v1/media/download/{media_id}");
         let authorization = self.sign_request("GET", &uri, destination, None)?;
@@ -2940,15 +2911,18 @@ impl Federation {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_owned();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| FederationError::Refused(format!("media body: {error}")))?;
+            let body = read_bounded(
+                response,
+                max_bytes.saturating_add(MULTIPART_SLACK_BYTES),
+                "media body",
+            )
+            .await?;
             let (content_type, filename, bytes) = match parse_multipart_media(&content_type, &body)?
             {
                 MediaPart::Inline(content_type, filename, bytes) => (content_type, filename, bytes),
                 MediaPart::Location(location) => {
-                    self.media_at_location(destination, &location).await?
+                    self.media_at_location(destination, &location, max_bytes)
+                        .await?
                 }
             };
             // No real avatar or attachment is zero bytes; an empty part is
@@ -2966,8 +2940,7 @@ impl Federation {
         // `M_TOO_LARGE` is the peer's answer, not its failure to answer: a
         // peer that caps what it serves (a mesh homeserver at 256 KiB, say)
         // has said so, and the legacy endpoint would only say it again.
-        let body: Value = response
-            .bytes()
+        let body: Value = read_bounded(response, ERROR_BODY_MAX_BYTES, "media error")
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -3007,11 +2980,8 @@ impl Federation {
             .get("content-disposition")
             .and_then(|value| value.to_str().ok())
             .and_then(disposition_filename);
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("legacy media body: {error}")))?;
-        Ok((content_type, filename, bytes.to_vec()))
+        let bytes = read_bounded(response, max_bytes, "legacy media body").await?;
+        Ok((content_type, filename, bytes))
     }
 
     /// The file a peer's media answer named by `Location` rather than
@@ -3023,6 +2993,7 @@ impl Federation {
         &self,
         destination: &str,
         url: &str,
+        max_bytes: usize,
     ) -> Result<(String, Option<String>, Vec<u8>), FederationError> {
         let parsed = reqwest::Url::parse(url).map_err(|error| {
             FederationError::Refused(format!("{destination} named media at {url}: {error}"))
@@ -3059,11 +3030,8 @@ impl Federation {
             .get("content-disposition")
             .and_then(|value| value.to_str().ok())
             .and_then(disposition_filename);
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| FederationError::Refused(format!("media location body: {error}")))?;
-        Ok((content_type, filename, bytes.to_vec()))
+        let bytes = read_bounded(response, max_bytes, "media location body").await?;
+        Ok((content_type, filename, bytes))
     }
 
     /// Deliver one signed transaction to a peer.
@@ -4461,6 +4429,72 @@ mod key_fetch_capacity_tests {
         assert_eq!(
             federation.key_fetch_slots.available_permits(),
             MAX_CONCURRENT_KEY_FETCHES
+        );
+    }
+}
+
+#[cfg(test)]
+mod untouchable_origin_tests {
+    use super::*;
+
+    fn federation(directory: &tempfile::TempDir) -> Federation {
+        let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+        let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+        Federation::new(store, "example.org", key, false, &[]).unwrap()
+    }
+
+    /// One unauthenticated notary query can list thousands of names. A name
+    /// that is refused before any socket is opened cost nothing to refuse,
+    /// so it must not take one of the entries every other origin needs.
+    #[tokio::test]
+    async fn names_refused_without_io_take_no_throttle_entry() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let federation = federation(&directory);
+        for port in 1..=64_u16 {
+            assert!(
+                federation
+                    .peer_key_document(&format!("10.0.0.1:{port}"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            federation.negative.lock().unwrap().is_empty(),
+            "a name that cost no fetch must not cost every other origin its turn"
+        );
+    }
+
+    /// Past the cap, with nothing expired, the cache starts over rather
+    /// than growing: a peer sets the lifetime, up to 48 hours.
+    #[tokio::test]
+    async fn the_delegation_cache_is_bounded_when_nothing_has_expired() {
+        let directory = tempfile::TempDir::new().unwrap();
+        // A port nothing listens on, so the lookup below fails at once.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+        let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+        let federation =
+            Federation::new(store, "example.org", key, true, &["127.0.0.0/8".to_owned()])
+                .unwrap()
+                .with_well_known_port(closed);
+        {
+            let mut delegations = federation.delegations.lock().unwrap();
+            let far = Instant::now() + WELL_KNOWN_MAX;
+            for number in 0..DELEGATIONS_MAX {
+                delegations.insert(
+                    format!("{number}.invalid"),
+                    (Some("x.invalid:443".to_owned()), far),
+                );
+            }
+        }
+        assert_eq!(federation.discovery().delegation("localhost").await, None);
+        assert!(
+            federation.delegations.lock().unwrap().len() <= DELEGATIONS_MAX,
+            "the cache grew past its cap"
         );
     }
 }

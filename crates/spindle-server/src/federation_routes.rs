@@ -495,12 +495,21 @@ struct KeyQueryBatch {
     server_keys: BTreeMap<String, Value>,
 }
 
+/// The most names one notary query is answered for. The route takes no
+/// credentials and each name can cost a key fetch; the rest are simply
+/// absent, which is what the spec says of a server whose keys cannot be had.
+const MAX_NOTARY_QUERY_NAMES: usize = 32;
+
 /// `POST /_matrix/key/v2/query`
 async fn key_query_batch(
     State(state): State<AppState>,
     Json(request): Json<KeyQueryBatch>,
 ) -> Json<Value> {
-    let names: Vec<String> = request.server_keys.into_keys().collect();
+    let names: Vec<String> = request
+        .server_keys
+        .into_keys()
+        .take(MAX_NOTARY_QUERY_NAMES)
+        .collect();
     let server_keys = notary_documents(&state, &names).await;
     Json(json!({ "server_keys": server_keys }))
 }
