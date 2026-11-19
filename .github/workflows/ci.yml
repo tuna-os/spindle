@@ -203,7 +203,7 @@ jobs:
       # this repository is unusually prose-heavy: the SPEC, the ADRs and the
       # benchmark write-ups are the artefact as much as the code is.
       - name: Check spelling
-        uses: crate-ci/typos@v1.52.1
+        uses: crate-ci/typos@v1.52.2
 
       # A tag is a pointer somebody else can move, and every action here runs
       # before our code does, in a job holding a token. This ran

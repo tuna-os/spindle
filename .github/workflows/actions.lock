@@ -21,7 +21,7 @@ workflows:
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
-        - 'crate-ci/typos@v1.52.1'
+        - 'crate-ci/typos@v1.52.2'
         - 'determinatesystems/nix-installer-action@v23'
         - 'dtolnay/rust-toolchain@v1'
         - 'swatinem/rust-cache@v2.9.3'
@@ -152,9 +152,9 @@ dependencies:
         commit: 'sha1-66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c'
         owner_id: 16208487
         repo_id: 399925381
-    'crate-ci/typos@v1.52.1':
-        ref: 'v1.52.1'
-        commit: 'sha1-2611abd15acb0c2e317fb9e45855aabb8b35a414'
+    'crate-ci/typos@v1.52.2':
+        ref: 'v1.52.2'
+        commit: 'sha1-276087d9a4f06398b3e04825487805e2d7375888'
         owner_id: 36412122
         repo_id: 181782286
     'determinatesystems/nix-installer-action@v23':
