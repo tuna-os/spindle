@@ -381,6 +381,32 @@ async fn a_locked_user_is_told_so_with_a_soft_logout() {
 }
 
 #[tokio::test]
+async fn a_hold_on_a_user_of_another_server_leaves_the_local_account_alone() {
+    let server = Harness::new(PLAIN);
+    let alice = server.register("alice").await;
+    let admin = server.register("admin").await;
+    server.make_admin("admin");
+
+    for (hold, flag) in [("lock", "locked"), ("suspend", "suspended")] {
+        let elsewhere = format!("/_matrix/client/v1/admin/{hold}/@alice:elsewhere.example");
+        let (status, body) = server.put(&elsewhere, &admin, &json!({ flag: true })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = server.get(&elsewhere, &admin).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let here = format!("/_matrix/client/v1/admin/{hold}/@alice:example.org");
+        let (status, body) = server.get(&here, &admin).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[flag], false);
+    }
+
+    let (status, body) = server
+        .get("/_matrix/client/v3/account/whoami", &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn a_suspended_user_can_read_and_log_out_but_not_write() {
     let server = Harness::new(PLAIN);
     let alice = server.register("alice").await;
