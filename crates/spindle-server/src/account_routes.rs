@@ -894,10 +894,19 @@ fn admin_hold(
     }
     let accounts = Accounts::new(state.store.as_ref(), &state.config.server.name);
     let localpart = localpart_of(user_id);
-    let Some(account) = accounts
-        .account(&localpart)
-        .map_err(|error| internal(&error))?
-    else {
+    // `localpart_of` drops the server name. A user of another server is not
+    // held here, and must not select the local account of the same name.
+    let elsewhere = user_id
+        .split_once(':')
+        .is_some_and(|(_, server)| server != state.config.server.name);
+    let account = if elsewhere {
+        None
+    } else {
+        accounts
+            .account(&localpart)
+            .map_err(|error| internal(&error))?
+    };
+    let Some(account) = account else {
         return Err(MatrixError::new(
             StatusCode::NOT_FOUND,
             "M_NOT_FOUND",
