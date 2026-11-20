@@ -1,0 +1,14 @@
+# Counted metrics that only go down. Checked by .github/workflows/ratchet.yml
+# with tuna-os/.github's count-ratchet action (see its README for the format).
+#
+# A count over budget fails. A count under budget also fails, with the new
+# number to write here, so an improvement stays locked in. Raising a budget
+# needs the `ratchet-raise` label on the pull request.
+#
+# Local count: python3 <tuna-os/.github>/.github/actions/count-ratchet/ratchet.py check
+# Seeded 2026-11-20 from main.
+
+[metrics.deny-undated]
+description = "deny.toml advisory ignores without a dated reason ('; review by YYYY-MM-DD')"
+command = 'python3 "$RATCHET_ACTION_PATH/checks/deny_review_dates.py" deny.toml'
+budget = 0
