@@ -55,6 +55,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::federation::FederationError;
+use crate::user_ids::server_of;
 
 pub(crate) use attest::takes_edu;
 pub use attest::{attestations, chain_step_holds, checkpoints, proofs};
@@ -125,11 +126,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The server part of a user ID.
-fn server_of(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, domain)| domain)
 }
 
 /// Whether this server holds `event_id` in `room_id`'s log.

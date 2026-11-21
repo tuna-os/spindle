@@ -50,6 +50,7 @@ use spindle_store::{Durability, FjallStore, ReadView, Store, StoreError};
 use crate::federation::Federation;
 use crate::metrics::EduResult;
 use crate::rooms::Rooms;
+use crate::user_ids::server_of;
 
 /// How long after their last activity a user still counts as "currently
 /// active".
@@ -331,7 +332,7 @@ impl Presence {
     }
 
     fn is_local(&self, user_id: &str) -> bool {
-        domain(user_id) == Some(self.server_name.as_str())
+        crate::user_ids::is_on(user_id, &self.server_name)
     }
 
     fn read_row(&self, user_id: &str) -> Result<Option<Row>, StoreError> {
@@ -534,7 +535,7 @@ impl Presence {
                 continue;
             };
             if user_id.len() > MAX_ID_LEN
-                || domain(user_id) != Some(origin)
+                || server_of(user_id) != Some(origin)
                 || self.is_local(user_id)
                 || !shares_room_with_local(peers.rooms, user_id, &self.server_name)
             {
@@ -786,13 +787,9 @@ fn shares_room_with_local(rooms: &Rooms, user_id: &str, server_name: &str) -> bo
         rooms.joined_member_ids(room_id).is_ok_and(|members| {
             members
                 .iter()
-                .any(|member| domain(member) == Some(server_name))
+                .any(|member| server_of(member) == Some(server_name))
         })
     })
-}
-
-fn domain(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, domain)| domain)
 }
 
 fn now_ms() -> u64 {

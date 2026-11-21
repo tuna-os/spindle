@@ -98,6 +98,7 @@ pub mod tokens;
 pub mod txn_replay;
 pub mod typing;
 pub mod upstream;
+pub mod user_ids;
 pub mod voip_routes;
 pub mod web;
 

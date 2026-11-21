@@ -614,11 +614,7 @@ pub fn is_server_admin(
 }
 
 pub(crate) fn local_localpart(state: &AppState, user_id: &str) -> Option<String> {
-    user_id
-        .strip_prefix('@')
-        .and_then(|rest| rest.split_once(':'))
-        .filter(|(_, domain)| *domain == state.config.server.name)
-        .map(|(localpart, _)| localpart.to_owned())
+    crate::user_ids::local_localpart(user_id, &state.config.server.name).map(str::to_owned)
 }
 
 /// The path accepts a full user ID (what Synapse tooling sends) and
