@@ -26,14 +26,10 @@ use tokio::time::Instant;
 use crate::AppState;
 use crate::errors::MatrixError;
 use crate::inbound::federation_origin;
-
-/// The server a user ID lives on, or `None` for something that is not one.
-fn domain_of(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, domain)| domain)
-}
+use crate::user_ids::server_of;
 
 fn is_local(state: &AppState, user_id: &str) -> bool {
-    domain_of(user_id) == Some(state.config.server.name.as_str())
+    crate::user_ids::is_on(user_id, &state.config.server.name)
 }
 
 /// `POST /_matrix/federation/v1/user/keys/query`: the device directory as
@@ -219,7 +215,7 @@ fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
     let Some(sender) = content["sender"].as_str() else {
         return;
     };
-    if domain_of(sender) != Some(origin) {
+    if server_of(sender) != Some(origin) {
         tracing::debug!(
             origin,
             sender,
@@ -326,7 +322,7 @@ async fn apply_device_list_update(state: &AppState, origin: &str, content: &Valu
     let Some(user_id) = content["user_id"].as_str() else {
         return;
     };
-    if domain_of(user_id) != Some(origin) {
+    if server_of(user_id) != Some(origin) {
         tracing::debug!(
             origin,
             user_id,
@@ -435,7 +431,7 @@ fn apply_signing_key_update(state: &AppState, origin: &str, content: &Value) {
     let Some(user_id) = content["user_id"].as_str() else {
         return;
     };
-    if domain_of(user_id) != Some(origin) {
+    if server_of(user_id) != Some(origin) {
         return;
     }
     for (name, key_type) in [
@@ -591,7 +587,7 @@ pub(crate) fn queue_remote_to_device(
     let mut by_server: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
         std::collections::BTreeMap::new();
     for (target_user, per_device) in messages {
-        let Some(domain) = domain_of(target_user) else {
+        let Some(domain) = server_of(target_user) else {
             continue;
         };
         if domain == state.config.server.name {
@@ -676,7 +672,7 @@ fn by_remote_server(
 ) -> BTreeMap<String, serde_json::Map<String, Value>> {
     let mut by_server: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
     for (user_id, wanted) in requested {
-        if let Some(domain) = domain_of(user_id)
+        if let Some(domain) = server_of(user_id)
             && domain != state.config.server.name
         {
             by_server

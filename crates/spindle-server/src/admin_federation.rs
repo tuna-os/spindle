@@ -27,6 +27,7 @@ use crate::AppState;
 use crate::admin::AdminActor;
 use crate::errors::MatrixError;
 use crate::federation::DeliveryHealth;
+use crate::user_ids::server_of;
 
 pub fn routes() -> Router<AppState> {
     let group = |prefix: &str| {
@@ -49,10 +50,6 @@ pub fn routes() -> Router<AppState> {
             )
     };
     group("/_synapse/admin/v1").merge(group("/_spindle/admin/v1"))
-}
-
-fn server_of(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, server)| server)
 }
 
 /// Every remote server this server shares a room with, and the rooms.

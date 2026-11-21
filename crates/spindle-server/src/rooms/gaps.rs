@@ -42,6 +42,7 @@ use spindle_core::{EventId, RoomLog, Sideline, StateKey, StateRoot, StateSnapsho
 
 use super::{RoomError, Rooms, canonical_to_json, event_body_key, power_level};
 use crate::authorize::StoredEvent;
+use crate::user_ids::server_of;
 
 /// The band of positions segments live in.
 ///
@@ -481,11 +482,6 @@ fn decode_row(bytes: &[u8]) -> Option<(StateRoot, String)> {
     Some((StateRoot::from_bytes(root), event_id))
 }
 
-/// The domain of a user ID.
-fn domain_of(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, domain)| domain)
-}
-
 /// What a redaction waiting for its target records.
 fn pending_record(redaction_id: &str, sender: &str, power_ok: bool) -> Vec<u8> {
     json!({"redaction": redaction_id, "sender": sender, "power_ok": power_ok})
@@ -498,8 +494,8 @@ fn pending_record(redaction_id: &str, sender: &str, power_ok: bool) -> Vec<u8> {
 /// redaction's sender had the power to redact (`power_ok`).
 fn redaction_applies(power_ok: bool, redaction_sender: &str, target_sender: &str) -> bool {
     power_ok
-        || domain_of(redaction_sender)
-            .is_some_and(|domain| domain_of(target_sender) == Some(domain))
+        || server_of(redaction_sender)
+            .is_some_and(|domain| server_of(target_sender) == Some(domain))
 }
 
 impl Rooms {
@@ -828,7 +824,7 @@ impl Rooms {
         let mut members = Vec::new();
         state.for_each(|key, _| {
             if key.event_type().as_str() == "m.room.member"
-                && domain_of(key.state_key()).is_some_and(|domain| domain != self.server_name)
+                && server_of(key.state_key()).is_some_and(|domain| domain != self.server_name)
             {
                 members.push(key.state_key().to_owned());
             }
@@ -844,7 +840,7 @@ impl Rooms {
                 ),
             )?;
             if membership.as_deref() == Some(super::JOIN_STR.as_bytes())
-                && let Some(domain) = domain_of(&user_id)
+                && let Some(domain) = server_of(&user_id)
             {
                 *counts.entry(domain.to_owned()).or_default() += 1;
             }

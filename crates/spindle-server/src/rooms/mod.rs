@@ -2038,7 +2038,7 @@ impl Rooms {
 
     /// Whether this server is the one that speaks for `user_id`.
     fn is_local(&self, user_id: &str) -> bool {
-        user_id.split_once(':').map(|(_, domain)| domain) == Some(self.server_name.as_str())
+        crate::user_ids::is_on(user_id, &self.server_name)
     }
 
     /// The `join_authorised_via_users_server` a restricted room's join needs
