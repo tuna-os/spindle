@@ -13,3 +13,4 @@ This directory contains operational runbooks for alert rules defined in `deploy/
 | `SpindleSyncLagHigh` | warning | p99 sync delivery lag > 30s | [SpindleSyncLagHigh.md](SpindleSyncLagHigh.md) |
 | `SpindleDown` | critical | Metrics listener unresponsive for 5m | [SpindleDown.md](SpindleDown.md) |
 | `SpindleServerErrors` | warning | HTTP 5xx error rate > 1% over 5m | [SpindleServerErrors.md](SpindleServerErrors.md) |
+| `SpindleBackupStale` | warning | Last online backup more than two days old | [SpindleBackupStale.md](SpindleBackupStale.md) |
