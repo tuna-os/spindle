@@ -1,0 +1,21 @@
+{
+  "group": "ci-20261123",
+  "rounds": 3,
+  "started": "2026-11-23T13:13:08Z",
+  "finished": "2026-11-23T13:41:07Z",
+  "host": {
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "cores": 4,
+    "kernel": "7.0.0-1017-azure",
+    "runner": "github-actions/ubuntu-24.04 (shared runner)"
+  },
+  "spindle_commit": "d22ee3f3310c",
+  "versions": [
+    "spindle 0.1.0 d22ee3f @ d22ee3f3310c",
+    "synapse 1.161.0 (b=main,d22ee3f) on postgres",
+    "continuwuity 26.9.0 (a237672)",
+    "tuwunel 1.9.2",
+    "dendrite 0.15.2+e546df2"
+  ],
+  "absent": []
+}
