@@ -345,6 +345,41 @@ async fn a_device_change_is_announced_to_the_server_sharing_a_room() {
     );
 }
 
+/// A peer address nothing answers on, and nothing else can take. The socket
+/// is bound but never listens, so a connection is refused at once, and the
+/// kernel keeps its port from every other `bind(0)` while this value lives.
+/// Dropping a listener instead frees the port, and a parallel test can be
+/// handed it before the outbox connects.
+struct DeadPeer {
+    name: String,
+    _socket: tokio::net::TcpSocket,
+}
+
+impl DeadPeer {
+    fn start() -> DeadPeer {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let name = format!("127.0.0.1:{}", socket.local_addr().unwrap().port());
+        DeadPeer {
+            name,
+            _socket: socket,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dead_peer_refuses_connections_and_keeps_its_port() {
+    let dead = DeadPeer::start();
+    let refused = tokio::net::TcpStream::connect(dead.name.as_str())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    let taken = tokio::net::TcpListener::bind(dead.name.as_str())
+        .await
+        .unwrap_err();
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+}
+
 /// A stand-in peer for the key fan-out: it serves `user/keys/query` and
 /// `user/keys/claim` for its one user, `@carol`, and counts how often it
 /// was asked. A `gate` holds every request until the other side of the
@@ -544,14 +579,12 @@ async fn a_key_query_skips_a_peer_the_outbox_found_unreachable() {
 async fn the_outbox_tells_a_silent_peer_from_one_that_refused() {
     let a = Instance::start().await;
     let alice = a.register("alice").await;
-    // Nothing listens on `silent` once its listener is dropped; `refusing`
-    // answers every transaction 404, since a key-only peer has no `/send`.
-    let silent = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
-    };
+    // Nothing listens on `silent`; `refusing` answers every transaction 404,
+    // since a key-only peer has no `/send`.
+    let dead = DeadPeer::start();
+    let silent = &dead.name;
     let refusing = MockPeer::start(true, None).await;
-    for (txn, server) in [("t1", &silent), ("t2", &refusing.name)] {
+    for (txn, server) in [("t1", silent), ("t2", &refusing.name)] {
         let (status, body) = a
             .request(
                 reqwest::Method::PUT,
@@ -571,9 +604,9 @@ async fn the_outbox_tells_a_silent_peer_from_one_that_refused() {
             .map(|health| health.unreachable)
     };
     assert!(
-        eventually(async || failed(&silent).is_some() && failed(&refusing.name).is_some()).await,
+        eventually(async || failed(silent).is_some() && failed(&refusing.name).is_some()).await,
         "the outbox never tried both peers"
     );
-    assert_eq!(failed(&silent), Some(true));
+    assert_eq!(failed(silent), Some(true));
     assert_eq!(failed(&refusing.name), Some(false));
 }
