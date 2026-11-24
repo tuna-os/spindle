@@ -1,0 +1,475 @@
+# Every route the router serves, and the rate limit its handler spends --
+# or `none`, and why. `scripts/limits-ledger.py --check` holds this file to
+# the code: a route with no row fails, a row for a route that is gone
+# fails, and so does a row that names a limit its handler does not reach.
+#
+# The point is the `none` rows. A route that is in no limiter used to be
+# the absence of a call, which nobody reviews. Here it is a line with a
+# reason, and a new route cannot arrive without one (#953).
+#
+# A row is `"METHOD path" = { spends = [...] }` or `{ none = "reason" }`.
+#
+# spends: each limit the handler can spend, as the source writes it: a
+#         `Limit` constant of ratelimit.rs, a `Budget::` variant, or the
+#         `[ratelimit]` count that a handler makes a limit of. The check
+#         finds the name in the handler or in a function it calls.
+# none:   the name of an entry in `[reasons]`. The reason says who can
+#         call the route or what it does. It does not say that no limit is
+#         right; docs/rate-limits.md is where a decision is argued.
+#
+# A reason's `sees` is its proof: the handler must reach one of the names
+# in the list, so a row cannot claim a caller its handler never asks for.
+# A reason with no `sees` is a statement that a reviewer checks.
+#
+# What the check cannot see: whether a limit is the right size, and
+# whether a handler that reaches a limit spends it on every path.
+
+[reasons.admin]
+text = "Only a server admin can call it."
+sees = ["AdminActor"]
+
+[reasons.peer]
+text = "Only another server can call it, and the request must have that server's signature."
+sees = ["federation_origin"]
+
+[reasons.provider]
+text = "Only the delegated-auth provider can call it, with the secret of the deployment."
+sees = ["admit"]
+
+[reasons.service]
+text = "Only an application service can call it, with its token."
+
+[reasons.signed]
+text = "The request must have a signature that only a holder of a deployment secret can make."
+
+[reasons.account-read]
+text = "A signed-in account reads. docs/rate-limits.md records that reads have no limit."
+sees = ["Authenticated", "AccountAuthenticated"]
+
+[reasons.account-write]
+text = "A signed-in account writes, and the write has no budget."
+sees = ["Authenticated"]
+
+[reasons.session]
+text = "Only a browser that signed in on the account pages can call it."
+sees = ["browser_session"]
+
+[reasons.capability]
+text = "It needs no account. It acts only when the request has a token or a password that proves the caller."
+
+[reasons.fixed]
+text = "It needs no account, and the answer does not depend on the caller."
+
+[reasons.open]
+text = "It needs no account."
+
+[reasons.cached-only]
+text = "It needs no account. It serves only media that this server holds; the fetch that spends Budget::RemoteMedia is in its shared helper and is never taken here."
+
+[routes]
+"GET /.well-known/matrix/client" = { none = "fixed" }
+"GET /.well-known/matrix/server" = { none = "fixed" }
+"GET /.well-known/matrix/support" = { none = "fixed" }
+"GET /.well-known/openid-configuration" = { none = "fixed" }
+"GET /_matrix/client/unstable/im.nheko.summary/rooms/{room_id_or_alias}/summary" = { none = "open" }
+"POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave" = { none = "account-write" }
+"POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token" = { spends = ["LIVEKIT_TOKEN_PER_USER"] }
+"GET /_matrix/client/unstable/io.element.msc4502/rooms/{room_id}/is_joined" = { none = "account-read" }
+"POST /_matrix/client/unstable/io.element.msc4512/appservice/fed_proxy" = { none = "service" }
+"GET /_matrix/client/unstable/org.matrix.msc2965/auth_metadata" = { none = "fixed" }
+"DELETE /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device" = { none = "account-write" }
+"GET /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device" = { none = "account-read" }
+"PUT /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device" = { none = "account-write" }
+"POST /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{device_id}/events" = { none = "account-write" }
+"GET /_matrix/client/unstable/org.matrix.msc3916/media/config" = { none = "fixed" }
+"GET /_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}" = { spends = ["Budget::RemoteMedia"] }
+"GET /_matrix/client/unstable/org.matrix.msc3916/media/download/{server_name}/{media_id}/{file_name}" = { spends = ["Budget::RemoteMedia"] }
+"GET /_matrix/client/unstable/org.matrix.msc3916/media/preview_url" = { spends = ["Budget::UrlPreview"] }
+"GET /_matrix/client/unstable/org.matrix.msc3916/media/thumbnail/{server_name}/{media_id}" = { spends = ["Budget::RemoteMedia"] }
+"POST /_matrix/client/unstable/org.matrix.msc4108/rendezvous" = { none = "open" }
+"GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events" = { none = "account-read" }
+"GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}" = { none = "account-read" }
+"POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}" = { none = "account-write" }
+"POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}" = { none = "capability" }
+"PUT /_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/{txn_id}" = { none = "account-write" }
+"GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports" = { none = "account-read" }
+"POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync" = { none = "account-read" }
+"GET /_matrix/client/v1/admin/lock/{user_id}" = { none = "account-read" }
+"PUT /_matrix/client/v1/admin/lock/{user_id}" = { none = "account-write" }
+"GET /_matrix/client/v1/admin/suspend/{user_id}" = { none = "account-read" }
+"PUT /_matrix/client/v1/admin/suspend/{user_id}" = { none = "account-write" }
+"POST /_matrix/client/v1/appservice/fed_proxy" = { none = "service" }
+"POST /_matrix/client/v1/appservice/{appservice_id}/ping" = { none = "service" }
+"GET /_matrix/client/v1/auth_metadata" = { none = "fixed" }
+"GET /_matrix/client/v1/delayed_events/{delay_id}" = { none = "account-read" }
+"POST /_matrix/client/v1/delayed_events/{delay_id}/{action}" = { none = "account-write" }
+"POST /_matrix/client/v1/login/get_token" = { none = "account-write" }
+"GET /_matrix/client/v1/media/config" = { none = "fixed" }
+"GET /_matrix/client/v1/media/download/{server_name}/{media_id}" = { spends = ["Budget::RemoteMedia"] }
+"GET /_matrix/client/v1/media/download/{server_name}/{media_id}/{file_name}" = { spends = ["Budget::RemoteMedia"] }
+"GET /_matrix/client/v1/media/preview_url" = { spends = ["Budget::UrlPreview"] }
+"GET /_matrix/client/v1/media/thumbnail/{server_name}/{media_id}" = { spends = ["Budget::RemoteMedia"] }
+"GET /_matrix/client/v1/mutual_rooms" = { none = "account-read" }
+"GET /_matrix/client/v1/register/m.login.registration_token/validity" = { spends = ["REGISTER_PER_SOURCE"] }
+"GET /_matrix/client/v1/room_summary/{room_id_or_alias}" = { none = "open" }
+"GET /_matrix/client/v1/rooms/{room_id}/hierarchy" = { none = "account-read" }
+"GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}" = { none = "account-read" }
+"GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}" = { none = "account-read" }
+"GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}" = { none = "account-read" }
+"GET /_matrix/client/v1/rooms/{room_id}/threads" = { none = "account-read" }
+"GET /_matrix/client/v1/rooms/{room_id}/timestamp_to_event" = { none = "account-read" }
+"GET /_matrix/client/v1/rtc/transports" = { none = "account-read" }
+"GET /_matrix/client/v3/account/3pid" = { none = "account-read" }
+"POST /_matrix/client/v3/account/3pid/add" = { none = "account-write" }
+"POST /_matrix/client/v3/account/3pid/delete" = { none = "account-write" }
+"POST /_matrix/client/v3/account/3pid/email/requestToken" = { spends = ["RESET_REQUEST_PER_ADDRESS", "RESET_REQUEST_PER_SOURCE"] }
+"POST /_matrix/client/v3/account/deactivate" = { none = "account-write" }
+"POST /_matrix/client/v3/account/password" = { none = "capability" }
+"POST /_matrix/client/v3/account/password/email/requestToken" = { spends = ["RESET_REQUEST_PER_ADDRESS", "RESET_REQUEST_PER_SOURCE"] }
+"GET /_matrix/client/v3/account/whoami" = { none = "account-read" }
+"GET /_matrix/client/v3/admin/whois/{user_id}" = { none = "account-read" }
+"GET /_matrix/client/v3/capabilities" = { none = "fixed" }
+"POST /_matrix/client/v3/createRoom" = { spends = ["Budget::RoomCreation"] }
+"POST /_matrix/client/v3/delete_devices" = { none = "account-write" }
+"GET /_matrix/client/v3/devices" = { none = "account-read" }
+"DELETE /_matrix/client/v3/devices/{device_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/devices/{device_id}" = { none = "account-read" }
+"PUT /_matrix/client/v3/devices/{device_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/directory/list/room/{room_id}" = { none = "open" }
+"PUT /_matrix/client/v3/directory/list/room/{room_id}" = { none = "account-write" }
+"DELETE /_matrix/client/v3/directory/room/{room_alias}" = { none = "account-write" }
+"GET /_matrix/client/v3/directory/room/{room_alias}" = { none = "open" }
+"PUT /_matrix/client/v3/directory/room/{room_alias}" = { none = "account-write" }
+"POST /_matrix/client/v3/join/{room_id_or_alias}" = { spends = ["Budget::JoinLocal", "Budget::JoinRemote"] }
+"GET /_matrix/client/v3/joined_rooms" = { none = "account-read" }
+"GET /_matrix/client/v3/keys/changes" = { none = "account-read" }
+"POST /_matrix/client/v3/keys/claim" = { none = "account-write" }
+"POST /_matrix/client/v3/keys/device_signing/upload" = { none = "account-write" }
+"POST /_matrix/client/v3/keys/query" = { none = "account-read" }
+"POST /_matrix/client/v3/keys/signatures/upload" = { none = "account-write" }
+"POST /_matrix/client/v3/keys/upload" = { none = "account-write" }
+"POST /_matrix/client/v3/knock/{room_id_or_alias}" = { spends = ["Budget::JoinLocal", "Budget::JoinRemote"] }
+"GET /_matrix/client/v3/login" = { none = "fixed" }
+"POST /_matrix/client/v3/login" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"GET /_matrix/client/v3/login/sso/redirect" = { none = "open" }
+"GET /_matrix/client/v3/login/sso/redirect/{idp_id}" = { none = "open" }
+"POST /_matrix/client/v3/logout" = { none = "account-write" }
+"POST /_matrix/client/v3/logout/all" = { none = "account-write" }
+"GET /_matrix/client/v3/notifications" = { none = "account-read" }
+"GET /_matrix/client/v3/presence/{user_id}/status" = { none = "account-read" }
+"PUT /_matrix/client/v3/presence/{user_id}/status" = { none = "account-write" }
+"GET /_matrix/client/v3/profile/{user_id}" = { none = "open" }
+"GET /_matrix/client/v3/profile/{user_id}/avatar_url" = { none = "open" }
+"PUT /_matrix/client/v3/profile/{user_id}/avatar_url" = { none = "account-write" }
+"GET /_matrix/client/v3/profile/{user_id}/displayname" = { none = "open" }
+"PUT /_matrix/client/v3/profile/{user_id}/displayname" = { none = "account-write" }
+"DELETE /_matrix/client/v3/profile/{user_id}/{key}" = { none = "account-write" }
+"GET /_matrix/client/v3/profile/{user_id}/{key}" = { none = "open" }
+"PUT /_matrix/client/v3/profile/{user_id}/{key}" = { none = "account-write" }
+"GET /_matrix/client/v3/publicRooms" = { none = "open" }
+"POST /_matrix/client/v3/publicRooms" = { none = "account-read" }
+"GET /_matrix/client/v3/pushers" = { none = "account-read" }
+"POST /_matrix/client/v3/pushers/set" = { none = "account-write" }
+"GET /_matrix/client/v3/pushrules/" = { none = "account-read" }
+"DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}" = { none = "account-read" }
+"PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions" = { none = "account-read" }
+"PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions" = { none = "account-write" }
+"GET /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled" = { none = "account-read" }
+"PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled" = { none = "account-write" }
+"POST /_matrix/client/v3/refresh" = { none = "capability" }
+"POST /_matrix/client/v3/register" = { spends = ["REGISTER_PER_SOURCE"] }
+"GET /_matrix/client/v3/register/available" = { none = "open" }
+"POST /_matrix/client/v3/register/email/requestToken" = { spends = ["RESET_REQUEST_PER_ADDRESS", "RESET_REQUEST_PER_SOURCE"] }
+"DELETE /_matrix/client/v3/room_keys/keys" = { none = "account-write" }
+"GET /_matrix/client/v3/room_keys/keys" = { none = "account-read" }
+"PUT /_matrix/client/v3/room_keys/keys" = { none = "account-write" }
+"DELETE /_matrix/client/v3/room_keys/keys/{room_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/room_keys/keys/{room_id}" = { none = "account-read" }
+"PUT /_matrix/client/v3/room_keys/keys/{room_id}" = { none = "account-write" }
+"DELETE /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}" = { none = "account-read" }
+"PUT /_matrix/client/v3/room_keys/keys/{room_id}/{session_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/room_keys/version" = { none = "account-read" }
+"POST /_matrix/client/v3/room_keys/version" = { none = "account-write" }
+"DELETE /_matrix/client/v3/room_keys/version/{version}" = { none = "account-write" }
+"GET /_matrix/client/v3/room_keys/version/{version}" = { none = "account-read" }
+"PUT /_matrix/client/v3/room_keys/version/{version}" = { none = "account-write" }
+"GET /_matrix/client/v3/rooms/{room_id}/aliases" = { none = "account-read" }
+"POST /_matrix/client/v3/rooms/{room_id}/ban" = { none = "account-write" }
+"GET /_matrix/client/v3/rooms/{room_id}/context/{event_id}" = { none = "account-read" }
+"PUT /_matrix/client/v3/rooms/{room_id}/delayed_event/{event_type}/{txn_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/rooms/{room_id}/event/{event_id}" = { none = "account-read" }
+"POST /_matrix/client/v3/rooms/{room_id}/forget" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/invite" = { spends = ["Budget::Invite", "Budget::Invited"] }
+"GET /_matrix/client/v3/rooms/{room_id}/is_joined" = { none = "account-read" }
+"POST /_matrix/client/v3/rooms/{room_id}/join" = { spends = ["Budget::JoinLocal", "Budget::JoinRemote"] }
+"GET /_matrix/client/v3/rooms/{room_id}/joined_members" = { none = "account-read" }
+"POST /_matrix/client/v3/rooms/{room_id}/kick" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/leave" = { none = "account-write" }
+"GET /_matrix/client/v3/rooms/{room_id}/members" = { none = "account-read" }
+"GET /_matrix/client/v3/rooms/{room_id}/messages" = { none = "account-read" }
+"POST /_matrix/client/v3/rooms/{room_id}/read_markers" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}" = { none = "account-write" }
+"PUT /_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}" = { spends = ["Budget::Message"] }
+"POST /_matrix/client/v3/rooms/{room_id}/report" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/report/{event_id}" = { none = "account-write" }
+"PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}" = { spends = ["Budget::Message", "rings_per_minute"] }
+"GET /_matrix/client/v3/rooms/{room_id}/state" = { none = "account-read" }
+"GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}" = { none = "account-read" }
+"PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}" = { spends = ["Budget::Message"] }
+"GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/" = { none = "account-read" }
+"PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}/" = { spends = ["Budget::Message"] }
+"GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}" = { none = "account-read" }
+"PUT /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}" = { spends = ["Budget::Message"] }
+"PUT /_matrix/client/v3/rooms/{room_id}/typing/{user_id}" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/unban" = { none = "account-write" }
+"POST /_matrix/client/v3/rooms/{room_id}/upgrade" = { none = "account-write" }
+"POST /_matrix/client/v3/rtc/livekit/delegate_delayed_leave" = { none = "account-write" }
+"POST /_matrix/client/v3/rtc/livekit/get_token" = { spends = ["LIVEKIT_TOKEN_PER_USER"] }
+"POST /_matrix/client/v3/search" = { none = "account-read" }
+"PUT /_matrix/client/v3/sendToDevice/{event_type}/{txn_id}" = { none = "account-write" }
+"GET /_matrix/client/v3/sync" = { none = "account-read" }
+"GET /_matrix/client/v3/user/{user_id}/account_data/{event_type}" = { none = "account-read" }
+"PUT /_matrix/client/v3/user/{user_id}/account_data/{event_type}" = { none = "account-write" }
+"POST /_matrix/client/v3/user/{user_id}/filter" = { none = "account-write" }
+"GET /_matrix/client/v3/user/{user_id}/filter/{filter_id}" = { none = "account-read" }
+"POST /_matrix/client/v3/user/{user_id}/openid/request_token" = { spends = ["OPENID_TOKEN_PER_USER"] }
+"GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}" = { none = "account-read" }
+"PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{event_type}" = { none = "account-write" }
+"GET /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags" = { none = "account-read" }
+"DELETE /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}" = { none = "account-write" }
+"PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}" = { none = "account-write" }
+"POST /_matrix/client/v3/user_directory/search" = { none = "account-read" }
+"POST /_matrix/client/v3/users/{user_id}/report" = { none = "account-write" }
+"GET /_matrix/client/v3/voip/turnServer" = { none = "account-read" }
+"GET /_matrix/client/versions" = { none = "fixed" }
+"POST /_matrix/federation/unstable/io.element.msc4195/rtc/livekit/get_token" = { spends = ["LIVEKIT_TOKEN_PER_REMOTE_SERVER", "LIVEKIT_TOKEN_PER_USER"] }
+"GET /_matrix/federation/v1/backfill/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/event/{event_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/event_auth/{room_id}/{event_id}" = { none = "peer" }
+"POST /_matrix/federation/v1/get_missing_events/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/hierarchy/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/make_join/{room_id}/{user_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/make_knock/{room_id}/{user_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/make_leave/{room_id}/{user_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/media/download/{media_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/media/thumbnail/{media_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/openid/userinfo" = { none = "capability" }
+"GET /_matrix/federation/v1/publicRooms" = { none = "peer" }
+"POST /_matrix/federation/v1/publicRooms" = { none = "peer" }
+"GET /_matrix/federation/v1/query/directory" = { none = "peer" }
+"GET /_matrix/federation/v1/query/profile" = { none = "peer" }
+"POST /_matrix/federation/v1/rtc/livekit/get_token" = { spends = ["LIVEKIT_TOKEN_PER_REMOTE_SERVER", "LIVEKIT_TOKEN_PER_USER"] }
+"PUT /_matrix/federation/v1/send/{txn_id}" = { none = "peer" }
+"PUT /_matrix/federation/v1/send_join/{room_id}/{event_id}" = { none = "peer" }
+"PUT /_matrix/federation/v1/send_knock/{room_id}/{event_id}" = { none = "peer" }
+"PUT /_matrix/federation/v1/send_leave/{room_id}/{event_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/state/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/state_ids/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/timestamp_to_event/{room_id}" = { none = "peer" }
+"GET /_matrix/federation/v1/user/devices/{user_id}" = { none = "peer" }
+"POST /_matrix/federation/v1/user/keys/claim" = { none = "peer" }
+"POST /_matrix/federation/v1/user/keys/query" = { none = "peer" }
+"GET /_matrix/federation/v1/version" = { none = "fixed" }
+"PUT /_matrix/federation/v2/invite/{room_id}/{event_id}" = { spends = ["Budget::Invited"] }
+"PUT /_matrix/federation/v2/send_join/{room_id}/{event_id}" = { none = "peer" }
+"PUT /_matrix/federation/v2/send_leave/{room_id}/{event_id}" = { none = "peer" }
+"POST /_matrix/key/v2/query" = { none = "open" }
+"GET /_matrix/key/v2/query/{server_name}" = { none = "open" }
+"GET /_matrix/key/v2/server" = { none = "fixed" }
+"POST /_matrix/media/v1/create" = { spends = ["Budget::MediaUpload"] }
+"GET /_matrix/media/v3/config" = { none = "fixed" }
+"GET /_matrix/media/v3/download/{server_name}/{media_id}" = { none = "cached-only" }
+"GET /_matrix/media/v3/download/{server_name}/{media_id}/{file_name}" = { none = "cached-only" }
+"GET /_matrix/media/v3/thumbnail/{server_name}/{media_id}" = { none = "cached-only" }
+"POST /_matrix/media/v3/upload" = { spends = ["Budget::MediaUpload"] }
+"PUT /_matrix/media/v3/upload/{server_name}/{media_id}" = { none = "account-write" }
+"GET /_spindle/admin/ui" = { none = "fixed" }
+"GET /_spindle/admin/ui/app.js" = { none = "fixed" }
+"GET /_spindle/admin/ui/styles.css" = { none = "fixed" }
+"GET /_spindle/admin/v1/audit" = { none = "admin" }
+"POST /_spindle/admin/v1/backup" = { none = "admin" }
+"GET /_spindle/admin/v1/backup/stream" = { none = "admin" }
+"GET /_spindle/admin/v1/event_reports" = { none = "admin" }
+"DELETE /_spindle/admin/v1/event_reports/{report_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/event_reports/{report_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/federation/destinations" = { none = "admin" }
+"GET /_spindle/admin/v1/federation/destinations/{destination}" = { none = "admin" }
+"POST /_spindle/admin/v1/federation/destinations/{destination}/reset_connection" = { none = "admin" }
+"GET /_spindle/admin/v1/federation/destinations/{destination}/rooms" = { none = "admin" }
+"POST /_spindle/admin/v1/media/protect/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/media/protect/{server_name}/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/media/quarantine/{server_name}/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/media/unprotect/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/media/unprotect/{server_name}/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/media/unquarantine/{server_name}/{media_id}" = { none = "admin" }
+"DELETE /_spindle/admin/v1/media/{server_name}/{media_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/media/{server_name}/{media_id}" = { none = "admin" }
+"POST /_spindle/admin/v1/purge_media_cache" = { none = "admin" }
+"GET /_spindle/admin/v1/registration_tokens" = { none = "admin" }
+"POST /_spindle/admin/v1/registration_tokens/new" = { none = "admin" }
+"DELETE /_spindle/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"GET /_spindle/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"PUT /_spindle/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"POST /_spindle/admin/v1/room/{room_id}/media/quarantine" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms" = { none = "admin" }
+"DELETE /_spindle/admin/v1/rooms/{room_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}/block" = { none = "admin" }
+"PUT /_spindle/admin/v1/rooms/{room_id}/block" = { none = "admin" }
+"POST /_spindle/admin/v1/rooms/{room_id}/make_room_admin" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}/members" = { none = "admin" }
+"POST /_spindle/admin/v1/rooms/{room_id}/purge_history" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}/state" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}/state_at" = { none = "admin" }
+"GET /_spindle/admin/v1/rooms/{room_id}/timeline" = { none = "admin" }
+"GET /_spindle/admin/v1/rtc/sfu" = { none = "admin" }
+"PUT /_spindle/admin/v1/rtc/sfu" = { none = "admin" }
+"GET /_spindle/admin/v1/scheduled_tasks" = { none = "admin" }
+"POST /_spindle/admin/v1/send_server_notice" = { none = "admin" }
+"GET /_spindle/admin/v1/server_version" = { none = "admin" }
+"POST /_spindle/admin/v1/user/{user_id}/media/quarantine" = { none = "admin" }
+"GET /_spindle/admin/v1/username_available" = { none = "admin" }
+"GET /_spindle/admin/v1/users" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}" = { none = "admin" }
+"PUT /_spindle/admin/v1/users/{user_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}/admin" = { none = "admin" }
+"PUT /_spindle/admin/v1/users/{user_id}/admin" = { none = "admin" }
+"POST /_spindle/admin/v1/users/{user_id}/deactivate" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}/devices" = { none = "admin" }
+"DELETE /_spindle/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"PUT /_spindle/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}/joined_rooms" = { none = "admin" }
+"DELETE /_spindle/admin/v1/users/{user_id}/media" = { none = "admin" }
+"GET /_spindle/admin/v1/users/{user_id}/media" = { none = "admin" }
+"POST /_spindle/admin/v1/users/{user_id}/password_hash" = { none = "admin" }
+"POST /_spindle/admin/v1/users/{user_id}/reset_link" = { none = "admin" }
+"POST /_spindle/admin/v1/users/{user_id}/reset_password" = { none = "admin" }
+"GET /_spindle/admin/v1/whois/{user_id}" = { none = "admin" }
+"POST /_spindle/rtc/livekit/get_token" = { spends = ["LIVEKIT_TOKEN_PER_REMOTE_SERVER", "LIVEKIT_TOKEN_PER_USER"] }
+"POST /_spindle/rtc/livekit/sfu/get" = { spends = ["LIVEKIT_TOKEN_PER_REMOTE_SERVER", "LIVEKIT_TOKEN_PER_USER"] }
+"POST /_spindle/rtc/livekit/sfu/webhook" = { none = "signed" }
+"GET /_synapse/admin/v1/audit" = { none = "admin" }
+"POST /_synapse/admin/v1/backup" = { none = "admin" }
+"POST /_synapse/admin/v1/deactivate/{user_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/event_reports" = { none = "admin" }
+"DELETE /_synapse/admin/v1/event_reports/{report_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/event_reports/{report_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/federation/destinations" = { none = "admin" }
+"GET /_synapse/admin/v1/federation/destinations/{destination}" = { none = "admin" }
+"POST /_synapse/admin/v1/federation/destinations/{destination}/reset_connection" = { none = "admin" }
+"GET /_synapse/admin/v1/federation/destinations/{destination}/rooms" = { none = "admin" }
+"POST /_synapse/admin/v1/media/protect/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/media/protect/{server_name}/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/media/quarantine/{server_name}/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/media/unprotect/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/media/unprotect/{server_name}/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/media/unquarantine/{server_name}/{media_id}" = { none = "admin" }
+"DELETE /_synapse/admin/v1/media/{server_name}/{media_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/media/{server_name}/{media_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/purge_history/{room_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/purge_media_cache" = { none = "admin" }
+"GET /_synapse/admin/v1/register" = { none = "open" }
+"POST /_synapse/admin/v1/register" = { none = "signed" }
+"GET /_synapse/admin/v1/registration_tokens" = { none = "admin" }
+"POST /_synapse/admin/v1/registration_tokens/new" = { none = "admin" }
+"DELETE /_synapse/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"GET /_synapse/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"PUT /_synapse/admin/v1/registration_tokens/{token}" = { none = "admin" }
+"POST /_synapse/admin/v1/reset_password/{user_id}" = { none = "admin" }
+"POST /_synapse/admin/v1/room/{room_id}/media/quarantine" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms" = { none = "admin" }
+"DELETE /_synapse/admin/v1/rooms/{room_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}/block" = { none = "admin" }
+"PUT /_synapse/admin/v1/rooms/{room_id}/block" = { none = "admin" }
+"POST /_synapse/admin/v1/rooms/{room_id}/make_room_admin" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}/members" = { none = "admin" }
+"POST /_synapse/admin/v1/rooms/{room_id}/purge_history" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}/state" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}/state_at" = { none = "admin" }
+"GET /_synapse/admin/v1/rooms/{room_id}/timeline" = { none = "admin" }
+"GET /_synapse/admin/v1/rtc/sfu" = { none = "admin" }
+"PUT /_synapse/admin/v1/rtc/sfu" = { none = "admin" }
+"GET /_synapse/admin/v1/scheduled_tasks" = { none = "admin" }
+"POST /_synapse/admin/v1/send_server_notice" = { none = "admin" }
+"GET /_synapse/admin/v1/server_version" = { none = "admin" }
+"POST /_synapse/admin/v1/user/{user_id}/media/quarantine" = { none = "admin" }
+"GET /_synapse/admin/v1/username_available" = { none = "admin" }
+"GET /_synapse/admin/v1/users" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}" = { none = "admin" }
+"PUT /_synapse/admin/v1/users/{user_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}/admin" = { none = "admin" }
+"PUT /_synapse/admin/v1/users/{user_id}/admin" = { none = "admin" }
+"POST /_synapse/admin/v1/users/{user_id}/deactivate" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}/devices" = { none = "admin" }
+"DELETE /_synapse/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"PUT /_synapse/admin/v1/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}/joined_rooms" = { none = "admin" }
+"DELETE /_synapse/admin/v1/users/{user_id}/media" = { none = "admin" }
+"GET /_synapse/admin/v1/users/{user_id}/media" = { none = "admin" }
+"POST /_synapse/admin/v1/users/{user_id}/password_hash" = { none = "admin" }
+"POST /_synapse/admin/v1/users/{user_id}/reset_link" = { none = "admin" }
+"POST /_synapse/admin/v1/users/{user_id}/reset_password" = { none = "admin" }
+"GET /_synapse/admin/v1/whois/{user_id}" = { none = "admin" }
+"GET /_synapse/admin/v2/rooms/delete_status/{delete_id}" = { none = "admin" }
+"DELETE /_synapse/admin/v2/rooms/{room_id}" = { none = "admin" }
+"GET /_synapse/admin/v2/rooms/{room_id}/delete_status" = { none = "admin" }
+"GET /_synapse/admin/v2/users" = { none = "admin" }
+"GET /_synapse/admin/v2/users/{user_id}" = { none = "admin" }
+"PUT /_synapse/admin/v2/users/{user_id}" = { none = "admin" }
+"POST /_synapse/admin/v2/users/{user_id}/delete_devices" = { none = "admin" }
+"GET /_synapse/admin/v2/users/{user_id}/devices" = { none = "admin" }
+"DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"GET /_synapse/admin/v2/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"PUT /_synapse/admin/v2/users/{user_id}/devices/{device_id}" = { none = "admin" }
+"DELETE /_synapse/client/rendezvous/{session_id}" = { none = "capability" }
+"GET /_synapse/client/rendezvous/{session_id}" = { none = "capability" }
+"PUT /_synapse/client/rendezvous/{session_id}" = { none = "capability" }
+"POST /_synapse/mas/allow_cross_signing_reset" = { none = "provider" }
+"POST /_synapse/mas/delete_device" = { none = "provider" }
+"POST /_synapse/mas/delete_user" = { none = "provider" }
+"GET /_synapse/mas/is_localpart_available" = { none = "provider" }
+"POST /_synapse/mas/provision_user" = { none = "provider" }
+"GET /_synapse/mas/query_user" = { none = "provider" }
+"POST /_synapse/mas/reactivate_user" = { none = "provider" }
+"POST /_synapse/mas/set_displayname" = { none = "provider" }
+"POST /_synapse/mas/sync_devices" = { none = "provider" }
+"POST /_synapse/mas/unset_displayname" = { none = "provider" }
+"POST /_synapse/mas/update_device_display_name" = { none = "provider" }
+"POST /_synapse/mas/upsert_device" = { none = "provider" }
+"GET /account" = { none = "session" }
+"GET /account/" = { none = "session" }
+"GET /account/3pid/validate" = { none = "capability" }
+"POST /account/3pid/validate" = { none = "capability" }
+"POST /account/deactivate" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/emails/add" = { spends = ["EMAIL_PER_USER", "FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/emails/remove" = { none = "session" }
+"GET /account/emails/verify" = { none = "capability" }
+"POST /account/emails/verify" = { none = "capability" }
+"GET /account/login" = { none = "open" }
+"POST /account/login" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/logout" = { none = "session" }
+"POST /account/password" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"GET /account/password/forgot" = { none = "open" }
+"POST /account/password/forgot" = { spends = ["RESET_REQUEST_PER_ADDRESS", "RESET_REQUEST_PER_SOURCE"] }
+"GET /account/password/reset" = { none = "capability" }
+"POST /account/password/reset" = { spends = ["FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/profile" = { none = "session" }
+"GET /account/recover" = { none = "open" }
+"POST /account/recover" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/recovery/generate" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /account/sessions/end" = { none = "session" }
+"GET /health" = { none = "fixed" }
+"GET /oauth2/authorize" = { none = "open" }
+"POST /oauth2/authorize" = { spends = ["FAILED_LOGIN_PER_ACCOUNT", "FAILED_LOGIN_PER_SOURCE"] }
+"POST /oauth2/registration" = { spends = ["OIDC_REGISTER_PER_SOURCE"] }
+"POST /oauth2/revoke" = { none = "capability" }
+"POST /oauth2/token" = { none = "capability" }
+"GET /ready" = { none = "fixed" }
+"GET /upstream/authorize/{id}" = { none = "open" }
+"GET /upstream/callback/{id}" = { spends = ["FAILED_LOGIN_PER_SOURCE"] }

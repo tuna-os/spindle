@@ -132,7 +132,10 @@ served, added in v1.N`. For each group:
 2. **Serve it.** A route arrives with the test that would have failed
    without it (CONTRIBUTING). `just regen` moves it from `spec-gaps.md` to
    `dashboard.md`; the OpenAPI check validates its responses on the next
-   run.
+   run. The route also needs a row in `contrib/limits/ledger.toml`. The
+   row names the rate limits that the handler spends, or it says `none`
+   and gives a reason. `python3 scripts/limits-ledger.py --check` tells
+   you which row is missing and which limits the handler reaches.
 3. **Claim it.** `crates/spindle-server/src/surface.rs` lists the spec
    versions `/versions` advertises, each with the routes that make the claim
    honest; `tests/surface.rs` fails if one is missing. Advertising v1.N is
