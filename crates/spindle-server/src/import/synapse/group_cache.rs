@@ -252,13 +252,15 @@ mod tests {
         assert_eq!(b.len(), 3);
         assert_eq!(
             (db.chain_queries, db.rows_read),
-            (1, 4),
+            // One more edge query: group 3's edge is new. Rows are read for
+            // group 3 alone.
+            (2, 4),
             "only group 3 is new"
         );
         cache.state_after(&mut db, "!r", "$b", None).unwrap();
         assert_eq!(
             (db.chain_queries, db.rows_read),
-            (1, 4),
+            (2, 4),
             "a repeat reads nothing"
         );
     }
