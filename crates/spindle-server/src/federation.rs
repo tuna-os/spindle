@@ -691,7 +691,7 @@ impl Federation {
         self.deny = deny.to_vec();
         // An unreadable row must not open the gate: keep the file's lists
         // and say so.
-        match Store::get(self.store.as_ref(), &keys::federation_deny_list()) {
+        match ReadView::get(self.store.as_ref(), &keys::federation_deny_list()) {
             Ok(Some(bytes)) => match serde_json::from_slice::<Vec<String>>(&bytes) {
                 Ok(list) => *self.added_deny.get_mut().unwrap_or_else(|e| e.into_inner()) = list,
                 Err(error) => tracing::error!(%error, "stored federation deny list is unreadable"),
