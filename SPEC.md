@@ -370,9 +370,14 @@ A room with 50k state events holds on the order of a few MB resident; rooms
 evict to disk under an LRU keyed by last activity, retaining only the 32-byte
 root.
 
-**Status.** The eviction of idle rooms in the paragraph above is designed only.
-An open room keeps its whole log index in memory until the process stops
-(#816). The snapshot window below is built.
+**Status.** Eviction of idle rooms is built as a count budget:
+`[storage] max_resident_rooms` (default 4096) drops the rooms untouched for
+longest when a load takes the open count past it. A room that something still
+holds, a partial-state room and a room with an unmerged fork are kept. Eviction
+drops the whole room, not "all but the root": while a room is resident its log
+index (`entries` and `positions`) is still held in full, so per-room memory is
+`O(events)`. Keeping only a tail window of the log index and a chain checkpoint
+for loads are not built (#816). The snapshot window below is built.
 
 Within a room the same rule applies per entry. Every log entry keeps its state
 root — 32 bytes, forever — but the materialized snapshot it names is held only
