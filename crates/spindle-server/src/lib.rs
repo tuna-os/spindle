@@ -426,7 +426,8 @@ fn federation_client(
             .with_peers(&config.federation.peers)
             .with_enabled(config.federation.enabled)
             .with_server_lists(&config.federation.allow, &config.federation.deny)
-            .with_metrics(Arc::clone(metrics)),
+            .with_metrics(Arc::clone(metrics))
+            .with_key_fetch_budget(config.ratelimit.key_fetches, config.ratelimit.enabled),
     ))
 }
 

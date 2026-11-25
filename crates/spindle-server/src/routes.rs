@@ -150,6 +150,7 @@ pub fn router(state: AppState) -> Router {
             federation_gate,
         ))
         .layer(axum::middleware::from_fn(cors))
+        .layer(axum::middleware::from_fn(key_fetch_budget))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             resolve_client_addr,
@@ -466,6 +467,36 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
             .get::<Self>()
             .cloned()
             .unwrap_or_else(|| Self("unknown".to_owned())))
+    }
+}
+
+/// Charge the key fetches a federation request starts to its source (#943).
+///
+/// Both the X-Matrix check of a server not seen before and the key notary
+/// can start a fetch, and a name that fails fast leaves a negative-cache
+/// entry. The budget is spent where the fetch starts
+/// ([`crate::federation::Federation`]); this layer only names the source
+/// and turns a refusal into 429 with `retry_after_ms`. A refused X-Matrix
+/// check would otherwise read as a bad signature (401), and the notary as
+/// a server with no keys, and neither tells the caller to back off.
+async fn key_fetch_budget(
+    source: ClientAddr,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path();
+    if !path.starts_with("/_matrix/federation/") && !path.starts_with("/_matrix/key/") {
+        return next.run(request).await;
+    }
+    let notary = path.starts_with("/_matrix/key/v2/query");
+    let (response, refused) =
+        crate::federation::with_key_fetch_source(source.to_string(), next.run(request)).await;
+    match refused {
+        Some(wait) if notary || response.status() == StatusCode::UNAUTHORIZED => {
+            MatrixError::limit_exceeded(wait).into_response()
+        }
+        _ => response,
     }
 }
 
