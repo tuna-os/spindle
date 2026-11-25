@@ -123,6 +123,17 @@ every state root. Run it after a crash, a restore or a disk fault. It names
 each room that fails and exits non-zero. A read error is reported as an
 error, not as a missing node. The server must be stopped.
 
+## Measuring the store
+
+```
+spindle stats <config>
+```
+
+This command prints the rows and bytes of each keyspace, largest first. Use
+it to see what fills the store: state nodes, the log, the media index or an
+outbox. The byte counts are keys and values before compression. The server
+must be stopped.
+
 ## Truncating a room's history
 
 A truncation removes the log of a room below a position (#817). It removes
