@@ -818,7 +818,6 @@ impl Keyspace {
         Self::HubAttestation,
         Self::HubEquivocation,
         Self::HubCheckpoint,
-        Self::FederationDenyList,
         Self::ChainCheckpoint,
         Self::SearchPosting,
         Self::SearchVocab,
