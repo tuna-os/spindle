@@ -377,15 +377,16 @@ async fn a_gap_in_the_chain_costs_exactly_one_refetch() {
     let (alice_token, alice) = a.register("alice").await;
     let (bob_token, _) = b.register("bob").await;
     // Four real changes on a, so the list a serves is the one the chain
-    // describes. A room is shared only so b takes the updates; the test
-    // carries them itself, and loses one.
-    a.share_room_with(&b, &alice_token, &bob_token).await;
+    // describes. The room is shared only once the devices exist, so b takes
+    // the updates but a pushes none of its own: the test carries them
+    // itself, and loses one.
     let mut devices = Vec::new();
     let mut ids = Vec::new();
     for _ in 0..4 {
         devices.push(a.new_device("alice", &alice).await);
         ids.push(a.state.devices.device_list_stream_id(&alice).unwrap());
     }
+    a.share_room_with(&b, &alice_token, &bob_token).await;
     let update = |index: usize, prev: &[u64]| {
         json!({
             "edu_type": "m.device_list_update",
