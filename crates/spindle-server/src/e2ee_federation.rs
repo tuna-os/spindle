@@ -203,12 +203,70 @@ pub(crate) async fn apply_edu(state: &AppState, origin: &str, edu: &Value) {
     let content = &edu["content"];
     match edu["edu_type"].as_str() {
         Some("m.direct_to_device") => deliver_to_device(state, origin, content),
-        Some("m.device_list_update") => apply_device_list_update(state, origin, content).await,
+        Some("m.device_list_update") => {
+            if user_is_of_interest(state, content).await {
+                apply_device_list_update(state, origin, content).await;
+            }
+        }
         Some("m.signing_key_update" | "org.matrix.signing_key_update") => {
-            apply_signing_key_update(state, origin, content);
+            if user_is_of_interest(state, content).await {
+                apply_signing_key_update(state, origin, content);
+            }
         }
         _ => {}
     }
+}
+
+/// Whether the user an inbound device-list or cross-signing update names
+/// shares a room with someone here. Without that, nobody on this server
+/// can ever read the keys, and a peer could grow the tables with users of
+/// its own making. An update dropped before a join lands is made up by
+/// the gap refetch at the next update (`place`).
+///
+/// The room walk can load a cold room: off the async workers, as presence
+/// does it.
+async fn user_is_of_interest(state: &AppState, content: &Value) -> bool {
+    let Some(user_id) = content["user_id"].as_str() else {
+        return false;
+    };
+    let (state, user_id) = (state.clone(), user_id.to_owned());
+    let shared = crate::blocking::offload(
+        std::sync::Arc::clone(&state.metrics),
+        crate::metrics::BlockingTask::FederationSend,
+        move || {
+            Ok(crate::presence::shares_room_with_local(
+                &state.rooms,
+                &user_id,
+                &state.config.server.name,
+            ))
+        },
+    )
+    .await
+    .unwrap_or(false);
+    if !shared {
+        tracing::debug!("device-list update for a user who shares no room with anyone here");
+    }
+    shared
+}
+
+/// Whether a to-device message may be queued for `device_id` of the local
+/// `user_id`: the device exists, or an application service claims the
+/// user exclusively. A bridge's ghost has no device row, yet its mail is
+/// pushed to the service (MSC2409).
+fn device_takes_mail(state: &AppState, user_id: &str, device_id: &str) -> bool {
+    if state.appservices.exclusively_claims(user_id) {
+        return true;
+    }
+    let Some(localpart) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(localpart, _)| localpart)
+    else {
+        return false;
+    };
+    crate::accounts::Accounts::new(state.store.as_ref(), &state.config.server.name)
+        .device(localpart, device_id)
+        .is_ok_and(|device| device.is_some())
 }
 
 fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
@@ -258,6 +316,9 @@ fn deliver_to_device(state: &AppState, origin: &str, content: &Value) {
             } else {
                 vec![target_device.clone()]
             };
+            let devices = devices
+                .into_iter()
+                .filter(|device_id| device_takes_mail(state, target_user, device_id));
             for device_id in devices {
                 batch_write.get_or_insert_with(|| state.rooms.reserve_stream_id());
                 let stream_write = state.rooms.reserve_stream_id();
