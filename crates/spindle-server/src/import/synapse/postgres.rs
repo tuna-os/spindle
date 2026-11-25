@@ -10,6 +10,7 @@
 use ::postgres::{Client, Config, IsolationLevel, NoTls, Transaction};
 use serde_json::Value;
 
+use super::group_cache::{GroupRow, GroupSource, StateGroupCache};
 use super::{ReadError, is_create_rooted};
 use crate::import::{PlanError, SourceEvent, SourceRoom, StateMap, plan_resolving};
 
@@ -57,7 +58,10 @@ impl Reader {
             .isolation_level(IsolationLevel::RepeatableRead)
             .read_only(true)
             .start()?;
-        Ok(Snapshot { transaction })
+        Ok(Snapshot {
+            transaction,
+            groups: StateGroupCache::default(),
+        })
     }
 
     /// Join a snapshot exported by another live [`Snapshot`].
@@ -89,6 +93,71 @@ impl Reader {
 /// A consistent view of the live Synapse database.
 pub struct Snapshot<'client> {
     transaction: Transaction<'client>,
+    /// State groups read so far; a snapshot never sees them change.
+    groups: StateGroupCache,
+}
+
+impl GroupSource for Transaction<'_> {
+    fn root_group(&mut self, event_id: &str) -> Result<Option<i64>, ReadError> {
+        Ok(self
+            .query_opt(
+                "SELECT state_group FROM event_to_state_groups WHERE event_id = $1",
+                &[&event_id],
+            )?
+            .map(|row| row.get(0)))
+    }
+
+    fn chain_from(&mut self, group: i64) -> Result<Vec<(i64, bool)>, ReadError> {
+        Ok(self
+            .query(
+                "WITH RECURSIVE chain(state_group, depth, path, cycle) AS ( \
+                     SELECT $1::bigint, 0::bigint, ARRAY[$1::bigint], FALSE \
+                     UNION ALL \
+                     SELECT edge.prev_state_group, chain.depth + 1, \
+                            chain.path || edge.prev_state_group, \
+                            edge.prev_state_group = ANY(chain.path) \
+                     FROM chain \
+                     INNER JOIN state_group_edges AS edge \
+                             ON edge.state_group = chain.state_group \
+                     WHERE NOT chain.cycle \
+                 ) \
+                 SELECT state_group, cycle FROM chain ORDER BY depth",
+                &[&group],
+            )?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    fn rows(
+        &mut self,
+        room_id: &str,
+        groups: &[i64],
+        keys: Option<&[(String, String)]>,
+    ) -> Result<Vec<(i64, GroupRow)>, ReadError> {
+        let rows = if let Some(keys) = keys {
+            let types: Vec<&str> = keys.iter().map(|(kind, _)| kind.as_str()).collect();
+            let state_keys: Vec<&str> = keys.iter().map(|(_, key)| key.as_str()).collect();
+            self.query(
+                "SELECT state_group, type, state_key, event_id \
+                 FROM state_groups_state \
+                 WHERE room_id = $1 AND state_group = ANY($2) \
+                   AND type = ANY($3) AND state_key = ANY($4)",
+                &[&room_id, &groups, &types, &state_keys],
+            )?
+        } else {
+            self.query(
+                "SELECT state_group, type, state_key, event_id \
+                 FROM state_groups_state \
+                 WHERE room_id = $1 AND state_group = ANY($2)",
+                &[&room_id, &groups],
+            )?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3))))
+            .collect())
+    }
 }
 
 /// Event groups, compression edges, and deltas verified to overwrite only
@@ -595,77 +664,8 @@ impl Snapshot<'_> {
         event_id: &str,
         keys: &[(String, String)],
     ) -> Result<StateMap, ReadError> {
-        let groups = self.state_group_chain(room_id, event_id)?;
-        let types: Vec<&str> = keys.iter().map(|(kind, _)| kind.as_str()).collect();
-        let state_keys: Vec<&str> = keys.iter().map(|(_, key)| key.as_str()).collect();
-        let rows = self.transaction.query(
-            "SELECT state_group, type, state_key, event_id \
-             FROM state_groups_state \
-             WHERE room_id = $1 AND state_group = ANY($2) \
-               AND type = ANY($3) AND state_key = ANY($4)",
-            &[&room_id, &groups, &types, &state_keys],
-        )?;
-        let wanted: std::collections::HashSet<(&str, &str)> = keys
-            .iter()
-            .map(|(kind, key)| (kind.as_str(), key.as_str()))
-            .collect();
-        let depth: std::collections::HashMap<i64, usize> = groups
-            .iter()
-            .enumerate()
-            .map(|(depth, state_group)| (*state_group, depth))
-            .collect();
-        let mut rows: Vec<_> = rows.into_iter().collect();
-        rows.sort_unstable_by_key(|row| depth.get(&row.get::<_, i64>(0)).copied());
-        let mut state = StateMap::new();
-        for row in rows {
-            let (kind, key): (String, String) = (row.get(1), row.get(2));
-            if wanted.contains(&(kind.as_str(), key.as_str())) {
-                state.entry((kind, key)).or_insert(row.get(3));
-            }
-        }
-        Ok(state)
-    }
-
-    /// The state groups behind `event_id`'s, newest first.
-    fn state_group_chain(&mut self, room_id: &str, event_id: &str) -> Result<Vec<i64>, ReadError> {
-        let Some(row) = self.transaction.query_opt(
-            "SELECT state_group FROM event_to_state_groups WHERE event_id = $1",
-            &[&event_id],
-        )?
-        else {
-            return Err(ReadError::MissingStateGroup {
-                room_id: room_id.to_owned(),
-                root: event_id.to_owned(),
-            });
-        };
-        let root_group: i64 = row.get(0);
-        let chain = self.transaction.query(
-            "WITH RECURSIVE chain(state_group, depth, path, cycle) AS ( \
-                 SELECT $1::bigint, 0::bigint, ARRAY[$1::bigint], FALSE \
-                 UNION ALL \
-                 SELECT edge.prev_state_group, chain.depth + 1, \
-                        chain.path || edge.prev_state_group, \
-                        edge.prev_state_group = ANY(chain.path) \
-                 FROM chain \
-                 INNER JOIN state_group_edges AS edge \
-                         ON edge.state_group = chain.state_group \
-                 WHERE NOT chain.cycle \
-             ) \
-             SELECT state_group, cycle FROM chain ORDER BY depth",
-            &[&root_group],
-        )?;
-        let mut groups = Vec::with_capacity(chain.len());
-        for row in chain {
-            let state_group: i64 = row.get(0);
-            if row.get::<_, bool>(1) {
-                return Err(ReadError::StateGroupCycle {
-                    room_id: room_id.to_owned(),
-                    state_group,
-                });
-            }
-            groups.push(state_group);
-        }
-        Ok(groups)
+        self.groups
+            .state_after(&mut self.transaction, room_id, event_id, Some(keys))
     }
 
     /// Resolve Synapse's delta-compressed state group for a horizon root.
@@ -678,64 +678,8 @@ impl Snapshot<'_> {
         room_id: &str,
         root_event_id: &str,
     ) -> Result<StateMap, ReadError> {
-        let Some(row) = self.transaction.query_opt(
-            "SELECT state_group FROM event_to_state_groups WHERE event_id = $1",
-            &[&root_event_id],
-        )?
-        else {
-            return Err(ReadError::MissingStateGroup {
-                room_id: room_id.to_owned(),
-                root: root_event_id.to_owned(),
-            });
-        };
-        let root_group: i64 = row.get(0);
-        let chain = self.transaction.query(
-            "WITH RECURSIVE chain(state_group, depth, path, cycle) AS ( \
-                 SELECT $1::bigint, 0::bigint, ARRAY[$1::bigint], FALSE \
-                 UNION ALL \
-                 SELECT edge.prev_state_group, chain.depth + 1, \
-                        chain.path || edge.prev_state_group, \
-                        edge.prev_state_group = ANY(chain.path) \
-                 FROM chain \
-                 INNER JOIN state_group_edges AS edge \
-                         ON edge.state_group = chain.state_group \
-                 WHERE NOT chain.cycle \
-             ) \
-             SELECT state_group, cycle FROM chain ORDER BY depth",
-            &[&root_group],
-        )?;
-
-        let mut groups = Vec::with_capacity(chain.len());
-        for row in chain {
-            let state_group: i64 = row.get(0);
-            if row.get::<_, bool>(1) {
-                return Err(ReadError::StateGroupCycle {
-                    room_id: room_id.to_owned(),
-                    state_group,
-                });
-            }
-            groups.push(state_group);
-        }
-
-        let rows = self.transaction.query(
-            "SELECT state_group, type, state_key, event_id \
-             FROM state_groups_state \
-             WHERE room_id = $1 AND state_group = ANY($2)",
-            &[&room_id, &groups],
-        )?;
-        let depth: std::collections::HashMap<i64, usize> = groups
-            .iter()
-            .enumerate()
-            .map(|(depth, state_group)| (*state_group, depth))
-            .collect();
-        let mut rows: Vec<_> = rows.into_iter().collect();
-        rows.sort_unstable_by_key(|row| depth.get(&row.get::<_, i64>(0)).copied());
-
-        let mut state = StateMap::new();
-        for row in rows {
-            state.entry((row.get(1), row.get(2))).or_insert(row.get(3));
-        }
-        Ok(state)
+        self.groups
+            .state_after(&mut self.transaction, room_id, root_event_id, None)
     }
 }
 

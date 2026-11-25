@@ -35,6 +35,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::{SourceEvent, SourceRoom, StateMap};
 
 pub mod full;
+mod group_cache;
 pub mod notifications;
 pub mod postgres;
 pub mod recovery;
