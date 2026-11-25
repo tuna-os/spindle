@@ -686,6 +686,11 @@ pub enum Keyspace {
     /// `(room_id, epoch, li)` -> a hub's signed checkpoint: the chain value
     /// and the state root at `li` (SPEC section 13.3).
     HubCheckpoint = 0x72,
+    /// The one row of the deny list an operator edits through the admin
+    /// API (#827): a JSON array of server-name globs. It adds to
+    /// `[federation] deny`, which a restart still reads from the file, so
+    /// the file stays the floor and the admin API can only add to it.
+    FederationDenyList = 0x73,
     /// `room_id` -> where a truncated room's hash chain restarts: the first
     /// `li` the room still holds a chain for (i64 be) and `chain[li - 1]`,
     /// the value the chain had just before it (32 bytes).
@@ -767,6 +772,12 @@ pub fn profile(user_id: &str) -> Vec<u8> {
     let mut key = vec![KEY_SCHEMA_VERSION, Keyspace::Profile as u8];
     key.extend_from_slice(user_id.as_bytes());
     key
+}
+
+/// The runtime deny list ([`Keyspace::FederationDenyList`]).
+#[must_use]
+pub fn federation_deny_list() -> Vec<u8> {
+    vec![KEY_SCHEMA_VERSION, Keyspace::FederationDenyList as u8]
 }
 
 /// The push delivery cursor -- the one row of [`Keyspace::PushCursor`].

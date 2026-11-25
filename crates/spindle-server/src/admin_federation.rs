@@ -48,8 +48,19 @@ pub fn routes() -> Router<AppState> {
                 &format!("{prefix}/federation/destinations/{{destination}}/reset_connection"),
                 post(reset_connection),
             )
+            // Spindle's own; Synapse has no server-wide deny list.
+            .route(
+                &format!("{prefix}/federation/deny"),
+                get(get_deny).put(put_deny),
+            )
     };
-    group("/_synapse/admin/v1").merge(group("/_spindle/admin/v1"))
+    // Spindle's own: Synapse has no server-wide deny list to copy.
+    let own = Router::new().route(
+        "/_spindle/admin/v1/federation/deny",
+        get(get_deny).put(put_deny),
+    );
+    own.merge(group("/_synapse/admin/v1"))
+        .merge(group("/_spindle/admin/v1"))
 }
 
 /// Every remote server this server shares a room with, and the rooms.
@@ -287,4 +298,60 @@ async fn reset_connection(
         &json!({}),
     )?;
     Ok(Json(json!({})))
+}
+
+/// `GET /_spindle/admin/v1/federation/deny`: the deny list from the file
+/// and the one the admin API holds.
+async fn get_deny(State(state): State<AppState>, _actor: AdminActor) -> Json<Value> {
+    Json(json!({
+        "configured": state.federation.configured_deny(),
+        "deny": state.federation.added_deny(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct DenyBody {
+    deny: Vec<String>,
+}
+
+/// `PUT /_spindle/admin/v1/federation/deny`: replace the admin API's deny
+/// list. It applies to the next request, and the audit log records what
+/// was added and removed.
+async fn put_deny(
+    State(state): State<AppState>,
+    actor: AdminActor,
+    Json(body): Json<DenyBody>,
+) -> Result<Json<Value>, MatrixError> {
+    let mut list: Vec<String> = Vec::new();
+    for pattern in body.deny {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.is_empty() || pattern.len() > 255 || pattern.contains(char::is_whitespace) {
+            return Err(invalid(format!("{pattern:?} is not a server name pattern")));
+        }
+        if !list.contains(&pattern) {
+            list.push(pattern);
+        }
+    }
+    // A pattern that matches this server would cut it off from its own
+    // key requests and tests; refuse it rather than lock the operator out.
+    if crate::server_acl::matches_any(&list, &state.config.server.name) {
+        return Err(invalid(
+            "The deny list must not match this server's own name",
+        ));
+    }
+    let before = state.federation.added_deny();
+    state
+        .federation
+        .set_added_deny(list.clone())
+        .map_err(|error| MatrixError::internal(&error.to_string()))?;
+    let added: Vec<&String> = list.iter().filter(|p| !before.contains(p)).collect();
+    let removed: Vec<&String> = before.iter().filter(|p| !list.contains(p)).collect();
+    crate::admin::audit(
+        &state,
+        &actor.identity().user_id,
+        "set_federation_deny",
+        "federation",
+        &json!({ "added": added, "removed": removed }),
+    )?;
+    Ok(Json(json!({ "deny": list })))
 }
