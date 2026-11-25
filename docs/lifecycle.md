@@ -341,8 +341,8 @@ What the probes say:
   sends no clients to a server that cannot write.
 - `/health` stays at 200. The process is good and the disk is not.
 - After `[storage] exit_on_write_refused_secs` (60 by default; 0 turns it off)
-  of refused writes, the server drains and exits non-zero. Freeing space does
-  not help a running process, so the exit lets a restart policy reopen the
+  of refused writes, the server drains and exits non-zero. More space does
+  not help the process that is up, so the exit lets a restart policy reopen the
   store. A restart onto a disk that is still full fails at open and backs off.
 - Reads continue. `/sync` and `/messages` serve the history up to the last
   acknowledged event.
