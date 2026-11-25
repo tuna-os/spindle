@@ -145,6 +145,30 @@ impl Node {
         device_id
     }
 
+    /// Create a public room here and have `other`'s user join it, so the
+    /// two servers have a user each in one room.
+    async fn share_room_with(&self, other: &Node, token: &str, other_token: &str) {
+        let room = self
+            .request(
+                reqwest::Method::POST,
+                "/_matrix/client/v3/createRoom",
+                Some(token),
+                Some(&json!({ "preset": "public_chat" })),
+            )
+            .await["room_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        other
+            .request(
+                reqwest::Method::POST,
+                &format!("/_matrix/client/v3/join/{room}?server_name={}", self.name),
+                Some(other_token),
+                Some(&json!({})),
+            )
+            .await;
+    }
+
     /// A signed federation request from this node straight to `to`'s
     /// listener, past its proxy.
     async fn federation(&self, to: &Node, method: &str, uri: &str, body: Option<&Value>) -> Value {
@@ -287,24 +311,7 @@ async fn each_update_names_the_last_and_a_contiguous_chain_is_applied_inline() {
     let b = Node::start().await;
     let (alice_token, alice) = a.register("alice").await;
     let (bob_token, _) = b.register("bob").await;
-    let room = a
-        .request(
-            reqwest::Method::POST,
-            "/_matrix/client/v3/createRoom",
-            Some(&alice_token),
-            Some(&json!({ "preset": "public_chat" })),
-        )
-        .await["room_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    b.request(
-        reqwest::Method::POST,
-        &format!("/_matrix/client/v3/join/{room}?server_name={}", a.name),
-        Some(&bob_token),
-        Some(&json!({})),
-    )
-    .await;
+    a.share_room_with(&b, &alice_token, &bob_token).await;
 
     let first = a.new_device("alice", &alice).await;
     let second = a.new_device("alice", &alice).await;
@@ -367,10 +374,12 @@ async fn each_update_names_the_last_and_a_contiguous_chain_is_applied_inline() {
 async fn a_gap_in_the_chain_costs_exactly_one_refetch() {
     let a = Node::start().await;
     let b = Node::start().await;
-    let (_, alice) = a.register("alice").await;
+    let (alice_token, alice) = a.register("alice").await;
+    let (bob_token, _) = b.register("bob").await;
     // Four real changes on a, so the list a serves is the one the chain
-    // describes. alice shares no room with b, so a tells b nothing itself;
-    // the test carries the updates, and loses one.
+    // describes. A room is shared only so b takes the updates; the test
+    // carries them itself, and loses one.
+    a.share_room_with(&b, &alice_token, &bob_token).await;
     let mut devices = Vec::new();
     let mut ids = Vec::new();
     for _ in 0..4 {
@@ -464,4 +473,83 @@ async fn a_gap_in_the_chain_costs_exactly_one_refetch() {
         1,
         "an update that follows the snapshot needs none"
     );
+}
+
+#[tokio::test]
+async fn updates_about_users_who_share_no_room_here_are_dropped() {
+    let a = Node::start().await;
+    let b = Node::start().await;
+    let (_, alice) = a.register("alice").await;
+    let device = a.new_device("alice", &alice).await;
+    // alice shares no room with anyone on b: b has no use for her keys.
+    let edus = vec![
+        json!({
+            "edu_type": "m.device_list_update",
+            "content": {
+                "user_id": alice,
+                "device_id": device,
+                "stream_id": 1,
+                "prev_id": [],
+                "deleted": false,
+                "keys": device_keys(&alice, &device),
+            },
+        }),
+        json!({
+            "edu_type": "m.signing_key_update",
+            "content": {
+                "user_id": alice,
+                "master_key": { "user_id": alice, "usage": ["master"], "keys": {} },
+            },
+        }),
+    ];
+    a.send_edus(&b, "stranger", edus).await;
+    assert_eq!(
+        b.state
+            .devices
+            .remote_device_list_stream_id(&alice)
+            .unwrap(),
+        None
+    );
+    assert!(b.state.devices.all_device_keys(&alice).unwrap().is_empty());
+    assert!(
+        b.state
+            .devices
+            .cross_signing_key(&alice, "master")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn to_device_messages_for_missing_devices_are_not_queued() {
+    let a = Node::start().await;
+    let b = Node::start().await;
+    let (_, alice) = a.register("alice").await;
+    let (bob_token, bob) = b.register("bob").await;
+    let real = b.new_device("bob", &bob).await;
+    let _ = bob_token;
+    let edu = json!({
+        "edu_type": "m.direct_to_device",
+        "content": {
+            "sender": alice,
+            "type": "m.test",
+            "message_id": "m1",
+            "messages": { bob.clone(): {
+                "NOSUCHDEVICE": { "n": 1 },
+                real.clone(): { "n": 2 },
+            } },
+        },
+    });
+    a.send_edus(&b, "mail", vec![edu]).await;
+    let queued = |device: &str| {
+        b.state
+            .devices
+            .pending_to_device_in(0, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.device_id == device)
+            .count()
+    };
+    assert_eq!(queued("NOSUCHDEVICE"), 0);
+    assert_eq!(queued(&real), 1);
 }

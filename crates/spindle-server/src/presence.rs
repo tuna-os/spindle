@@ -779,7 +779,7 @@ fn fan_out(peers: Peers<'_>, user_id: &str, status: &Status) {
 
 /// Whether `user_id` is joined to a room some user of `server_name` is
 /// joined to.
-fn shares_room_with_local(rooms: &Rooms, user_id: &str, server_name: &str) -> bool {
+pub(crate) fn shares_room_with_local(rooms: &Rooms, user_id: &str, server_name: &str) -> bool {
     let Ok(joined) = rooms.joined(user_id) else {
         return false;
     };
