@@ -38,6 +38,7 @@ pub mod full;
 pub mod notifications;
 pub mod postgres;
 pub mod recovery;
+mod replay_cache;
 mod replay_spool;
 pub mod resolve;
 pub mod signatures;
