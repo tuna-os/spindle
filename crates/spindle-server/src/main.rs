@@ -1032,6 +1032,7 @@ async fn serve() -> ExitCode {
     };
     let periodic_sync = apply_durability(&store, &config.storage);
 
+    let exit_on_write_refused_secs = config.storage.exit_on_write_refused_secs;
     let bind = config.server.bind.clone();
     let name = config.server.name.clone();
     let metrics_bind = config.metrics.bind.clone();
@@ -1097,8 +1098,24 @@ async fn serve() -> ExitCode {
     // same and joined below, so that when the store closes no task still
     // holds a copy of the router.
     let federation_handle = federation.as_ref().map(|listener| listener.handle.clone());
+    // A store that refuses writes for good is restarted by exiting (#892).
+    let write_refused = spindle_server::write_watchdog::write_refused_for(
+        Arc::clone(&store),
+        Duration::from_secs(exit_on_write_refused_secs),
+        Duration::from_secs(1),
+    );
+    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wedged_flag = Arc::clone(&wedged);
     let stop = async move {
-        stop.await;
+        tokio::select! {
+            () = stop => {}
+            () = write_refused => {
+                tracing::error!(
+                    "the store has refused writes for {exit_on_write_refused_secs}s and only a restart reopens it; exiting"
+                );
+                wedged_flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         if let Some(handle) = federation_handle {
             handle.graceful_shutdown(Some(Duration::from_secs(30)));
         }
@@ -1117,6 +1134,9 @@ async fn serve() -> ExitCode {
     drop(periodic_sync);
     close_store(store).await;
     flush_traces(tracer_provider);
+    if wedged.load(std::sync::atomic::Ordering::Acquire) {
+        return ExitCode::FAILURE;
+    }
     match served {
         Ok(()) => {
             tracing::info!("shut down cleanly");

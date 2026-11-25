@@ -101,6 +101,7 @@ pub mod upstream;
 pub mod user_ids;
 pub mod voip_routes;
 pub mod web;
+pub mod write_watchdog;
 
 use std::sync::Arc;
 

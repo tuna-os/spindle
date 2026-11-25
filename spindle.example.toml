@@ -64,6 +64,11 @@ path = "./data"
 # Must be above zero.
 # relaxed_sync_interval_ms = 1000
 
+# After a full disk the store refuses every write until the process is
+# restarted. Exit non-zero once writes have been refused for this many
+# seconds, so a restart policy brings the server back. 0 never exits.
+# exit_on_write_refused_secs = 60
+
 # Directory for online backups taken with POST /_spindle/admin/v1/backup.
 # Unset turns the endpoint off. Each backup is a new file in this directory.
 # backup_dir = "./backups"

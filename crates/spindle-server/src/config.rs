@@ -1890,6 +1890,12 @@ pub struct StorageConfig {
     /// the other modes. Must be above zero.
     #[serde(default = "default_relaxed_sync_interval_ms")]
     pub relaxed_sync_interval_ms: u64,
+    /// How long the store may refuse writes before the server exits
+    /// non-zero, in seconds (#892). After a full disk the engine refuses
+    /// every write until it is reopened, so a restart is the only way
+    /// back; this lets the supervisor do it. `0` never exits.
+    #[serde(default = "default_exit_on_write_refused_secs")]
+    pub exit_on_write_refused_secs: u64,
     /// Where `POST /_spindle/admin/v1/backup` writes backups (#813). Unset
     /// turns the endpoint off: it answers with an error and writes nothing.
     /// The endpoint takes no path from the request, so an admin token cannot
@@ -1927,6 +1933,10 @@ impl From<DurabilityMode> for spindle_store::Durability {
 
 fn default_relaxed_sync_interval_ms() -> u64 {
     1000
+}
+
+fn default_exit_on_write_refused_secs() -> u64 {
+    60
 }
 
 fn default_max_resident_rooms() -> usize {
@@ -2025,6 +2035,7 @@ impl Default for StorageConfig {
             max_resident_rooms: default_max_resident_rooms(),
             durability: DurabilityMode::default(),
             relaxed_sync_interval_ms: default_relaxed_sync_interval_ms(),
+            exit_on_write_refused_secs: default_exit_on_write_refused_secs(),
             backup_dir: None,
         }
     }
