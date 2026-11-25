@@ -4472,20 +4472,20 @@ mod key_fetch_capacity_tests {
         let federation = Federation::new(store, "example.org", key, false, &[])
             .unwrap()
             .with_key_fetch_budget(crate::config::Rate::new(0.001, 3), true);
-        let (_, refused) = with_key_fetch_source("203.0.113.9".to_owned(), async {
+        let ((), refused) = Box::pin(with_key_fetch_source("203.0.113.9".to_owned(), async {
             for number in 0..20 {
                 federation
                     .direct_key_document(&format!("host{number}.invalid"), false)
                     .await;
             }
-        })
+        }))
         .await;
         assert_eq!(federation.negative.lock().unwrap().len(), 3);
         assert!(refused.is_some_and(|wait| wait > 0));
         // Another address has a budget of its own.
-        let (_, refused) = with_key_fetch_source("203.0.113.10".to_owned(), async {
+        let ((), refused) = Box::pin(with_key_fetch_source("203.0.113.10".to_owned(), async {
             federation.direct_key_document("other.invalid", false).await;
-        })
+        }))
         .await;
         assert!(refused.is_none());
         assert_eq!(federation.negative.lock().unwrap().len(), 4);
