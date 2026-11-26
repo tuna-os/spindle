@@ -160,13 +160,22 @@ impl Delegated {
             "{}/.well-known/openid-configuration",
             self.config.issuer.trim_end_matches('/')
         );
-        let document: Value = self
+        let response = self
             .client
             .get(url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .map_err(|error| MatrixError::internal(&format!("auth provider: {error}")))?
+            .map_err(|error| MatrixError::internal(&format!("auth provider: {error}")))?;
+        // A 502 from a proxy in front of a dead provider is not a document
+        // that failed to parse, and the log should not say it is (#892).
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MatrixError::internal(&format!(
+                "auth provider unreachable: it answered {status}"
+            )));
+        }
+        let document: Value = response
             .bytes()
             .await
             .ok()

@@ -119,7 +119,7 @@ hub-mode = []
 [dev-dependencies]
 tokio-rustls = "0.26"
 # The hub-mode tests partition two servers with a TCP proxy between them.
-tokio = { workspace = true, features = ["io-util", "sync"] }
+tokio = { workspace = true, features = ["io-util", "sync", "test-util"] }
 # `state-res` so the tests can judge our events with the same implementation a
 # federating peer would (ADR 0002: ruma judges, it never builds our side).
 ruma = { workspace = true, features = ["state-res", "events"] }
