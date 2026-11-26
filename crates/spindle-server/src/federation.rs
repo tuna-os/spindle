@@ -52,6 +52,42 @@ const HIERARCHY_CACHE_MAX: usize = 512;
 const HIERARCHY_TIMEOUT: Duration = Duration::from_secs(5);
 const HIERARCHY_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+tokio::task_local! {
+    /// The source address of the request this task is serving, so a key
+    /// fetch it starts can be charged to it without every route passing the
+    /// address down (#943).
+    static KEY_FETCH_SOURCE: KeyFetchSource;
+}
+
+/// The caller a key fetch is charged to, and whether one was refused.
+pub struct KeyFetchSource {
+    address: String,
+    /// Milliseconds to wait, set when a fetch was refused; 0 if none was.
+    refused: std::sync::atomic::AtomicU64,
+}
+
+/// Run `work` with its key fetches charged to `address`. Returns the
+/// milliseconds the caller must wait if any fetch was refused for budget.
+pub async fn with_key_fetch_source<F: std::future::Future>(
+    address: String,
+    work: F,
+) -> (F::Output, Option<u64>) {
+    KEY_FETCH_SOURCE
+        .scope(
+            KeyFetchSource {
+                address,
+                refused: std::sync::atomic::AtomicU64::new(0),
+            },
+            async {
+                let output = work.await;
+                let wait = KEY_FETCH_SOURCE
+                    .with(|source| source.refused.load(std::sync::atomic::Ordering::Relaxed));
+                (output, (wait > 0).then_some(wait))
+            },
+        )
+        .await
+}
+
 const NEGATIVE_CACHE: Duration = Duration::from_secs(60);
 
 /// How soon after a successful fetch an origin is asked again because the
@@ -165,6 +201,9 @@ pub struct Federation {
     /// server costs one timeout rather than one per page.
     hierarchy_cache: std::sync::Mutex<HashMap<HierarchyKey, (Instant, Option<Value>)>>,
     key_fetch_slots: tokio::sync::Semaphore,
+    /// What one source address may spend on key fetches (#943), and the
+    /// budget itself. Unset, as in a test rig, nothing is counted.
+    key_fetch_budget: Option<(crate::config::Rate, crate::ratelimit::RateLimiter)>,
     /// Ephemeral EDUs waiting for the next transaction to each destination.
     ///
     /// In memory and nowhere else, deliberately: typing and presence are
@@ -610,6 +649,7 @@ impl Federation {
             negative: std::sync::Mutex::new(HashMap::new()),
             hierarchy_cache: std::sync::Mutex::new(HashMap::new()),
             key_fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_KEY_FETCHES),
+            key_fetch_budget: None,
             edu_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
             durable_edus: edu_outbox::EduOutbox::default(),
             receipt_queue: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -628,6 +668,37 @@ impl Federation {
             delivery: std::sync::Mutex::new(HashMap::new()),
             delivery_resets: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Bound key fetches per source address (#943); see
+    /// `ratelimit.key_fetches`.
+    #[must_use]
+    pub fn with_key_fetch_budget(mut self, rate: crate::config::Rate, enabled: bool) -> Self {
+        self.key_fetch_budget = Some((rate, crate::ratelimit::RateLimiter::with_enabled(enabled)));
+        self
+    }
+
+    /// Spend one key fetch from the budget of the source this task is
+    /// serving. A task with no source (a background refresh) is free.
+    fn spend_key_fetch(&self) -> bool {
+        let Some((rate, limiter)) = &self.key_fetch_budget else {
+            return true;
+        };
+        let Ok(spent) =
+            KEY_FETCH_SOURCE.try_with(|source| match limiter.check_rate(&source.address, *rate) {
+                Ok(()) => true,
+                Err(retry) => {
+                    source.refused.store(
+                        retry.as_millis().max(1),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    false
+                }
+            })
+        else {
+            return true;
+        };
+        spent
     }
 
     /// Ask these notaries for a peer's keys when the peer cannot answer
@@ -1574,6 +1645,12 @@ impl Federation {
                     .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
                 return None;
             }
+        }
+        // Last, so a request the caches answer costs the source nothing.
+        if !self.spend_key_fetch() {
+            self.metrics
+                .record_key_fetch(KeySource::Direct, KeyFetchResult::Throttled);
+            return None;
         }
         match self.fetch_key_document(origin).await {
             Ok(document) => {
@@ -4430,6 +4507,36 @@ mod receipt_queue_tests {
 #[cfg(test)]
 mod key_fetch_capacity_tests {
     use super::*;
+
+    /// One source cannot grow the negative cache past its budget (#943),
+    /// and another source is unaffected.
+    #[tokio::test]
+    async fn one_source_cannot_fill_the_negative_cache_past_its_budget() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FjallStore::open(directory.path()).unwrap());
+        let key = Arc::new(ServerKey::load_or_create(store.as_ref()).unwrap());
+        // A tiny refill, so the burst is the whole budget.
+        let federation = Federation::new(store, "example.org", key, false, &[])
+            .unwrap()
+            .with_key_fetch_budget(crate::config::Rate::new(0.001, 3), true);
+        let ((), refused) = Box::pin(with_key_fetch_source("203.0.113.9".to_owned(), async {
+            for number in 0..20 {
+                federation
+                    .direct_key_document(&format!("host{number}.invalid"), false)
+                    .await;
+            }
+        }))
+        .await;
+        assert_eq!(federation.negative.lock().unwrap().len(), 3);
+        assert!(refused.is_some_and(|wait| wait > 0));
+        // Another address has a budget of its own.
+        let ((), refused) = Box::pin(with_key_fetch_source("203.0.113.10".to_owned(), async {
+            federation.direct_key_document("other.invalid", false).await;
+        }))
+        .await;
+        assert!(refused.is_none());
+        assert_eq!(federation.negative.lock().unwrap().len(), 4);
+    }
 
     #[tokio::test]
     async fn saturated_origin_cache_and_fetch_slots_refuse_before_network_io() {

@@ -653,6 +653,17 @@ pub trait SourceState {
         Ok(())
     }
 
+    /// Whether the source already knows, from an earlier pass, that its
+    /// state after `event_id` is exactly `state`. `false` means unknown or
+    /// different, and the replay reads the state.
+    fn state_known_equal(&mut self, _event_id: &str, _state: &StateSnapshot) -> bool {
+        false
+    }
+
+    /// Note the source's full state after `event_id`, which the replay just
+    /// read, so a later pass can skip the read ([`Self::state_known_equal`]).
+    fn note_source_state(&mut self, _event_id: &str, _state: &StateMap) {}
+
     /// Save a supplied state outside the returned map when needed. `true`
     /// retains it in the outcome; `false` means the source saved it and will
     /// provide it through `SynapseSource::read_settled` during the write.
@@ -1173,16 +1184,21 @@ fn replay_pass(
             );
             if matches!(continuity, Continuity::Elsewhere | Continuity::Unknown) {
                 full_checks += 1;
-                let map = source
-                    .state_after(event_id)
-                    .map_err(|why| no_state(event_id, why))?;
-                if !same_state(state, &map) {
-                    let (state, slots) = snapshot_over(Some(state), &map, &table);
-                    want = Want {
-                        state: Some(state),
-                        reason: Some(ELSEWHERE_REASON),
-                        slots: Some(slots),
-                    };
+                // An earlier pass may have shown that Synapse's state is the
+                // derived one; the marks do not change either.
+                if !source.state_known_equal(event_id, state) {
+                    let map = source
+                        .state_after(event_id)
+                        .map_err(|why| no_state(event_id, why))?;
+                    source.note_source_state(event_id, &map);
+                    if !same_state(state, &map) {
+                        let (state, slots) = snapshot_over(Some(state), &map, &table);
+                        want = Want {
+                            state: Some(state),
+                            reason: Some(ELSEWHERE_REASON),
+                            slots: Some(slots),
+                        };
+                    }
                 }
             }
         }

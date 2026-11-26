@@ -1314,6 +1314,15 @@ pub struct RateLimitConfig {
     /// cached is free to read.
     #[serde(default = "default_remote_media")]
     pub remote_media: Rate,
+    /// Requests from one source address that start a federation key
+    /// fetch (#943). A name that fails cheaply (NXDOMAIN, connection
+    /// refused) takes a negative-cache entry, and the key routes take no
+    /// credentials, so without this one address can fill that cache. A
+    /// request answered from the key cache or the negative cache is free;
+    /// only a fetch that goes out spends one. Over the budget the caller
+    /// gets 429 with `retry_after_ms`.
+    #[serde(default = "default_key_fetches")]
+    pub key_fetches: Rate,
 }
 
 /// A per-user write budget: `burst` requests at once, refilled at
@@ -1361,6 +1370,7 @@ impl Default for RateLimitConfig {
             media_uploads: default_media_uploads(),
             url_previews: default_url_previews(),
             remote_media: default_remote_media(),
+            key_fetches: default_key_fetches(),
         }
     }
 }
@@ -1410,6 +1420,12 @@ const fn default_url_previews() -> Rate {
 // A client opening a room with many remote avatars and images is a burst.
 const fn default_remote_media() -> Rate {
     Rate::new(2.0, 100)
+}
+
+// A peer meets a handful of new servers a minute at most; a script naming
+// made-up servers is what the budget is for.
+const fn default_key_fetches() -> Rate {
+    Rate::new(0.5, 30)
 }
 
 const fn default_true() -> bool {
@@ -2370,6 +2386,7 @@ impl Config {
             ("ratelimit.media_uploads", limits.media_uploads),
             ("ratelimit.url_previews", limits.url_previews),
             ("ratelimit.remote_media", limits.remote_media),
+            ("ratelimit.key_fetches", limits.key_fetches),
         ] {
             // Same reasoning as the ring: zero burst or zero rate refuses
             // every request forever, and NaN or a rate whose refill

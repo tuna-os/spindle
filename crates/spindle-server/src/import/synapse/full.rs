@@ -44,6 +44,7 @@ use spindle_store::{FjallStore, ReadView, Store};
 
 use super::ReadError;
 use super::postgres::Snapshot;
+use super::replay_cache::ReplayCache;
 use super::replay_spool::ReplaySpool;
 use super::resolve::RoomResolver;
 use super::signatures::{KeyRing, Verdict};
@@ -397,6 +398,8 @@ struct SnapshotSource<'a, 'snapshot> {
     spool: &'a mut ReplaySpool,
     /// Each event's state group, and each group's `prev_state_group`.
     groups: Option<&'a super::postgres::StateGroupGraph>,
+    /// Results the passes of the replay share for this room.
+    cache: &'a mut ReplayCache,
 }
 
 impl SourceState for SnapshotSource<'_, '_> {
@@ -431,9 +434,20 @@ impl SourceState for SnapshotSource<'_, '_> {
             state.retain(|key, _| keys.contains(key));
             return Ok(state);
         }
-        self.snapshot
-            .state_after_event_keys(self.room_id, event_id, keys)
-            .map_err(|error| error.to_string())
+        let (snapshot, room_id) = (&mut *self.snapshot, self.room_id);
+        self.cache.keyed(event_id, keys, || {
+            snapshot
+                .state_after_event_keys(room_id, event_id, keys)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn state_known_equal(&mut self, event_id: &str, state: &spindle_core::StateSnapshot) -> bool {
+        self.cache.source_matches(event_id, state)
+    }
+
+    fn note_source_state(&mut self, event_id: &str, state: &StateMap) {
+        self.cache.remember_source(event_id, state);
     }
 
     fn resolve(
@@ -441,7 +455,9 @@ impl SourceState for SnapshotSource<'_, '_> {
         sets: &[&spindle_core::StateSnapshot],
     ) -> Option<Result<Resolution, String>> {
         let resolver = self.resolver.as_deref_mut()?;
-        Some(resolver.resolve(self.snapshot, sets))
+        let snapshot = &mut *self.snapshot;
+        self.cache
+            .resolution(sets, || Some(resolver.resolve(snapshot, sets)))
     }
 
     fn replay_progress(&mut self, position: usize, total: usize) {
@@ -1699,6 +1715,9 @@ impl Run<'_, '_> {
         };
         let groups = self.snapshot.state_group_graph(room_id)?;
         let mut states = HashMap::new();
+        // Shared by every pass and the retry at the head: neither the
+        // resolver's answers nor Synapse's state depend on the marks.
+        let mut cache = ReplayCache::default();
         let source_head = current_head_needs_source(&source);
         if source_head {
             eprintln!("replay: room={room_id} source_head=accepted_current_outlier");
@@ -1712,6 +1731,7 @@ impl Run<'_, '_> {
                 resolver: Some(&mut auth_engine),
                 spool: &mut spool,
                 groups: Some(&groups),
+                cache: &mut cache,
             };
             replay_resolving(&source, &mut lookup, source_head)
         };
@@ -1730,9 +1750,14 @@ impl Run<'_, '_> {
                 resolver: Some(&mut auth_engine),
                 spool: &mut spool,
                 groups: Some(&groups),
+                cache: &mut cache,
             };
             resolved = replay_resolving(&source, &mut lookup, true);
         }
+        eprintln!(
+            "replay: room={room_id} reused_from_earlier_passes={}",
+            cache.hits
+        );
         room_report.compat_user_ids = auth_engine.stand_ins.iter().cloned().collect();
         drop(auth_engine);
         let resolved = match resolved {
@@ -1917,6 +1942,7 @@ impl Run<'_, '_> {
                     resolver: None,
                     spool: &mut spool,
                     groups: None,
+                    cache: &mut cache,
                 };
                 let (appended, _) = self
                     .target

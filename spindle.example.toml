@@ -157,6 +157,10 @@ url_previews = { per_second = 0.5, burst = 20 }
 # Authenticated downloads and thumbnails of remote media not yet cached: one
 # per fetch. Media already cached is free to read.
 remote_media = { per_second = 2.0, burst = 100 }
+# Requests from one source address that start a federation key fetch: the
+# X-Matrix check of a server not seen before, and the key notary routes.
+# Answers from the key cache are free. Over the budget the caller gets 429.
+key_fetches = { per_second = 0.5, burst = 30 }
 
 [previews]
 # URL previews make the server fetch attacker-chosen URLs, which is the

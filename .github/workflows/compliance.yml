@@ -133,7 +133,7 @@ jobs:
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         if: github.event_name != 'pull_request'
         with:
           go-version-file: evidence/mautrix-echo/go.mod
@@ -257,7 +257,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: 'stable'
           # setup-go's own cache keys off a go.sum, and this repository has
@@ -500,7 +500,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: 'stable'
           cache: false
@@ -598,7 +598,7 @@ jobs:
       # The Go upstream's own workflow uses, not `stable`: the pinned
       # suite's go-json-experiment dependency does not build on newer Go,
       # where it aliases encoding/json/v2 and finds names that are not there.
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.25'
           cache: false
@@ -664,7 +664,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: 'stable'
           cache: false
@@ -742,7 +742,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: 'stable'
           cache: false
