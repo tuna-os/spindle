@@ -178,6 +178,16 @@ fn store_maintenance_command() -> Option<ExitCode> {
             };
             Some(verify(&config_path))
         }
+        // `spindle stats <config>` -- rows and bytes of each keyspace, so an
+        // operator can see what fills the store (#891). Offline like
+        // `verify`: opening the store takes the directory lock.
+        "stats" => {
+            let Some(config_path) = std::env::args().nth(2) else {
+                eprintln!("usage: spindle stats <config>");
+                return Some(ExitCode::FAILURE);
+            };
+            Some(stats(&config_path))
+        }
         // `spindle reindex-search <config>` -- rebuild the `/search` word
         // index from the log (#830). Offline like `verify`.
         "reindex-search" => {
@@ -188,6 +198,42 @@ fn store_maintenance_command() -> Option<ExitCode> {
             Some(reindex_search(&config_path))
         }
         _ => None,
+    }
+}
+
+/// Print the rows and bytes of each keyspace, largest first.
+fn stats(config_path: &str) -> ExitCode {
+    let Some(store) = open_store(config_path) else {
+        return ExitCode::FAILURE;
+    };
+    match spindle_store::stats::store_stats(&store) {
+        Ok(report) => {
+            println!("{:<28} {:>14} {:>16}", "keyspace", "rows", "bytes");
+            for (keyspace, one) in report.by_size() {
+                println!(
+                    "{:<28} {:>14} {:>16}",
+                    format!("{keyspace:?}"),
+                    one.rows,
+                    one.bytes
+                );
+            }
+            if report.unknown.rows > 0 {
+                println!(
+                    "{:<28} {:>14} {:>16}",
+                    "(unknown)", report.unknown.rows, report.unknown.bytes
+                );
+            }
+            let total = report.total();
+            println!("{:<28} {:>14} {:>16}", "total", total.rows, total.bytes);
+            println!(
+                "stats: bytes are keys and values before compression; the disk holds more until a compaction"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("stats: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

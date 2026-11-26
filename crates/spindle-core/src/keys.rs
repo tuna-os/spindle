@@ -714,6 +714,126 @@ pub enum Keyspace {
     SearchMarker = 0x82,
 }
 
+impl Keyspace {
+    /// Every keyspace, in declaration order. `spindle stats` walks it to name
+    /// the rows it counts; a test holds it to the enum above.
+    pub const ALL: [Self; 105] = [
+        Self::Log,
+        Self::EventIndex,
+        Self::StateNode,
+        Self::StateRoot,
+        Self::RoomMeta,
+        Self::Account,
+        Self::Device,
+        Self::AccessToken,
+        Self::RefreshToken,
+        Self::ServerKey,
+        Self::Stream,
+        Self::Receipt,
+        Self::Relation,
+        Self::Membership,
+        Self::Forgotten,
+        Self::AccountData,
+        Self::Alias,
+        Self::Filter,
+        Self::Media,
+        Self::Transaction,
+        Self::DeviceKeys,
+        Self::OneTimeKeys,
+        Self::ToDevice,
+        Self::FallbackKeys,
+        Self::DeviceListChange,
+        Self::KeyBackup,
+        Self::KeyBackupData,
+        Self::CrossSigning,
+        Self::UrlPreview,
+        Self::ServerKeys,
+        Self::FederationTxn,
+        Self::FederationOutbox,
+        Self::EventRoom,
+        Self::PendingInvite,
+        Self::Profile,
+        Self::AppserviceCursor,
+        Self::AuditLog,
+        Self::OidcClient,
+        Self::PurgeWatermark,
+        Self::RoomBlock,
+        Self::PublishedRoom,
+        Self::RoomStream,
+        Self::DelayedEvent,
+        Self::DelayedEventById,
+        Self::FinalisedDelay,
+        Self::Presence,
+        Self::Pusher,
+        Self::MemberHistory,
+        Self::PushCursor,
+        Self::PendingKnock,
+        Self::OpenIdToken,
+        Self::Sticky,
+        Self::EventReport,
+        Self::DehydratedDevice,
+        Self::TransactionEcho,
+        Self::MediaReservation,
+        Self::LoginToken,
+        Self::RegistrationToken,
+        Self::ServerNoticeRoom,
+        Self::AccountDataStream,
+        Self::Sidelined,
+        Self::HistoricalRejection,
+        Self::ImportedAuthOnly,
+        Self::ImportNotificationFence,
+        Self::FederationGap,
+        Self::StateKeyIntern,
+        Self::StreamCheckpoint,
+        Self::EduOutbox,
+        Self::PushPending,
+        Self::PresenceStream,
+        Self::PartialStateRoom,
+        Self::PartialStateResynced,
+        Self::RevokedDevice,
+        Self::CurrentState,
+        Self::DestinationRetry,
+        Self::RoomStateDelta,
+        Self::FederationGapEvent,
+        Self::FederationGapPosition,
+        Self::FederationGapSpan,
+        Self::PendingRedaction,
+        Self::UpstreamLink,
+        Self::OwedEvent,
+        Self::SlidingConnection,
+        Self::SlidingConnectionUsed,
+        Self::SynapsePosition,
+        Self::SynapseTopologicalPosition,
+        Self::ErasurePolicy,
+        Self::BrowserSession,
+        Self::EmailToken,
+        Self::UserEmail,
+        Self::EmailOwner,
+        Self::RecoveryCodes,
+        Self::AdminTask,
+        Self::FinalisedDelayById,
+        Self::DelayEcho,
+        Self::DeviceListOutbound,
+        Self::DeviceListInbound,
+        Self::HubAttestation,
+        Self::HubEquivocation,
+        Self::HubCheckpoint,
+        Self::ChainCheckpoint,
+        Self::SearchPosting,
+        Self::SearchVocab,
+        Self::SearchMarker,
+    ];
+
+    /// The keyspace a key tag byte names, or `None` for a tag no version of
+    /// this server wrote.
+    #[must_use]
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|keyspace| *keyspace as u8 == tag)
+    }
+}
+
 // Adding a discriminant is additive: every key already written keeps its bytes
 // and its meaning, so it needs no `KEY_SCHEMA_VERSION` bump. Reusing or
 // reordering one would need both a bump and a migration, which is what
@@ -2132,4 +2252,36 @@ pub fn presence_stream_parts(key: &[u8]) -> Option<(u64, String)> {
     let position: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     let user = String::from_utf8(rest.get(8..)?.to_vec()).ok()?;
     Some((u64::from_be_bytes(position), user))
+}
+
+#[cfg(test)]
+mod keyspace_all_tests {
+    use super::Keyspace;
+
+    /// `ALL` is a hand-kept list, so a variant added to the enum and left
+    /// out of it would be counted under no name by `spindle stats`. The
+    /// enum's own source is the reference.
+    #[test]
+    fn all_lists_every_declared_keyspace() {
+        let source = include_str!("keys.rs");
+        let body = source
+            .split("pub enum Keyspace {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("enum body");
+        let declared: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ")
+                    && !line.trim_start().starts_with("//")
+                    && line.contains(" = 0x")
+            })
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let listed: Vec<String> = Keyspace::ALL.iter().map(|k| format!("{k:?}")).collect();
+        assert_eq!(declared, listed);
+        for keyspace in Keyspace::ALL {
+            assert_eq!(Keyspace::from_tag(keyspace as u8), Some(keyspace));
+        }
+    }
 }
