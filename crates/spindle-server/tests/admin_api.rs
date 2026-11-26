@@ -265,6 +265,8 @@ fn all_admin_routes(user: &str) -> Vec<(reqwest::Method, String)> {
             (reqwest::Method::PUT, format!("{prefix}/rooms/!r:x/block")),
             (reqwest::Method::DELETE, format!("{prefix}/event_reports/1")),
             (reqwest::Method::GET, format!("{prefix}/scheduled_tasks")),
+            (reqwest::Method::GET, format!("{prefix}/federation/deny")),
+            (reqwest::Method::PUT, format!("{prefix}/federation/deny")),
             (
                 reqwest::Method::GET,
                 format!("{prefix}/federation/destinations"),
@@ -3183,4 +3185,61 @@ async fn room_listing_orders_exactly_as_synapse_for_every_column_and_direction()
         search(port).await.is_empty(),
         "the end of the server name is not in any alias's localpart"
     );
+}
+
+#[tokio::test]
+async fn the_federation_deny_list_changes_without_a_restart_and_is_audited() {
+    let server = Instance::start().await;
+    let admin_token = server.register("root").await;
+    server.promote("root");
+    let path = "/_spindle/admin/v1/federation/deny";
+
+    let (status, body) = server
+        .request(
+            reqwest::Method::PUT,
+            path,
+            Some(&admin_token),
+            Some(&json!({ "deny": ["Bad.Example", "*.evil.example", "bad.example"] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["deny"], json!(["bad.example", "*.evil.example"]));
+
+    let (_, body) = server
+        .request(reqwest::Method::GET, path, Some(&admin_token), None)
+        .await;
+    assert_eq!(body["deny"], json!(["bad.example", "*.evil.example"]));
+
+    // A pattern that would cut the server off from itself is refused.
+    let (status, _) = server
+        .request(
+            reqwest::Method::PUT,
+            path,
+            Some(&admin_token),
+            Some(&json!({ "deny": ["127.0.0.1"] })),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    let (_, body) = server
+        .request(
+            reqwest::Method::PUT,
+            path,
+            Some(&admin_token),
+            Some(&json!({ "deny": ["bad.example"] })),
+        )
+        .await;
+    assert_eq!(body["deny"], json!(["bad.example"]));
+
+    let (_, body) = server
+        .request(
+            reqwest::Method::GET,
+            "/_spindle/admin/v1/audit?action=set_federation_deny",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{body}");
+    assert_eq!(entries[1]["detail"]["removed"], json!(["*.evil.example"]));
 }

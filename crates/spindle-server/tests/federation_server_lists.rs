@@ -278,3 +278,39 @@ async fn outbound_requests_to_a_denied_destination_open_no_socket() {
             >= 2
     );
 }
+
+#[tokio::test]
+async fn the_admin_deny_list_applies_at_once_and_survives_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FjallStore::open(dir.path()).unwrap());
+    let key = Arc::new(spindle_server::signing::ServerKey::load_or_create(store.as_ref()).unwrap());
+    let federation = || {
+        spindle_server::federation::Federation::new(
+            Arc::clone(&store),
+            "example.org",
+            Arc::clone(&key),
+            false,
+            &[],
+        )
+        .unwrap()
+        .with_server_lists(&[], &["file.example".to_owned()])
+    };
+
+    let running = federation();
+    assert!(running.server_permitted("bad.example"));
+    running
+        .set_added_deny(vec!["bad.example".to_owned()])
+        .unwrap();
+    assert!(!running.server_permitted("bad.example"), "no restart");
+    assert!(
+        !running.server_permitted("file.example"),
+        "the file still applies"
+    );
+
+    // A new process reads the saved list back.
+    assert!(!federation().server_permitted("bad.example"));
+
+    running.set_added_deny(Vec::new()).unwrap();
+    assert!(running.server_permitted("bad.example"));
+    assert!(federation().server_permitted("bad.example"));
+}

@@ -346,6 +346,9 @@ dependency_failure_ttl_secs = 300
 allow = []
 
 # Servers refused in every room, in both directions, whatever `allow` says.
+# A change here needs a restart. To add servers while the process runs, use
+# PUT /_spindle/admin/v1/federation/deny: its list adds to this one, applies
+# at once, survives a restart and is written to the audit log.
 deny = []
 
 # MSC3995 hub mode (#22, SPEC section 12.6), between Spindle servers that

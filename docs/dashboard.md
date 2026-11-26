@@ -26,12 +26,12 @@ Roadmap: #4. Statuses here are the current standing, not the plan.
 
 ## Endpoint coverage
 
-**332 routes implemented; 0 known gaps in scope.**
+**335 routes implemented; 0 known gaps in scope.**
 Deprecated surfaces and deliberately-unbundled services (TURN, push
 gateway, identity server — see #4's *what not to build early*) are
 neither implemented nor counted.
 
-### Admin & moderation — 110 implemented, 0 planned
+### Admin & moderation — 113 implemented, 0 planned
 
 - `GET /_spindle/admin/ui`
 - `GET /_spindle/admin/ui/app.js`
@@ -41,6 +41,8 @@ neither implemented nor counted.
 - `GET /_spindle/admin/v1/backup/stream`
 - `GET /_spindle/admin/v1/event_reports`
 - `GET/DELETE /_spindle/admin/v1/event_reports/{report_id}`
+- `GET/PUT /_spindle/admin/v1/federation/deny`
+- `GET/PUT /_spindle/admin/v1/federation/deny`
 - `GET /_spindle/admin/v1/federation/destinations`
 - `GET /_spindle/admin/v1/federation/destinations/{destination}`
 - `POST /_spindle/admin/v1/federation/destinations/{destination}/reset_connection`
@@ -89,6 +91,7 @@ neither implemented nor counted.
 - `POST /_synapse/admin/v1/deactivate/{user_id}`
 - `GET /_synapse/admin/v1/event_reports`
 - `GET/DELETE /_synapse/admin/v1/event_reports/{report_id}`
+- `GET/PUT /_synapse/admin/v1/federation/deny`
 - `GET /_synapse/admin/v1/federation/destinations`
 - `GET /_synapse/admin/v1/federation/destinations/{destination}`
 - `POST /_synapse/admin/v1/federation/destinations/{destination}/reset_connection`

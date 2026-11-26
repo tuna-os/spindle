@@ -227,6 +227,9 @@ pub struct Federation {
     /// beside `enabled`, so one place covers every outbound request.
     allow: Vec<String>,
     deny: Vec<String>,
+    /// The deny list an operator edits through the admin API (#827). Kept
+    /// apart from `deny` so the file's list stays the floor; both apply.
+    added_deny: std::sync::RwLock<Vec<String>>,
     /// What each server name's `.well-known/matrix/server` said; shared
     /// with every [`Discovery`] handed out, so one fetch serves them all.
     delegations: Arc<Delegations>,
@@ -653,6 +656,7 @@ impl Federation {
             enabled: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            added_deny: std::sync::RwLock::new(Vec::new()),
             delegations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             well_known_port: 443,
             destinations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -756,7 +760,45 @@ impl Federation {
     pub fn with_server_lists(mut self, allow: &[String], deny: &[String]) -> Self {
         self.allow = allow.to_vec();
         self.deny = deny.to_vec();
+        // An unreadable row must not open the gate: keep the file's lists
+        // and say so.
+        match ReadView::get(self.store.as_ref(), &keys::federation_deny_list()) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<Vec<String>>(&bytes) {
+                Ok(list) => *self.added_deny.get_mut().unwrap_or_else(|e| e.into_inner()) = list,
+                Err(error) => tracing::error!(%error, "stored federation deny list is unreadable"),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::error!(%error, "could not read the stored federation deny list"),
+        }
         self
+    }
+
+    /// The deny list set through the admin API.
+    #[must_use]
+    pub fn added_deny(&self) -> Vec<String> {
+        self.added_deny
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace the admin API's deny list. Saved first, so a failed write
+    /// leaves the running list as it was; takes effect for the next
+    /// request, with no restart.
+    ///
+    /// # Errors
+    /// The store refused the write.
+    pub fn set_added_deny(&self, list: Vec<String>) -> Result<(), spindle_store::StoreError> {
+        let bytes = serde_json::to_vec(&list).expect("a list of strings serialises");
+        Store::put(self.store.as_ref(), &keys::federation_deny_list(), &bytes)?;
+        *self.added_deny.write().unwrap_or_else(|e| e.into_inner()) = list;
+        Ok(())
+    }
+
+    /// The `[federation] deny` globs from the file.
+    #[must_use]
+    pub fn configured_deny(&self) -> &[String] {
+        &self.deny
     }
 
     /// Whether the server-wide lists let this server talk to `name`. The
@@ -764,7 +806,12 @@ impl Federation {
     #[must_use]
     pub fn server_permitted(&self, name: &str) -> bool {
         use crate::server_acl::matches_any;
-        !matches_any(&self.deny, name) && (self.allow.is_empty() || matches_any(&self.allow, name))
+        !matches_any(&self.deny, name)
+            && !matches_any(
+                &self.added_deny.read().unwrap_or_else(|e| e.into_inner()),
+                name,
+            )
+            && (self.allow.is_empty() || matches_any(&self.allow, name))
     }
 
     /// The origin an `X-Matrix` header names, if the lists refuse it. A
